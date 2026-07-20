@@ -1,4 +1,5 @@
 import type { Plugin } from '@opencode-ai/plugin'
+import { pollAndDeliver } from './remote-control.js'
 
 /**
  * DevSpec OpenCode plugin entry point.
@@ -16,14 +17,22 @@ import type { Plugin } from '@opencode-ai/plugin'
  * `event.type` (e.g. `'session.idle'`) rather than looking for a
  * differently-named hook key. Verified against the installed
  * `@opencode-ai/plugin`/`@opencode-ai/sdk` type definitions, not assumed
- * from docs — future hook additions here (autopilot polling, remote-control
- * message delivery) should follow this same pattern.
+ * from docs.
+ *
+ * Remote control (see src/remote-control.ts) piggybacks on this same
+ * `session.idle` event — whenever the session goes quiet, check DevSpec for
+ * a dispatched owner command and inject it straight into the session via
+ * `client.session.promptAsync`. No separate poller process or inbox file,
+ * unlike Claude Code's design — see remote-control.ts for why.
  */
-export const DevSpecPlugin: Plugin = async ({ client }) => {
+export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   return {
     event: async ({ event }) => {
       if (event.type === 'session.idle') {
-        // Autopilot / remote-control hooks land here as their action items ship.
+        await pollAndDeliver(client, directory, event.properties.sessionID).catch(() => {
+          // Remote control is best-effort — a delivery failure must never
+          // interrupt the session the user is actually working in.
+        })
       }
     },
   }
