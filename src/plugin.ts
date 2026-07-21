@@ -1,5 +1,6 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { pollAndDeliver } from './remote-control.js'
+import { registerBundledCommands } from './register-commands.js'
 
 /**
  * DevSpec OpenCode plugin entry point.
@@ -24,9 +25,18 @@ import { pollAndDeliver } from './remote-control.js'
  * a dispatched owner command and inject it straight into the session via
  * `client.session.promptAsync`. No separate poller process or inbox file,
  * unlike Claude Code's design — see remote-control.ts for why.
+ *
+ * The `config` hook registers this package's bundled commands/*.md files
+ * into OpenCode's declarative `command` config (see register-commands.ts) —
+ * confirmed via a live install that OpenCode does NOT auto-discover a
+ * plugin's own `commands/` directory the way it does `instructions` file
+ * paths, so shipping the markdown files alone does nothing without this.
  */
 export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   return {
+    config: async (cfg) => {
+      registerBundledCommands(cfg)
+    },
     event: async ({ event }) => {
       if (event.type === 'session.idle') {
         await pollAndDeliver(client, directory, event.properties.sessionID).catch(() => {
