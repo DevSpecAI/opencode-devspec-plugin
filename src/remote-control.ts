@@ -26,6 +26,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Plugin } from '@opencode-ai/plugin'
+import { AGENT_NAME } from './agent-identity.js'
 import { mcpToolsCall } from './devspec-client.js'
 import { resolveDevspecAuth } from './resolve-devspec-auth.js'
 
@@ -88,7 +89,9 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'heartbeat_connection',
-      arguments: { connection_id: state.connectionId, status: 'live', busy },
+      // Re-assert the fixed agent identity on every heartbeat, like the Claude
+      // poller — the connection can never mislabel itself from a stale state file.
+      arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy },
     })
     writeState(directory, { ...state, busy })
   } catch {
@@ -232,7 +235,7 @@ export async function ensureConnection(directory: string): Promise<{ auth: Retur
     mcpUrl: auth.mcp_url,
     token: auth.token,
     name: 'register_connection',
-    arguments: { local_id: localId, agent_name: 'OpenCode', cwd: directory },
+    arguments: { local_id: localId, agent_name: AGENT_NAME, cwd: directory },
   })
 
   const state: ConnectionState = {
@@ -315,12 +318,42 @@ async function reportPollError(
     name: 'post_session_message',
     arguments: {
       session_id: sessionId,
-      agent_name: 'OpenCode',
+      agent_name: AGENT_NAME,
       message: `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`,
     },
   }).catch(() => {
     // Best-effort — a failed error-report must never crash the poll loop.
   })
+}
+
+/**
+ * Server-authoritative attachment decision — mirrors the Claude poller's
+ * `resolveServerAttachment` (devspec-remote-poll.mjs).
+ *
+ * The heartbeat echo (`hb.session_id`) is the one source of truth for which
+ * session this connection is attached to; local state is written FROM it, never
+ * used to override it. That is what lets an attach/detach/redirect done from the
+ * phone/web Agents page reach this in-process poller at all — the server changes
+ * the attachment without ever touching this machine's local state file, so
+ * reading the attached session from local state alone would never learn of it.
+ *
+ * A `not_found` heartbeat means the connection ended server-side and must
+ * re-register; it omits `session_id`, so it must NEVER be read as a detach →
+ * return no change and leave the current session intact. `changed` is the ONE
+ * trigger to reseed the transcript cursor, and it flips only when the
+ * server-reported session actually differs from what we currently hold.
+ */
+export function resolveServerAttachment(
+  currentSessionId: string | null,
+  hb: unknown,
+): { sessionId: string | null; changed: boolean } {
+  const obj = hb && typeof hb === 'object' ? (hb as Record<string, unknown>) : null
+  if (!obj || obj.status === 'not_found') {
+    return { sessionId: currentSessionId, changed: false }
+  }
+  const raw = obj.session_id
+  const hbSession = typeof raw === 'string' && raw ? raw : null
+  return { sessionId: hbSession, changed: hbSession !== currentSessionId }
 }
 
 /**
@@ -349,16 +382,17 @@ export async function pollAndDeliver(
   let state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
 
+  let hb: unknown
   try {
-    await mcpToolsCall({
+    hb = await mcpToolsCall({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'heartbeat_connection',
-      // Re-assert our last-known busy value on every keep-alive, per
-      // heartbeat_connection's own documented contract ("re-assert on
-      // keep-alives") — otherwise a long-running turn's busy:true would
-      // silently decay back to idle server-side after its freshness window.
-      arguments: { connection_id: state.connectionId, status: 'live', busy: state.busy ?? false },
+      // Re-assert our fixed identity + last-known busy value on every keep-alive,
+      // per heartbeat_connection's own documented contract ("re-assert on
+      // keep-alives") — otherwise a long-running turn's busy:true would silently
+      // decay back to idle server-side after its freshness window.
+      arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy: state.busy ?? false },
     })
   } catch (err) {
     // connection may have ended server-side — next idle cycle will re-check.
@@ -367,6 +401,23 @@ export async function pollAndDeliver(
     // just slow" from the owner's side.
     await reportPollError(auth, directory, state.sessionId, 'heartbeat_connection', err)
     return
+  }
+
+  // Server-authoritative attachment. The heartbeat response — not local state —
+  // is the source of truth for which session this connection is attached to. An
+  // attach / detach / redirect done from the phone or web Agents page changes it
+  // server-side WITHOUT touching this machine's state file, so this poll used to
+  // never see it (it read state.sessionId only). Adopt the server's answer here,
+  // and only here. `not_found` is guarded inside resolveServerAttachment as
+  // "re-register needed" (never a detach), so the session is left intact for it.
+  const adopt = resolveServerAttachment(state.sessionId, hb)
+  if (adopt.changed) {
+    // Adopt the server's session and reseed the transcript cursor exactly once so
+    // delivery starts fresh from the newly-attached room instead of resuming an
+    // old room's cursor. deliveredMessageIds is left alone — its bounded set
+    // still guards against re-delivering anything we genuinely already handled.
+    state = { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
+    writeState(directory, state)
   }
 
   if (!state.sessionId) return
@@ -453,7 +504,7 @@ export async function pollAndDeliver(
         name: 'post_session_message',
         arguments: {
           session_id: state.sessionId,
-          agent_name: 'OpenCode',
+          agent_name: AGENT_NAME,
           message: model
             ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
             : `⚠️ Could not deliver this message: ${reason}`,
@@ -533,7 +584,7 @@ async function mirrorLatestReply(
       name: 'post_session_message',
       arguments: {
         session_id: state.sessionId,
-        agent_name: 'OpenCode',
+        agent_name: AGENT_NAME,
         message: text,
         ...(model ? { model } : {}),
       },

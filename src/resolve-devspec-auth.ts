@@ -1,14 +1,33 @@
 /**
  * Resolve DevSpec MCP URL + Bearer token for this plugin's remote-control
- * hook, using OpenCode's own config shape (opencode.json) rather than
- * Claude Code's `.mcp.json` / `~/.claude.json` — everything else about this
- * resolver (env-var priority, never printing the raw token) mirrors
- * claude-code-devspec-autopilot's `resolve-mcp-auth.mjs`.
+ * poller/heartbeat, using OpenCode's own config shape (opencode.json) rather
+ * than Claude Code's `.mcp.json` / `~/.claude.json`. Never prints the raw token.
  *
- * Lookup order:
- * 1. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN (+ DEVSPEC_MCP_URL)
- * 2. Project opencode.json (the `directory` OpenCode handed the plugin, and parents)
- * 3. Global opencode.json (~/.config/opencode/opencode.json)
+ * TOKEN SYMMETRY (mirrors the Claude poller's item 74b29c76). The connection is
+ * REGISTERED through OpenCode's own MCP client, which authenticates the `devspec`
+ * server with the `mcp.devspec` token in opencode.json — OpenCode's MCP client
+ * does NOT read `DEVSPEC_MCP_TOKEN`. This poller/heartbeat path MUST run under
+ * that SAME token, or the server rejects it ("this connection belongs to a
+ * different token") and dispatch/heartbeat delivery spams. So the opencode.json
+ * token wins over the env token here — the opposite of the usual "env overrides"
+ * convention, precisely because the env token can never be the one that
+ * registered the connection.
+ *
+ * Lookup order (token):
+ * 1. Project opencode.json (the `directory` OpenCode handed the plugin, and parents)
+ * 2. Global opencode.json (~/.config/opencode/opencode.json)
+ * 3. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN env — fallback ONLY when no opencode.json
+ *    token is configured (env-only setups). `DEVSPEC_MCP_URL` still overrides the
+ *    resolved URL in every branch.
+ *
+ * Backward compatible: when only one token source is present the result is
+ * unchanged; only the both-present-and-different case flips — and it now resolves
+ * to the token that actually registered the connection.
+ *
+ * NOTE: this resolver feeds ONLY the in-process remote-control machinery
+ * (register / heartbeat / poll / mirror in remote-control.ts). It is not the
+ * auth path for OpenCode's own MCP tool calls, so re-prioritising it here keeps
+ * register + poller symmetric without affecting anything else.
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -83,10 +102,11 @@ function fromGlobalConfig() {
 export function resolveDevspecAuth(cwd: string = process.cwd()): DevspecAuth {
   const envToken = process.env.DEVSPEC_MCP_TOKEN || process.env.DEVSPEC_TOKEN || null
   const envUrl = process.env.DEVSPEC_MCP_URL || null
-  if (envToken) {
-    return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
-  }
 
+  // Token symmetry: the opencode.json `mcp.devspec` token (project, then global)
+  // is the token OpenCode's MCP client used to REGISTER the connection, so the
+  // poller/heartbeat must run under it. It therefore takes priority over the env
+  // token — see the file header for why the usual env-override order is inverted.
   const fromProject = walkOpencodeJson(cwd)
   if (fromProject?.token) {
     return { ok: true, token: fromProject.token, mcp_url: envUrl || fromProject.mcp_url || DEFAULT_PROD_URL, source: fromProject.source }
@@ -95,6 +115,12 @@ export function resolveDevspecAuth(cwd: string = process.cwd()): DevspecAuth {
   const fromGlobal = fromGlobalConfig()
   if (fromGlobal?.token) {
     return { ok: true, token: fromGlobal.token, mcp_url: envUrl || fromGlobal.mcp_url || DEFAULT_PROD_URL, source: fromGlobal.source }
+  }
+
+  // Env token — fallback ONLY when no opencode.json token is configured. In that
+  // setup it is the sole token source, so behavior is unchanged (backward compat).
+  if (envToken) {
+    return { ok: true, token: envToken, mcp_url: envUrl || DEFAULT_PROD_URL, source: 'env' }
   }
 
   if (fromProject?.mcp_url) {
