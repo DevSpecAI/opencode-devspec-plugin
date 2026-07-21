@@ -1,5 +1,5 @@
 import type { Plugin } from '@opencode-ai/plugin'
-import { pollAndDeliver, recordConnectionEventFromTool } from './remote-control.js'
+import { pollAndDeliver, recordConnectionEventFromTool, setBusy } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
 
 /**
@@ -92,6 +92,15 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       const sessionId = (event as { properties?: { sessionID?: string } }).properties?.sessionID
       if (typeof sessionId === 'string') lastKnownSessionId = sessionId
       if (event.type === 'session.idle') {
+        // Real gap found live-testing: heartbeat_connection was never once
+        // called with `busy` — the DevSpec session UI's "OpenCode is
+        // working…" indicator on the agent's icon has NO other signal, so
+        // the connection always looked live but never showed as working,
+        // no matter how long a turn took. session.idle is the ground truth
+        // for "a turn just finished" — mark not-busy here, before poll()
+        // runs and (if there's a newly dispatched message to act on)
+        // reasserts busy:true itself.
+        await setBusy(directory, false)
         await poll(sessionId ?? lastKnownSessionId)
       }
     },

@@ -58,6 +58,42 @@ interface ConnectionState {
    * the delivery loop — only needs to cover recent history.
    */
   deliveredMessageIds?: string[]
+  /**
+   * Our own last-known assertion of heartbeat_connection's `busy` flag —
+   * the SOLE signal that drives the "OpenCode is working…" indicator on the
+   * agent's icon in the DevSpec session UI (confirmed against the tool's
+   * own contract). Real gap found: every heartbeat_connection call in this
+   * file only ever sent `status: 'live'` — never `busy` — so the connection
+   * always showed live but never showed as working, no matter how long a
+   * turn actually took. Tracked here so re-asserting on routine keep-alives
+   * (per the tool's contract) doesn't require an extra read each time, and
+   * so we only call the tool again when the value actually changes.
+   */
+  busy?: boolean
+}
+
+/**
+ * Assert heartbeat_connection's `busy` flag — see the `busy` field doc on
+ * ConnectionState for why this exists. Call with `true` right before
+ * kicking off a delivered message's turn, and `false` as soon as OpenCode's
+ * own `session.idle` event confirms the turn actually finished.
+ */
+export async function setBusy(directory: string, busy: boolean): Promise<void> {
+  const auth = resolveDevspecAuth(directory)
+  const state = readState(directory)
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
+  if (state.busy === busy) return // already asserted — avoid a redundant call
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'heartbeat_connection',
+      arguments: { connection_id: state.connectionId, status: 'live', busy },
+    })
+    writeState(directory, { ...state, busy })
+  } catch {
+    // Best-effort — a failed busy assertion must never crash the poll loop.
+  }
 }
 
 function stateFile(directory: string): string {
@@ -306,7 +342,11 @@ export async function pollAndDeliver(
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'heartbeat_connection',
-      arguments: { connection_id: state.connectionId, status: 'live' },
+      // Re-assert our last-known busy value on every keep-alive, per
+      // heartbeat_connection's own documented contract ("re-assert on
+      // keep-alives") — otherwise a long-running turn's busy:true would
+      // silently decay back to idle server-side after its freshness window.
+      arguments: { connection_id: state.connectionId, status: 'live', busy: state.busy ?? false },
     })
   } catch (err) {
     // connection may have ended server-side — next idle cycle will re-check.
@@ -348,6 +388,13 @@ export async function pollAndDeliver(
 
   const toDeliver = allMessages.filter((m) => m?.remote_control?.is_owner_instruction === true)
   const deliveredIds = new Set(state.deliveredMessageIds ?? [])
+
+  // Assert busy BEFORE kicking off any turn — see setBusy's doc. Only the
+  // undelivered ones matter (an all-already-delivered batch means nothing
+  // new is actually starting).
+  if (toDeliver.some((m) => typeof m?.id === 'string' && !deliveredIds.has(m.id))) {
+    await setBusy(directory, true)
+  }
 
   for (const msg of toDeliver) {
     if (typeof msg?.id === 'string' && deliveredIds.has(msg.id)) continue // see deliveredMessageIds doc
