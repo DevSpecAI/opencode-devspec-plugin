@@ -46,6 +46,18 @@ interface ConnectionState {
    * model-override work, not a hypothetical one.
    */
   lastDeliveredMessageId?: string | null
+  /**
+   * Bounded list of DevSpec message ids already delivered via promptAsync.
+   * Real bug found live-testing: the SAME owner message got delivered to
+   * OpenCode 3 separate times (3 duplicate answers inside one OpenCode
+   * session for one single DevSpec-side dispatch) even though
+   * get_session_transcript's own after_message_id cursor was verified
+   * correct in isolation — the exact mechanism wasn't fully isolated, but
+   * this list makes duplicate delivery structurally impossible regardless
+   * of how a stale/racing cursor read could happen. Capped at 50 entries in
+   * the delivery loop — only needs to cover recent history.
+   */
+  deliveredMessageIds?: string[]
 }
 
 function stateFile(directory: string): string {
@@ -137,6 +149,7 @@ export function recordConnectionEventFromTool(
       codename: typeof result?.codename === 'string' ? result.codename : existing?.codename ?? null,
       lastMirroredMessageId: existing?.lastMirroredMessageId,
       lastDeliveredMessageId: existing?.lastDeliveredMessageId,
+      deliveredMessageIds: existing?.deliveredMessageIds,
     })
     return
   }
@@ -164,6 +177,7 @@ export function recordConnectionEventFromTool(
     codename: existing?.codename ?? null,
     lastMirroredMessageId: existing?.lastMirroredMessageId,
     lastDeliveredMessageId: existing?.lastDeliveredMessageId,
+    deliveredMessageIds: existing?.deliveredMessageIds,
   })
 }
 
@@ -333,8 +347,20 @@ export async function pollAndDeliver(
   }
 
   const toDeliver = allMessages.filter((m) => m?.remote_control?.is_owner_instruction === true)
+  const deliveredIds = new Set(state.deliveredMessageIds ?? [])
 
   for (const msg of toDeliver) {
+    if (typeof msg?.id === 'string' && deliveredIds.has(msg.id)) continue // see deliveredMessageIds doc
+
+    // Mark as claimed BEFORE calling promptAsync (not after) and persist
+    // immediately — closes the race window as tightly as possible so a
+    // concurrent/overlapping poll invocation sees this id already delivered
+    // rather than independently fetching and delivering it a second time.
+    if (typeof msg?.id === 'string') {
+      deliveredIds.add(msg.id)
+      writeState(directory, { ...state, deliveredMessageIds: Array.from(deliveredIds).slice(-50) })
+    }
+
     const text = typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg?.content ?? msg)
     // Per-message provider/model override — only meaningful for
     // provider-agnostic tools (OpenCode). Verified live: promptAsync's body
@@ -415,9 +441,17 @@ async function mirrorLatestReply(
     .trim()
 
   if (!text) {
-    // Nothing textual to mirror (e.g. a pure tool-call turn) — still advance
-    // the cursor so this same non-text message isn't rechecked forever.
-    writeState(directory, { ...state, lastMirroredMessageId: last.info.id })
+    // Real bug found live-testing: a message can be checked WHILE STILL
+    // STREAMING (no text parts yet) — marking it "mirrored" here (as this
+    // code used to) meant it was permanently skipped even once it finished
+    // streaming with real text moments later, since the dedup check above
+    // only compares message IDs, not content. Confirmed live: a genuine
+    // answer to a plain question never made it to DevSpec at all because an
+    // earlier poll caught it empty and marked it done first. Do NOT persist
+    // here — leave last.info.id unrecorded so the next poll re-evaluates
+    // this same message once it (likely) has text. A message that is
+    // permanently textless (a real pure-tool-call turn) is harmless to
+    // recheck: `last` moves on naturally once a newer message exists.
     return
   }
 
