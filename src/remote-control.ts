@@ -334,7 +334,19 @@ export async function pollAndDeliver(
   sessionId: string,
 ): Promise<void> {
   const auth = resolveDevspecAuth(directory)
-  const state = readState(directory)
+  // `state` is intentionally `let`, not `const` — real bug found live-
+  // testing: every writeState call in this function used to spread from
+  // ONE snapshot captured here at the top, so each successive write threw
+  // away whatever the PREVIOUS write in this same invocation had just set
+  // (deliveredMessageIds clobbering lastDeliveredMessageId, mirrorLatestReply's
+  // write then clobbering both of those back to their pre-poll values).
+  // Confirmed live: a message got delivered and answered correctly, then
+  // re-delivered and re-answered again on the very next 8s poll, because
+  // the dedup bookkeeping this same cycle had just written was erased
+  // before the cycle even finished. Every write below now also updates
+  // this local binding, so later writes in the same call compose on top
+  // of earlier ones instead of reverting them.
+  let state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
 
   try {
@@ -374,7 +386,10 @@ export async function pollAndDeliver(
       ...(state.lastDeliveredMessageId ? { after_message_id: state.lastDeliveredMessageId } : {}),
     },
   }).catch((err) => {
-    void reportPollError(auth, directory, state.sessionId, 'get_session_transcript', err)
+    // Non-null assertion: `state` is a `let` (reassigned above to compose
+    // writes within this call), so TS can't narrow it across this closure —
+    // but it's never set back to null anywhere in this function.
+    void reportPollError(auth, directory, state!.sessionId, 'get_session_transcript', err)
     return null
   })
 
@@ -383,7 +398,8 @@ export async function pollAndDeliver(
     // Advance the cursor even for messages we don't deliver (advisory context) —
     // without this, every idle poll re-fetched the WHOLE transcript and
     // re-delivered every owner instruction ever posted to this session.
-    writeState(directory, { ...state, lastDeliveredMessageId: allMessages[allMessages.length - 1].id })
+    state = { ...state, lastDeliveredMessageId: allMessages[allMessages.length - 1].id }
+    writeState(directory, state)
   }
 
   const toDeliver = allMessages.filter((m) => m?.remote_control?.is_owner_instruction === true)
@@ -394,6 +410,7 @@ export async function pollAndDeliver(
   // new is actually starting).
   if (toDeliver.some((m) => typeof m?.id === 'string' && !deliveredIds.has(m.id))) {
     await setBusy(directory, true)
+    state = { ...state, busy: true } // keep our local copy in sync with what setBusy just wrote
   }
 
   for (const msg of toDeliver) {
@@ -405,7 +422,8 @@ export async function pollAndDeliver(
     // rather than independently fetching and delivering it a second time.
     if (typeof msg?.id === 'string') {
       deliveredIds.add(msg.id)
-      writeState(directory, { ...state, deliveredMessageIds: Array.from(deliveredIds).slice(-50) })
+      state = { ...state, deliveredMessageIds: Array.from(deliveredIds).slice(-50) }
+      writeState(directory, state)
     }
 
     const text = typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg?.content ?? msg)
