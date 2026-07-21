@@ -75,6 +75,98 @@ function clearState(directory: string): void {
   }
 }
 
+/**
+ * Bridge between the `/devspec.remote` MARKDOWN command (which has the model
+ * call `register_connection`/`attach_connection` directly as raw MCP tool
+ * calls) and this file's own local state, which `pollAndDeliver` depends on
+ * to know a connection exists at all.
+ *
+ * Real gap found live-testing: the command completes a genuine connect
+ * handshake with DevSpec's server, but never went through `ensureConnection`/
+ * `attachSession` above — so no local state file was ever written, and
+ * `pollAndDeliver` (gated on `readState(directory)` being non-null) silently
+ * never activated for that session. Wire this into the `tool.execute.after`
+ * plugin hook so ANY path that results in these tool calls (the command,
+ * or the model doing it ad hoc) keeps local state in sync automatically —
+ * no dependence on the command's own wording.
+ *
+ * `hookOutput` is the RAW `tool.execute.after` output object. Verified live
+ * that this does NOT match the hook's own declared `{title, output,
+ * metadata}` shape for MCP-sourced tools specifically — MCP results instead
+ * arrive as the standard MCP envelope `{content: [{type: 'text', text:
+ * '...'}]}`, with the actual JSON payload inside `text`. Built-in tools
+ * (bash, glob, ...) DO use `{output: string}`. Check both rather than
+ * trusting the declared type, which is only accurate for the built-in case.
+ */
+export function recordConnectionEventFromTool(
+  directory: string,
+  toolName: string,
+  args: unknown,
+  hookOutput: unknown,
+): void {
+  const isRegister = toolName === 'devspec_register_connection' || toolName.endsWith('register_connection')
+  const isAttach = toolName === 'devspec_attach_connection' || toolName.endsWith('attach_connection')
+  if (!isRegister && !isAttach) return
+
+  const out = (hookOutput && typeof hookOutput === 'object' ? hookOutput : {}) as Record<string, unknown>
+  const mcpContent = Array.isArray(out.content) ? out.content : null
+  const rawText =
+    typeof out.output === 'string'
+      ? out.output
+      : mcpContent && typeof mcpContent[0]?.text === 'string'
+        ? (mcpContent[0].text as string)
+        : null
+  if (!rawText) return
+
+  let result: any
+  try {
+    result = JSON.parse(rawText)
+  } catch {
+    return
+  }
+
+  const existing = readState(directory)
+  const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
+
+  if (isRegister) {
+    const connectionId = typeof result?.connection_id === 'string' ? result.connection_id : existing?.connectionId
+    if (!connectionId) return
+    writeState(directory, {
+      connectionId,
+      sessionId: existing?.sessionId ?? null,
+      codename: typeof result?.codename === 'string' ? result.codename : existing?.codename ?? null,
+      lastMirroredMessageId: existing?.lastMirroredMessageId,
+      lastDeliveredMessageId: existing?.lastDeliveredMessageId,
+    })
+    return
+  }
+
+  // Attach: connection_id/session_id may come back on the result, or only be
+  // present on the call's own args (DevSpec's attach_connection echoes both,
+  // but don't assume — fall back to what the model was called with).
+  const connectionId =
+    typeof result?.connection_id === 'string'
+      ? result.connection_id
+      : typeof argsObj.connection_id === 'string'
+        ? (argsObj.connection_id as string)
+        : existing?.connectionId
+  const sessionId =
+    typeof result?.session_id === 'string'
+      ? result.session_id
+      : typeof argsObj.session_id === 'string'
+        ? (argsObj.session_id as string)
+        : existing?.sessionId ?? null
+  if (!connectionId) return
+
+  writeState(directory, {
+    connectionId,
+    sessionId,
+    codename: existing?.codename ?? null,
+    lastMirroredMessageId: existing?.lastMirroredMessageId,
+    lastDeliveredMessageId: existing?.lastDeliveredMessageId,
+  })
+}
+
 /** Register (or reuse) this OpenCode instance as a DevSpec connection. Idempotent per directory. */
 export async function ensureConnection(directory: string): Promise<{ auth: ReturnType<typeof resolveDevspecAuth>; state: ConnectionState | null; error?: string }> {
   const auth = resolveDevspecAuth(directory)
