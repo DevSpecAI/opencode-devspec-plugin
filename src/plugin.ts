@@ -58,8 +58,24 @@ const POLL_INTERVAL_MS = 8000
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
 export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
-  // Cached from whichever event last carried a sessionID — used by the
-  // interval backstop below, which has no event of its own to read one from.
+  // Real bug found live-testing (severe — a live runaway ping-pong loop,
+  // not just a delivery gap): this used to update from the generic `event`
+  // hook's sessionID on EVERY event type, unconditionally. OpenCode's
+  // server re-syncs/touches previously-persisted sessions for a project
+  // directory on its own (background session.updated/status/diff activity
+  // for OLD sessions the plugin was never actually driving) — so this
+  // cache kept getting silently hijacked away from the CURRENT connect's
+  // session to some unrelated, dormant one and back again. Two sessions
+  // then took turns being "last known," and since mirrorLatestReply's
+  // dedup is keyed off content it had already posted for EACH session
+  // independently, the two rotated forever, reposting each other's static
+  // last message over and over with no new content ever involved.
+  //
+  // Fixed by only ever setting this from `tool.execute.after`'s own
+  // `sessionID` field (confirmed present on the hook's input type) at the
+  // exact moment register_connection/attach_connection succeeds — the one
+  // signal that unambiguously identifies the session driving THIS connect,
+  // immune to background noise from sessions we have nothing to do with.
   let lastKnownSessionId: string | null = null
   let pollInFlight = false
 
@@ -92,18 +108,12 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       registerBundledCommands(cfg)
     },
     event: async ({ event }) => {
+      // Deliberately NOT updating lastKnownSessionId here anymore — see the
+      // comment on its declaration above. Only used now for the (still
+      // never observed, but kept for forward-compat) session.idle path.
       const sessionId = (event as { properties?: { sessionID?: string } }).properties?.sessionID
-      if (typeof sessionId === 'string') lastKnownSessionId = sessionId
       logPoll(`event received: type=${event.type} sessionID=${sessionId}`)
       if (event.type === 'session.idle') {
-        // Real gap found live-testing: heartbeat_connection was never once
-        // called with `busy` — the DevSpec session UI's "OpenCode is
-        // working…" indicator on the agent's icon has NO other signal, so
-        // the connection always looked live but never showed as working,
-        // no matter how long a turn took. session.idle is the ground truth
-        // for "a turn just finished" — mark not-busy here, before poll()
-        // runs and (if there's a newly dispatched message to act on)
-        // reasserts busy:true itself.
         await setBusy(directory, false)
         await poll(sessionId ?? lastKnownSessionId, 'session.idle')
       }
@@ -111,6 +121,16 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     'tool.execute.after': async (input, output) => {
       try {
         recordConnectionEventFromTool(directory, input.tool, input.args, output)
+        if (
+          (input.tool === 'devspec_register_connection' ||
+            input.tool.endsWith('register_connection') ||
+            input.tool === 'devspec_attach_connection' ||
+            input.tool.endsWith('attach_connection')) &&
+          typeof input.sessionID === 'string'
+        ) {
+          logPoll(`pinning lastKnownSessionId=${input.sessionID} from tool=${input.tool}`)
+          lastKnownSessionId = input.sessionID
+        }
       } catch {
         // Best-effort — must never break the tool call it's observing.
       }

@@ -96,6 +96,20 @@ interface ConnectionState {
    * so we only call the tool again when the value actually changes.
    */
   busy?: boolean
+  /**
+   * Bounded list of OpenCode assistant message ids already mirrored to
+   * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
+   * pointer only stops re-posting the SAME message twice in a row). Real
+   * bug found live-testing: two unrelated OpenCode-internal sessions ended
+   * up alternately "last known" (see plugin.ts's lastKnownSessionId fix),
+   * so this pointer kept flipping between two DIFFERENT already-seen
+   * messages and reposting each one every time the OTHER one's post
+   * overwrote the pointer — an infinite ping-pong between two messages
+   * that were each individually "new" relative to whatever the pointer
+   * happened to hold at that moment. A set makes that structurally
+   * impossible regardless of how the pointer itself gets confused.
+   */
+  mirroredMessageIds?: string[]
 }
 
 /**
@@ -219,6 +233,7 @@ export function recordConnectionEventFromTool(
       lastMirroredMessageId: existing?.lastMirroredMessageId,
       lastDeliveredMessageId: existing?.lastDeliveredMessageId,
       deliveredMessageIds: existing?.deliveredMessageIds,
+      mirroredMessageIds: existing?.mirroredMessageIds,
     })
     return
   }
@@ -247,6 +262,7 @@ export function recordConnectionEventFromTool(
     lastMirroredMessageId: existing?.lastMirroredMessageId,
     lastDeliveredMessageId: existing?.lastDeliveredMessageId,
     deliveredMessageIds: existing?.deliveredMessageIds,
+    mirroredMessageIds: existing?.mirroredMessageIds,
   })
 }
 
@@ -593,8 +609,9 @@ async function mirrorLatestReply(
     `mirrorLatestReply: ${assistantMessages.length} assistant messages, last.id=${last?.info?.id}, ` +
       `lastMirrored=${state.lastMirroredMessageId}`,
   )
-  if (!last?.info?.id || last.info.id === state.lastMirroredMessageId) {
-    logPoll(`mirrorLatestReply: skip (same as lastMirrored or no last message)`)
+  const alreadyMirrored = new Set(state.mirroredMessageIds ?? [])
+  if (!last?.info?.id || last.info.id === state.lastMirroredMessageId || alreadyMirrored.has(last.info.id)) {
+    logPoll(`mirrorLatestReply: skip (already mirrored or no last message)`)
     return
   }
 
@@ -645,7 +662,12 @@ async function mirrorLatestReply(
   }
 
   logPoll(`mirrorLatestReply: posted last.id=${last.info.id}`)
-  writeState(directory, { ...state, lastMirroredMessageId: last.info.id })
+  alreadyMirrored.add(last.info.id)
+  writeState(directory, {
+    ...state,
+    lastMirroredMessageId: last.info.id,
+    mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+  })
 
   // Real bug found live-testing: `session.idle` — the event the busy:false
   // transition was gated on — never fires even once in practice (confirmed
