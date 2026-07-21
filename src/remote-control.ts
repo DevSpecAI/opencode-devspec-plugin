@@ -55,6 +55,20 @@ export function logPoll(line: string): void {
   }
 }
 
+/**
+ * How long a turn may stay `busy` with an empty (no-text) latest assistant
+ * message before we treat it as stalled. Real gap found live-testing: a
+ * turn reported pickup, stayed busy for minutes with `has no text yet`,
+ * then reported complete without ever mirroring a reply — owners saw
+ * "working…" forever and had to dig into poll.log. Override via
+ * DEVSPEC_OPENCODE_STALL_MS (milliseconds).
+ */
+export const STALL_TIMEOUT_MS = (() => {
+  const raw = process.env.DEVSPEC_OPENCODE_STALL_MS
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) && n > 0 ? n : 120_000
+})()
+
 interface ConnectionState {
   connectionId: string
   sessionId: string | null
@@ -96,6 +110,19 @@ interface ConnectionState {
    * so we only call the tool again when the value actually changes.
    */
   busy?: boolean
+  /**
+   * Epoch ms when `busy` last flipped to true. Used by the stall detector
+   * (see checkBusyStall). Cleared when busy goes false. Absent on older
+   * state files — checkBusyStall seeds it on first sight rather than
+   * immediately treating the turn as already timed out.
+   */
+  busySince?: number | null
+  /**
+   * Epoch ms of the busySince window we already posted a stall warning for.
+   * Prevents re-posting the same stall on every subsequent poll if clearing
+   * busy somehow fails.
+   */
+  stallWarnedAt?: number | null
   /**
    * Bounded list of OpenCode assistant message ids already mirrored to
    * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
@@ -170,13 +197,142 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       // poller — the connection can never mislabel itself from a stale state file.
       arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy },
     })
-    writeState(directory, { ...state, busy })
+    writeState(directory, {
+      ...state,
+      busy,
+      busySince: busy ? Date.now() : null,
+      stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
+    })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
     logPoll(`setBusy(${busy}) heartbeat_connection call failed: ${err}`)
     return
   }
   await reportActivity(directory, busy ? 'pickup' : 'complete')
+}
+
+function assistantTextFromMessage(message: { parts?: unknown } | null | undefined): string {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  return parts
+    .filter((p: any) => p?.type === 'text' && typeof p.text === 'string')
+    .map((p: any) => p.text)
+    .join('\n')
+    .trim()
+}
+
+async function postSessionNotice(
+  auth: ReturnType<typeof resolveDevspecAuth>,
+  sessionId: string,
+  message: string,
+): Promise<void> {
+  if (!auth.ok || !auth.token || !auth.mcp_url) return
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: { session_id: sessionId, agent_name: AGENT_NAME, message },
+    })
+  } catch (err) {
+    logPoll(`postSessionNotice failed: ${err}`)
+  }
+}
+
+/**
+ * If we've been busy longer than STALL_TIMEOUT_MS and the latest OpenCode
+ * assistant message still has no text, clear busy and warn in the DevSpec
+ * session. Called every poll while busy — cheap when under the timeout.
+ */
+export async function checkBusyStall(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+): Promise<void> {
+  const auth = resolveDevspecAuth(directory)
+  let state = readState(directory)
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state?.busy || !state.sessionId) return
+
+  // Older state files may have busy:true with no busySince — seed now so we
+  // don't immediately treat a mid-flight upgrade as already timed out.
+  if (!state.busySince) {
+    const seeded = { ...state, busySince: Date.now() }
+    writeState(directory, seeded)
+    logPoll(`stall check: seeded busySince for pre-existing busy=true`)
+    return
+  }
+
+  const elapsed = Date.now() - state.busySince
+  if (elapsed < STALL_TIMEOUT_MS) {
+    logPoll(`stall check: busy ${elapsed}ms (< ${STALL_TIMEOUT_MS}ms) — ok`)
+    return
+  }
+
+  let messages: any[]
+  try {
+    const res: any = await (client as any).session.messages({ path: { id: sessionId } })
+    messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+  } catch (err) {
+    logPoll(`stall check: client.session.messages failed: ${err}`)
+    return
+  }
+
+  const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
+  const last = assistantMessages[assistantMessages.length - 1]
+  const text = assistantTextFromMessage(last)
+  if (text) {
+    logPoll(
+      `stall check: busy ${elapsed}ms but last assistant (${last?.info?.id}) has text — not a stall`,
+    )
+    return
+  }
+
+  if (state.stallWarnedAt === state.busySince) {
+    logPoll(`stall check: already warned for busySince=${state.busySince} — clearing busy again`)
+    await setBusy(directory, false)
+    return
+  }
+
+  const lastId = last?.info?.id ?? 'none'
+  logPoll(
+    `STALL: busy ${elapsed}ms with empty assistant text (last.id=${lastId}) — clearing busy and posting warning`,
+  )
+  writeState(directory, { ...state, stallWarnedAt: state.busySince })
+  await postSessionNotice(
+    auth,
+    state.sessionId,
+    `⚠️ OpenCode turn stalled after ${Math.round(elapsed / 1000)}s with no reply text ` +
+      `(assistant message \`${lastId}\`). Cleared the busy indicator — check ` +
+      `~/.devspec/opencode-remote-control/poll.log if this keeps happening.`,
+  )
+  await setBusy(directory, false)
+}
+
+/**
+ * Handle OpenCode's `session.error` event: clear busy, post into DevSpec,
+ * and log the full event payload. Confirmed live (poll.log) that this event
+ * fires on MiniMax connect failures — previously only the type+sessionID
+ * were logged and busy was left untouched.
+ */
+export async function handleSessionError(directory: string, event: unknown): Promise<void> {
+  const auth = resolveDevspecAuth(directory)
+  const state = readState(directory)
+  let detail = ''
+  try {
+    detail = JSON.stringify(event)
+  } catch {
+    detail = String(event)
+  }
+  if (detail.length > 2000) detail = `${detail.slice(0, 2000)}…`
+  logPoll(`session.error handled: ${detail}`)
+
+  if (state?.sessionId && auth.ok) {
+    await postSessionNotice(
+      auth,
+      state.sessionId,
+      `⚠️ OpenCode reported \`session.error\`. Busy cleared. Detail: ${detail}`,
+    )
+  }
+  await setBusy(directory, false)
 }
 
 function stateFile(directory: string): string {
@@ -493,6 +649,11 @@ export async function pollAndDeliver(
   // keepalive (attended cadence)" from the reference implementation.
   if (state.busy) {
     await reportActivity(directory, 'keepalive')
+    // Stall detector — clears busy + posts a warning when a turn sits
+    // busy with empty assistant text past STALL_TIMEOUT_MS. Must run
+    // BEFORE delivery/mirror so a hung prior turn doesn't block forever.
+    await checkBusyStall(client, directory, sessionId)
+    state = readState(directory) ?? state
   }
 
   // Server-authoritative attachment. The heartbeat response — not local state —
@@ -660,11 +821,7 @@ async function mirrorLatestReply(
     return
   }
 
-  const text = (last.parts ?? [])
-    .filter((p: any) => p?.type === 'text' && typeof p.text === 'string')
-    .map((p: any) => p.text)
-    .join('\n')
-    .trim()
+  const text = assistantTextFromMessage(last)
 
   if (!text) {
     logPoll(`mirrorLatestReply: last.id=${last.info.id} has no text yet, not persisting — will recheck`)
@@ -679,6 +836,7 @@ async function mirrorLatestReply(
     // this same message once it (likely) has text. A message that is
     // permanently textless (a real pure-tool-call turn) is harmless to
     // recheck: `last` moves on naturally once a newer message exists.
+    // Stall detection for long-lived empty text lives in checkBusyStall.
     return
   }
 

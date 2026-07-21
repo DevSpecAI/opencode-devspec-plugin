@@ -1,5 +1,11 @@
 import type { Plugin } from '@opencode-ai/plugin'
-import { logPoll, pollAndDeliver, recordConnectionEventFromTool, setBusy } from './remote-control.js'
+import {
+  handleSessionError,
+  logPoll,
+  pollAndDeliver,
+  recordConnectionEventFromTool,
+  setBusy,
+} from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
 
 /**
@@ -111,11 +117,24 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       // Deliberately NOT updating lastKnownSessionId here anymore — see the
       // comment on its declaration above. Only used now for the (still
       // never observed, but kept for forward-compat) session.idle path.
-      const sessionId = (event as { properties?: { sessionID?: string } }).properties?.sessionID
-      logPoll(`event received: type=${event.type} sessionID=${sessionId}`)
+      const props = (event as { properties?: Record<string, unknown> }).properties
+      const sessionId = typeof props?.sessionID === 'string' ? props.sessionID : undefined
+      let propsSummary = ''
+      try {
+        propsSummary = props ? JSON.stringify(props) : ''
+        if (propsSummary.length > 500) propsSummary = `${propsSummary.slice(0, 500)}…`
+      } catch {
+        propsSummary = String(props)
+      }
+      logPoll(`event received: type=${event.type} sessionID=${sessionId} props=${propsSummary}`)
       if (event.type === 'session.idle') {
         await setBusy(directory, false)
         await poll(sessionId ?? lastKnownSessionId, 'session.idle')
+      } else if (event.type === 'session.error') {
+        // Confirmed live: MiniMax connect failures emit session.error. Clear
+        // busy and surface the payload into DevSpec — previously only the
+        // type line landed in poll.log and the UI stayed "working…".
+        await handleSessionError(directory, event)
       }
     },
     'tool.execute.after': async (input, output) => {
