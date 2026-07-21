@@ -197,8 +197,9 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       // poller — the connection can never mislabel itself from a stale state file.
       arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy },
     })
-    writeState(directory, {
-      ...state,
+    // patchState re-reads disk — never spread a stale snapshot here (see
+    // patchState's doc: that lost-update duplicated mirrored replies).
+    patchState(directory, {
       busy,
       busySince: busy ? Date.now() : null,
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
@@ -255,8 +256,7 @@ export async function checkBusyStall(
   // Older state files may have busy:true with no busySince — seed now so we
   // don't immediately treat a mid-flight upgrade as already timed out.
   if (!state.busySince) {
-    const seeded = { ...state, busySince: Date.now() }
-    writeState(directory, seeded)
+    patchState(directory, { busySince: Date.now() })
     logPoll(`stall check: seeded busySince for pre-existing busy=true`)
     return
   }
@@ -296,7 +296,7 @@ export async function checkBusyStall(
   logPoll(
     `STALL: busy ${elapsed}ms with empty assistant text (last.id=${lastId}) — clearing busy and posting warning`,
   )
-  writeState(directory, { ...state, stallWarnedAt: state.busySince })
+  patchState(directory, { stallWarnedAt: state.busySince })
   await postSessionNotice(
     auth,
     state.sessionId,
@@ -352,6 +352,23 @@ function readState(directory: string): ConnectionState | null {
 
 function writeState(directory: string, state: ConnectionState): void {
   fs.writeFileSync(stateFile(directory), JSON.stringify(state, null, 2), { mode: 0o600 })
+}
+
+/**
+ * Re-read the on-disk state, merge `patch`, write back. Real bug found
+ * live-testing: setBusy(false) on the session.idle path and
+ * mirrorLatestReply both did `writeState({ ...staleInMemory, … })`, so
+ * whichever finished second rolled back the other's cursor fields —
+ * lastMirrored got reset to the previous id and the next poll posted the
+ * same reply twice into DevSpec. Always merge onto the latest disk
+ * snapshot so concurrent writers only touch their own keys.
+ */
+function patchState(directory: string, patch: Partial<ConnectionState>): ConnectionState | null {
+  const current = readState(directory)
+  if (!current) return null
+  const next = { ...current, ...patch }
+  writeState(directory, next)
+  return next
 }
 
 function clearState(directory: string): void {
@@ -811,12 +828,16 @@ async function mirrorLatestReply(
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
   const last = assistantMessages[assistantMessages.length - 1]
+  // Always re-read disk before the dedup decision — a concurrent setBusy /
+  // prior mirror may have advanced the cursor since `state` was snapshotted
+  // at the top of pollAndDeliver.
+  const fresh = readState(directory) ?? state
   logPoll(
     `mirrorLatestReply: ${assistantMessages.length} assistant messages, last.id=${last?.info?.id}, ` +
-      `lastMirrored=${state.lastMirroredMessageId}`,
+      `lastMirrored=${fresh.lastMirroredMessageId}`,
   )
-  const alreadyMirrored = new Set(state.mirroredMessageIds ?? [])
-  if (!last?.info?.id || last.info.id === state.lastMirroredMessageId || alreadyMirrored.has(last.info.id)) {
+  const alreadyMirrored = new Set(fresh.mirroredMessageIds ?? [])
+  if (!last?.info?.id || last.info.id === fresh.lastMirroredMessageId || alreadyMirrored.has(last.info.id)) {
     logPoll(`mirrorLatestReply: skip (already mirrored or no last message)`)
     return
   }
@@ -840,6 +861,20 @@ async function mirrorLatestReply(
     return
   }
 
+  // Optimistic claim BEFORE the network post — closes the race where two
+  // concurrent poll/idle paths both pass the dedup check, both post, then
+  // both write. Whichever claims second sees the id already in the set and
+  // skips. If the post fails we roll the claim back so a later poll can retry.
+  alreadyMirrored.add(last.info.id)
+  const claimed = patchState(directory, {
+    lastMirroredMessageId: last.info.id,
+    mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+  })
+  if (!claimed) return
+  // Another writer may have claimed the same id between our check and patch
+  // if we lost a race on lastMirrored — re-check isn't perfect without a
+  // lock, but the set membership after merge is enough when both use patchState.
+
   const modelInfo = last.info.model
   const model =
     modelInfo && typeof modelInfo.providerID === 'string' && typeof modelInfo.modelID === 'string'
@@ -852,25 +887,24 @@ async function mirrorLatestReply(
       token: auth.token,
       name: 'post_session_message',
       arguments: {
-        session_id: state.sessionId,
+        session_id: fresh.sessionId ?? state.sessionId,
         agent_name: AGENT_NAME,
         message: text,
         ...(model ? { model } : {}),
       },
     })
   } catch (err) {
-    // Leave the cursor unadvanced so this same reply is retried next idle poll.
+    // Roll back the optimistic claim so this reply can be retried.
+    const ids = (readState(directory)?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id)
+    patchState(directory, {
+      lastMirroredMessageId: fresh.lastMirroredMessageId ?? null,
+      mirroredMessageIds: ids,
+    })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
     return
   }
 
   logPoll(`mirrorLatestReply: posted last.id=${last.info.id}`)
-  alreadyMirrored.add(last.info.id)
-  writeState(directory, {
-    ...state,
-    lastMirroredMessageId: last.info.id,
-    mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-  })
 
   // Real bug found live-testing: `session.idle` — the event the busy:false
   // transition was gated on — never fires even once in practice (confirmed
@@ -882,5 +916,7 @@ async function mirrorLatestReply(
   // A completed reply with real text (this point, right after successfully
   // posting one) is the clearest signal actually available that a turn
   // just finished — use it instead of the dead event.
+  // (Later live runs DID see session.idle fire — keep both paths; setBusy
+  // is idempotent when already false.)
   await setBusy(directory, false)
 }
