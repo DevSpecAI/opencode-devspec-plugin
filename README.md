@@ -12,7 +12,7 @@ npm install --save-dev opencode-devspec-plugin
 
 ## 2. Configure `opencode.json`
 
-Add an `mcp` entry pointing at your DevSpec project's MCP endpoint, and a `plugin` entry loading this package:
+Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry loading this package:
 
 ```jsonc
 {
@@ -20,9 +20,9 @@ Add an `mcp` entry pointing at your DevSpec project's MCP endpoint, and a `plugi
   "mcp": {
     "devspec": {
       "type": "remote",
-      "url": "https://<your-devspec-host>/api/mcp",
+      "url": "https://devspec.ai/api/mcp",
       "headers": {
-        "Authorization": "Bearer <your-devspec-token>"
+        "Authorization": "Bearer dvs_…"
       }
     }
   },
@@ -31,7 +31,13 @@ Add an `mcp` entry pointing at your DevSpec project's MCP endpoint, and a `plugi
 }
 ```
 
-Replace `<your-devspec-host>` and `<your-devspec-token>` with the values from your DevSpec project's connection settings.
+Create your token in DevSpec under **You → Connections** → **Connect a tool** (pick **Read & write**); it starts with `dvs_`. Paste it after `Bearer ` in place of `dvs_…`.
+
+**One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time at **You → Connections** (no show-once).
+
+The URL above (`https://devspec.ai/api/mcp`) is DevSpec's production MCP host. On a self-hosted DevSpec instance, use that instance's host instead.
+
+> **Node.js 18+** is only needed for autopilot and remote control (isolated work branches, session mirroring) — plain MCP tool access works without it.
 
 ## 3. Verify
 
