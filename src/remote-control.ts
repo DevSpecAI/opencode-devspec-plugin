@@ -113,10 +113,44 @@ interface ConnectionState {
 }
 
 /**
+ * Report a connection activity verb — the canonical "I'm working" signal as
+ * of DevSpec's newer activity state machine (ported from the same fix in
+ * claude-code-devspec-autopilot's poller). `busy` (via heartbeat_connection,
+ * below) is the OLDER mechanism; the server still translates it, but that
+ * translation is documented as a rollout safety net, not the long-term
+ * design — report_pickup/keepalive/complete is. Kept additive (both fire
+ * together from setBusy, never as a replacement) for exactly the same
+ * reason the Claude poller kept its busy-heartbeat unchanged when adding
+ * this: both feed the same server-side attempt idempotently, so there's no
+ * migration risk in running them side by side. Connection-scoped
+ * (attempt_id omitted) — the server resolves the current attempt.
+ */
+async function reportActivity(directory: string, verb: 'pickup' | 'keepalive' | 'complete'): Promise<void> {
+  const auth = resolveDevspecAuth(directory)
+  const state = readState(directory)
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
+  const tool = { pickup: 'report_pickup', keepalive: 'report_keepalive', complete: 'report_complete' }[verb]
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: tool,
+      arguments: { connection_id: state.connectionId },
+    })
+  } catch (err) {
+    // Best-effort — never break the poll loop over this.
+    logPoll(`reportActivity(${verb}) failed: ${err}`)
+  }
+}
+
+/**
  * Assert heartbeat_connection's `busy` flag — see the `busy` field doc on
  * ConnectionState for why this exists. Call with `true` right before
  * kicking off a delivered message's turn, and `false` as soon as OpenCode's
- * own `session.idle` event confirms the turn actually finished.
+ * own `session.idle` event confirms the turn actually finished. Also emits
+ * the corresponding report_pickup/report_complete activity verb (see
+ * reportActivity) on the same transition — folded in here rather than at
+ * each call site so the two mechanisms can never drift out of sync.
  */
 export async function setBusy(directory: string, busy: boolean): Promise<void> {
   const auth = resolveDevspecAuth(directory)
@@ -140,7 +174,9 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
     logPoll(`setBusy(${busy}) heartbeat_connection call failed: ${err}`)
+    return
   }
+  await reportActivity(directory, busy ? 'pickup' : 'complete')
 }
 
 function stateFile(directory: string): string {
@@ -448,6 +484,15 @@ export async function pollAndDeliver(
     // just slow" from the owner's side.
     await reportPollError(auth, directory, state.sessionId, 'heartbeat_connection', err)
     return
+  }
+
+  // Ported from the Claude Code poller's activity-verb emission: while a
+  // turn is genuinely in progress, re-assert report_keepalive on the SAME
+  // cadence as the routine busy-heartbeat above (this function already runs
+  // every 8s via the interval backstop) — mirrors "one poll tick = one
+  // keepalive (attended cadence)" from the reference implementation.
+  if (state.busy) {
+    await reportActivity(directory, 'keepalive')
   }
 
   // Server-authoritative attachment. The heartbeat response — not local state —
