@@ -227,6 +227,52 @@ export async function stopConnection(directory: string): Promise<void> {
   }
 }
 
+// Dedup key for reportPollError, keyed by directory — avoids spamming DevSpec
+// with the same warning every 8s from the interval backstop. Module-level and
+// in-memory only (resets on server restart); that's fine, a repeat failure
+// re-posting once per minute is still far better than the total silence this
+// replaces.
+const lastPollErrorReports = new Map<string, { message: string; at: number }>()
+const POLL_ERROR_REPORT_COOLDOWN_MS = 60_000
+
+/**
+ * Post a poll failure back into the DevSpec session so it's diagnosable from
+ * the owner's side, not just the machine's own (usually inaccessible) logs.
+ *
+ * Real gap found live-testing: `pollAndDeliver`'s heartbeat/transcript-fetch
+ * failures were caught-and-swallowed with zero trace anywhere — a dispatched
+ * message could sit as "waiting for pickup" forever with no way for the
+ * owner (or anyone debugging remotely) to tell whether delivery was merely
+ * slow or the whole poll loop was silently broken.
+ */
+async function reportPollError(
+  auth: ReturnType<typeof resolveDevspecAuth>,
+  directory: string,
+  sessionId: string | null,
+  stage: string,
+  err: unknown,
+): Promise<void> {
+  if (!auth.ok || !auth.token || !auth.mcp_url || !sessionId) return
+  const message = err instanceof Error ? err.message : String(err)
+  const key = `${directory}:${stage}`
+  const prior = lastPollErrorReports.get(key)
+  if (prior && prior.message === message && Date.now() - prior.at < POLL_ERROR_REPORT_COOLDOWN_MS) return
+  lastPollErrorReports.set(key, { message, at: Date.now() })
+
+  await mcpToolsCall({
+    mcpUrl: auth.mcp_url,
+    token: auth.token,
+    name: 'post_session_message',
+    arguments: {
+      session_id: sessionId,
+      agent_name: 'OpenCode',
+      message: `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`,
+    },
+  }).catch(() => {
+    // Best-effort — a failed error-report must never crash the poll loop.
+  })
+}
+
 /**
  * Poll DevSpec for owner commands and inject any into the live OpenCode
  * session directly. Call this from the `session.idle` event — no separate
@@ -248,8 +294,13 @@ export async function pollAndDeliver(
       name: 'heartbeat_connection',
       arguments: { connection_id: state.connectionId, status: 'live' },
     })
-  } catch {
-    return // connection may have ended server-side — next idle cycle will re-check
+  } catch (err) {
+    // connection may have ended server-side — next idle cycle will re-check.
+    // Still surface it: a persistently failing heartbeat means NOTHING below
+    // this line ever runs, which previously looked identical to "delivered,
+    // just slow" from the owner's side.
+    await reportPollError(auth, directory, state.sessionId, 'heartbeat_connection', err)
+    return
   }
 
   if (!state.sessionId) return
@@ -268,7 +319,10 @@ export async function pollAndDeliver(
       connection_id: state.connectionId,
       ...(state.lastDeliveredMessageId ? { after_message_id: state.lastDeliveredMessageId } : {}),
     },
-  }).catch(() => null)
+  }).catch((err) => {
+    void reportPollError(auth, directory, state.sessionId, 'get_session_transcript', err)
+    return null
+  })
 
   const allMessages: any[] = Array.isArray(transcript?.messages) ? transcript.messages : []
   if (allMessages.length > 0) {
