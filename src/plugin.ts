@@ -1,19 +1,18 @@
 import type { Plugin } from '@opencode-ai/plugin'
-import { pollAndDeliver, recordConnectionEventFromTool, setBusy } from './remote-control.js'
+import { logPoll, pollAndDeliver, recordConnectionEventFromTool, setBusy } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
 
 /**
- * Backstop poll cadence (ms). `session.idle` is edge-triggered — it only
- * fires on a busy→idle transition, never while a session simply SITS idle.
- * Real bug found live-testing: after the initial connect handshake, the
- * OpenCode session went idle once (one poll fired, delivered nothing new
- * yet), and then nothing further happened inside OpenCode itself — so no
- * second idle event ever fired. A message dispatched from DevSpec after
- * that point (a plain "are you there?") sat forever with nothing left to
- * pick it up; DevSpec showed "Sent · waiting for OpenCode to pick up"
- * indefinitely even though the connection was genuinely live. This interval
- * is the fix: poll on a fixed cadence regardless of session activity, in
- * addition to (not instead of) the low-latency idle-triggered poll.
+ * Backstop poll cadence (ms). Originally added alongside `session.idle` as
+ * a defensive fallback for the (assumed) case where idle wouldn't refire.
+ * Confirmed live via a full event-type log for a connect handshake and
+ * several turns: `session.idle` never fires — not once, ever, in this
+ * OpenCode version. The events that DO fire are session.created/updated/
+ * status/diff and message.updated/part.updated/part.delta. This interval
+ * is therefore not a backstop at all — it is the ONLY thing driving
+ * delivery and mirroring. Left running at this cadence; see remote-control.ts
+ * for the `busy` flag's own fix now that its true "turn finished" signal
+ * (session.idle) turned out not to exist either.
  */
 const POLL_INTERVAL_MS = 8000
 
@@ -35,13 +34,13 @@ const POLL_INTERVAL_MS = 8000
  * `@opencode-ai/plugin`/`@opencode-ai/sdk` type definitions, not assumed
  * from docs.
  *
- * Remote control (see src/remote-control.ts) piggybacks on this same
- * `session.idle` event for low-latency delivery right after activity, PLUS
- * a fixed-cadence `setInterval` backstop (see POLL_INTERVAL_MS above) so a
- * message dispatched from DevSpec while the session is already sitting idle
- * still gets picked up — `session.idle` alone is edge-triggered and will
- * not fire again just because time passes. No separate poller process or
- * inbox file, unlike Claude Code's design — see remote-control.ts for why.
+ * Remote control (see src/remote-control.ts) still listens for `session.idle`
+ * for the low-latency path this was originally designed around, but per the
+ * POLL_INTERVAL_MS note above, that event has never been observed to fire —
+ * the `setInterval` backstop is what actually delivers and mirrors
+ * everything today. Kept in case a future OpenCode version fires it. No
+ * separate poller process or inbox file, unlike Claude Code's design — see
+ * remote-control.ts for why.
  *
  * The `config` hook registers this package's bundled commands/*.md files
  * into OpenCode's declarative `command` config (see register-commands.ts) —
@@ -64,21 +63,25 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   let lastKnownSessionId: string | null = null
   let pollInFlight = false
 
-  const poll = async (sessionId: string | null) => {
-    if (!sessionId || pollInFlight) return
+  const poll = async (sessionId: string | null, trigger: string) => {
+    if (!sessionId || pollInFlight) {
+      logPoll(`poll(${trigger}) skipped: sessionId=${sessionId} pollInFlight=${pollInFlight}`)
+      return
+    }
     pollInFlight = true
     try {
       await pollAndDeliver(client, directory, sessionId)
-    } catch {
+    } catch (err) {
       // Remote control is best-effort — a delivery failure must never
       // interrupt the session the user is actually working in.
+      logPoll(`poll(${trigger}) pollAndDeliver threw: ${err}`)
     } finally {
       pollInFlight = false
     }
   }
 
   const backstop = setInterval(() => {
-    void poll(lastKnownSessionId)
+    void poll(lastKnownSessionId, 'interval')
   }, POLL_INTERVAL_MS)
   // Never let this timer keep the process alive on its own — it's a
   // best-effort backstop, not a reason for the server to refuse to exit.
@@ -91,6 +94,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     event: async ({ event }) => {
       const sessionId = (event as { properties?: { sessionID?: string } }).properties?.sessionID
       if (typeof sessionId === 'string') lastKnownSessionId = sessionId
+      logPoll(`event received: type=${event.type} sessionID=${sessionId}`)
       if (event.type === 'session.idle') {
         // Real gap found live-testing: heartbeat_connection was never once
         // called with `busy` — the DevSpec session UI's "OpenCode is
@@ -101,7 +105,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // runs and (if there's a newly dispatched message to act on)
         // reasserts busy:true itself.
         await setBusy(directory, false)
-        await poll(sessionId ?? lastKnownSessionId)
+        await poll(sessionId ?? lastKnownSessionId, 'session.idle')
       }
     },
     'tool.execute.after': async (input, output) => {

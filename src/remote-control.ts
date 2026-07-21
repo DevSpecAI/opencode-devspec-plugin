@@ -30,6 +30,31 @@ import { AGENT_NAME } from './agent-identity.js'
 import { mcpToolsCall } from './devspec-client.js'
 import { resolveDevspecAuth } from './resolve-devspec-auth.js'
 
+/**
+ * Persistent diagnostic log for the poll loop's own decisions — every
+ * heartbeat's busy value, every delivery/mirror decision, every busy
+ * transition. Real gap found live-testing: none of this was ever recorded
+ * anywhere, and Axiom has no visibility into heartbeat_connection calls
+ * either (they don't appear in the standard tool-call telemetry at all,
+ * unlike register_connection/get_session_transcript/post_session_message,
+ * which do) — so a stuck "OpenCode is working…" indicator, or a duplicate
+ * mirrored reply, was completely undiagnosable from either side without
+ * this. Colocated with launch-opencode-session.mjs's own launcher.log
+ * (same directory, different file) in the other repo.
+ */
+function pollLogFile(): string {
+  return path.join(os.homedir(), '.devspec', 'opencode-remote-control', 'poll.log')
+}
+
+export function logPoll(line: string): void {
+  try {
+    fs.mkdirSync(path.dirname(pollLogFile()), { recursive: true })
+    fs.appendFileSync(pollLogFile(), `${new Date().toISOString()} ${line}\n`, 'utf8')
+  } catch {
+    // best-effort — logging must never be why a poll fails
+  }
+}
+
 interface ConnectionState {
   connectionId: string
   sessionId: string | null
@@ -83,7 +108,11 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
   const auth = resolveDevspecAuth(directory)
   const state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
-  if (state.busy === busy) return // already asserted — avoid a redundant call
+  if (state.busy === busy) {
+    logPoll(`setBusy(${busy}) skipped — already ${state.busy}`)
+    return // already asserted — avoid a redundant call
+  }
+  logPoll(`setBusy(${busy}) — was ${state.busy}`)
   try {
     await mcpToolsCall({
       mcpUrl: auth.mcp_url,
@@ -94,8 +123,9 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy },
     })
     writeState(directory, { ...state, busy })
-  } catch {
+  } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
+    logPoll(`setBusy(${busy}) heartbeat_connection call failed: ${err}`)
   }
 }
 
@@ -381,6 +411,7 @@ export async function pollAndDeliver(
   // of earlier ones instead of reverting them.
   let state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
+  logPoll(`pollAndDeliver start sessionId(opencode)=${sessionId} devspecSession=${state.sessionId} busy=${state.busy} lastDelivered=${state.lastDeliveredMessageId} lastMirrored=${state.lastMirroredMessageId}`)
 
   let hb: unknown
   try {
@@ -455,6 +486,10 @@ export async function pollAndDeliver(
 
   const toDeliver = allMessages.filter((m) => m?.remote_control?.is_owner_instruction === true)
   const deliveredIds = new Set(state.deliveredMessageIds ?? [])
+  logPoll(
+    `fetched ${allMessages.length} messages, ${toDeliver.length} owner instructions, ` +
+      `undelivered=${toDeliver.filter((m) => typeof m?.id === 'string' && !deliveredIds.has(m.id)).map((m) => m.id).join(',') || 'none'}`,
+  )
 
   // Assert busy BEFORE kicking off any turn — see setBusy's doc. Only the
   // undelivered ones matter (an all-already-delivered batch means nothing
@@ -512,6 +547,11 @@ export async function pollAndDeliver(
       }).catch(() => {
         // Best-effort — a failed error-report must never crash the poll loop.
       })
+      // promptAsync itself failed, so no turn is actually running — clear
+      // the busy flag asserted above, or it would stick at true with no
+      // reply ever coming to clear it via mirrorLatestReply's own path.
+      await setBusy(directory, false)
+      state = { ...state, busy: false }
     }
   }
 
@@ -542,13 +582,21 @@ async function mirrorLatestReply(
   try {
     const res: any = await (client as any).session.messages({ path: { id: sessionId } })
     messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
-  } catch {
+  } catch (err) {
+    logPoll(`mirrorLatestReply: client.session.messages failed: ${err}`)
     return
   }
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
   const last = assistantMessages[assistantMessages.length - 1]
-  if (!last?.info?.id || last.info.id === state.lastMirroredMessageId) return
+  logPoll(
+    `mirrorLatestReply: ${assistantMessages.length} assistant messages, last.id=${last?.info?.id}, ` +
+      `lastMirrored=${state.lastMirroredMessageId}`,
+  )
+  if (!last?.info?.id || last.info.id === state.lastMirroredMessageId) {
+    logPoll(`mirrorLatestReply: skip (same as lastMirrored or no last message)`)
+    return
+  }
 
   const text = (last.parts ?? [])
     .filter((p: any) => p?.type === 'text' && typeof p.text === 'string')
@@ -557,6 +605,7 @@ async function mirrorLatestReply(
     .trim()
 
   if (!text) {
+    logPoll(`mirrorLatestReply: last.id=${last.info.id} has no text yet, not persisting — will recheck`)
     // Real bug found live-testing: a message can be checked WHILE STILL
     // STREAMING (no text parts yet) — marking it "mirrored" here (as this
     // code used to) meant it was permanently skipped even once it finished
@@ -589,10 +638,24 @@ async function mirrorLatestReply(
         ...(model ? { model } : {}),
       },
     })
-  } catch {
+  } catch (err) {
     // Leave the cursor unadvanced so this same reply is retried next idle poll.
+    logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
     return
   }
 
+  logPoll(`mirrorLatestReply: posted last.id=${last.info.id}`)
   writeState(directory, { ...state, lastMirroredMessageId: last.info.id })
+
+  // Real bug found live-testing: `session.idle` — the event the busy:false
+  // transition was gated on — never fires even once in practice (confirmed
+  // by logging every single event type received over a full connect +
+  // multiple turns: session.created/updated/status/diff, message.updated,
+  // message.part.updated/delta — never session.idle). That left busy stuck
+  // true forever after the first delivered message, exactly matching a
+  // live report of the "OpenCode is working…" indicator never turning off.
+  // A completed reply with real text (this point, right after successfully
+  // posting one) is the clearest signal actually available that a turn
+  // just finished — use it instead of the dead event.
+  await setBusy(directory, false)
 }
