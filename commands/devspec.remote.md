@@ -17,7 +17,15 @@ Unlike the Claude Code plugin, this does not spawn a separate background poller 
    - `--new` → not yet supported for OpenCode (no `create_session` wiring here yet) — tell the user to attach to an existing session instead, or use Claude Code/Cursor for `--new`.
    - bare (no flags) → register a sessionless connection; it shows as available on the Agents page with no session attached.
 
-2. **Register the connection.** First run `git remote get-url origin` in the project directory. Call the DevSpec MCP tool `register_connection` with `agent_name: "OpenCode"`, `cwd` set to the project directory, and `git_remote` set to that URL — passing it up front avoids a round-trip: the account may be able to access more than one DevSpec project, and without `git_remote` the call fails asking for exactly this. This is idempotent — running the command again in the same project reuses the same connection rather than creating a duplicate. Store the returned `connection_id` and **`codename`** (an auto-minted adjective-animal identity, e.g. "Brave Otter") — tell the user which codename identifies this OpenCode instance on the Agents page.
+2. **Register the connection.** First run `git remote get-url origin` in the project directory.
+
+   `register_connection` requires `local_id` — a **stable** value that must be the exact same on every call for this project, or each call registers a brand-new connection instead of reusing one (this is exactly what "idempotent" depends on, and there's no `CLAUDE_SESSION_ID`-equivalent env var available to read here — confirmed live: OpenCode sets no session-identifying env var, so this must be derived, not looked up). Compute it deterministically from the resolved project directory — run:
+   ```
+   node -e "console.log(Buffer.from(require('path').resolve(process.cwd())).toString('base64url').slice(0,32))"
+   ```
+   This matches the hash the DevSpec plugin itself uses for its own local state file, so the two stay in step. Do **not** generate a random UUID, read an environment variable, or invent any other value — always run this exact command.
+
+   Then call the DevSpec MCP tool `register_connection` with `agent_name: "OpenCode"`, `cwd` set to the project directory, `git_remote` set to the URL from above, and `local_id` set to that computed value. Passing `git_remote` up front avoids a round-trip: the account may be able to access more than one DevSpec project, and without `git_remote` the call fails asking for exactly this. Store the returned `connection_id` and **`codename`** (an auto-minted adjective-animal identity, e.g. "Brave Otter") — tell the user which codename identifies this OpenCode instance on the Agents page.
 
 3. **Attach to a session (only if `--session <uuid>` was given).** Call `attach_connection({ connection_id, session_id })`. Never call `create_session` from this command.
 
