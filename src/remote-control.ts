@@ -33,6 +33,19 @@ interface ConnectionState {
   connectionId: string
   sessionId: string | null
   codename: string | null
+  /**
+   * Id of the last OpenCode assistant message we mirrored back to DevSpec via
+   * post_session_message. Prevents re-posting the same reply on every idle
+   * poll — there is no other cursor for "have we already reported this one".
+   */
+  lastMirroredMessageId?: string | null
+  /**
+   * Cursor into the DevSpec transcript (last delivered message id). Without
+   * this, every idle poll re-fetched the WHOLE transcript and re-delivered
+   * every owner instruction ever posted — a real bug fixed alongside the
+   * model-override work, not a hypothetical one.
+   */
+  lastDeliveredMessageId?: string | null
 }
 
 function stateFile(directory: string): string {
@@ -147,36 +160,143 @@ export async function pollAndDeliver(
     return // connection may have ended server-side — next idle cycle will re-check
   }
 
-  const dispatch: any = await mcpToolsCall({
+  if (!state.sessionId) return
+
+  // NOTE: get_connection_dispatch is for agent_assignment work-item batches
+  // (autopilot), not ad-hoc chat messages — it has no `owner_messages` field.
+  // The real delivery path is the session transcript's `remote_control` stamp
+  // below; an earlier version of this file called get_connection_dispatch
+  // expecting owner_messages, which silently always returned nothing.
+  const transcript: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
     token: auth.token,
-    name: 'get_connection_dispatch',
-    arguments: { connection_id: state.connectionId },
+    name: 'get_session_transcript',
+    arguments: {
+      session_id: state.sessionId,
+      connection_id: state.connectionId,
+      ...(state.lastDeliveredMessageId ? { after_message_id: state.lastDeliveredMessageId } : {}),
+    },
   }).catch(() => null)
 
-  const ownerMessages: any[] = Array.isArray(dispatch?.owner_messages) ? dispatch.owner_messages : []
-
-  let transcriptMessages: any[] = []
-  if (state.sessionId) {
-    const transcript: any = await mcpToolsCall({
-      mcpUrl: auth.mcp_url,
-      token: auth.token,
-      name: 'get_session_transcript',
-      arguments: { session_id: state.sessionId, connection_id: state.connectionId },
-    }).catch(() => null)
-    transcriptMessages = (transcript?.messages ?? []).filter(
-      (m: any) => m?.remote_control?.is_owner_instruction === true,
-    )
+  const allMessages: any[] = Array.isArray(transcript?.messages) ? transcript.messages : []
+  if (allMessages.length > 0) {
+    // Advance the cursor even for messages we don't deliver (advisory context) —
+    // without this, every idle poll re-fetched the WHOLE transcript and
+    // re-delivered every owner instruction ever posted to this session.
+    writeState(directory, { ...state, lastDeliveredMessageId: allMessages[allMessages.length - 1].id })
   }
 
-  const toDeliver = [...ownerMessages, ...transcriptMessages]
+  const toDeliver = allMessages.filter((m) => m?.remote_control?.is_owner_instruction === true)
+
   for (const msg of toDeliver) {
     const text = typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg?.content ?? msg)
-    // client.session.promptAsync injects the message directly into the running
-    // session (POST /session/:id/message under the hood) — no manual paste.
-    await (client as any).session.promptAsync({
-      path: { id: sessionId },
-      body: { parts: [{ type: 'text', text }] },
-    })
+    // Per-message provider/model override — only meaningful for
+    // provider-agnostic tools (OpenCode). Verified live: promptAsync's body
+    // accepts an optional {providerID, modelID} independent of any agent config.
+    const rawModel = msg?.dispatch_model
+    const model =
+      rawModel && typeof rawModel === 'object' && typeof rawModel.providerID === 'string' && typeof rawModel.modelID === 'string'
+        ? { providerID: rawModel.providerID, modelID: rawModel.modelID }
+        : undefined
+
+    try {
+      // client.session.promptAsync injects the message directly into the running
+      // session (POST /session/:id/message under the hood) — no manual paste.
+      await (client as any).session.promptAsync({
+        path: { id: sessionId },
+        body: { parts: [{ type: 'text', text }], ...(model ? { model } : {}) },
+      })
+    } catch (err) {
+      // A rejected model/credential must surface back into the DevSpec
+      // transcript, not vanish silently on the user's own machine.
+      const reason = err instanceof Error ? err.message : String(err)
+      await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'post_session_message',
+        arguments: {
+          session_id: state.sessionId,
+          agent_name: 'OpenCode',
+          message: model
+            ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
+            : `⚠️ Could not deliver this message: ${reason}`,
+        },
+      }).catch(() => {
+        // Best-effort — a failed error-report must never crash the poll loop.
+      })
+    }
   }
+
+  await mirrorLatestReply(client, auth, directory, state, sessionId)
+}
+
+/**
+ * Mirror OpenCode's own latest assistant reply back into the DevSpec session,
+ * including which model produced it. Only the SINGLE most recent assistant
+ * message is checked each poll (not a backlog) — cheap, and avoids flooding
+ * DevSpec with a dump of prior history on first connect.
+ *
+ * This direction (OpenCode → DevSpec) did not exist before this change — the
+ * plugin only ever delivered DevSpec → OpenCode. Without it, an owner could
+ * pick a model and send a message, but would never see OpenCode's answer
+ * appear back in the DevSpec session at all.
+ */
+async function mirrorLatestReply(
+  client: Parameters<Plugin>[0]['client'],
+  auth: ReturnType<typeof resolveDevspecAuth>,
+  directory: string,
+  state: ConnectionState,
+  sessionId: string,
+): Promise<void> {
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state.sessionId) return
+
+  let messages: any[]
+  try {
+    const res: any = await (client as any).session.messages({ path: { id: sessionId } })
+    messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+  } catch {
+    return
+  }
+
+  const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
+  const last = assistantMessages[assistantMessages.length - 1]
+  if (!last?.info?.id || last.info.id === state.lastMirroredMessageId) return
+
+  const text = (last.parts ?? [])
+    .filter((p: any) => p?.type === 'text' && typeof p.text === 'string')
+    .map((p: any) => p.text)
+    .join('\n')
+    .trim()
+
+  if (!text) {
+    // Nothing textual to mirror (e.g. a pure tool-call turn) — still advance
+    // the cursor so this same non-text message isn't rechecked forever.
+    writeState(directory, { ...state, lastMirroredMessageId: last.info.id })
+    return
+  }
+
+  const modelInfo = last.info.model
+  const model =
+    modelInfo && typeof modelInfo.providerID === 'string' && typeof modelInfo.modelID === 'string'
+      ? { providerID: modelInfo.providerID, modelID: modelInfo.modelID }
+      : undefined
+
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: {
+        session_id: state.sessionId,
+        agent_name: 'OpenCode',
+        message: text,
+        ...(model ? { model } : {}),
+      },
+    })
+  } catch {
+    // Leave the cursor unadvanced so this same reply is retried next idle poll.
+    return
+  }
+
+  writeState(directory, { ...state, lastMirroredMessageId: last.info.id })
 }
