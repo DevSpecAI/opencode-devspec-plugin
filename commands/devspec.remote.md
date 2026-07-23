@@ -21,19 +21,19 @@ Unlike the Claude Code plugin, this does not spawn a separate background poller 
 
    `register_connection` requires `local_id` — a **stable** value that must be the exact same on every call for the SAME target (this project, plus the target session when one is named), or each call registers a brand-new connection instead of reusing one. There's no `CLAUDE_SESSION_ID`-equivalent env var available to read here — confirmed live: OpenCode sets no session-identifying env var, so this must be derived, not looked up.
 
-   **Critically, `local_id` must incorporate the `--session <uuid>` value when one was given** — folder path alone is NOT enough. Folder-only identity was a real, live-observed bug: launching against a second session for the same checkout silently reused the SAME connection and *moved* it away from whichever session had it first ("left A, joined B"), disconnecting that session's agent out from under it. Compute it deterministically:
+   **Critically, `local_id` must incorporate the `--session <uuid>` value when one was given** — folder path alone is NOT enough. Folder-only identity was a real, live-observed bug: launching against a second session for the same checkout silently reused the SAME connection and *moved* it away from whichever session had it first ("left A, joined B"), disconnecting that session's agent out from under it. Compute it deterministically with a real hash — NOT plain base64 truncation, which silently fails to distinguish sessions: a resolved project path is typically already 100+ characters, encoding to 130+ base64 characters on its own, so truncating raw base64 to 32 chars keeps only the folder's own encoding and never reaches the appended session id at all (confirmed live: three different sessions for one folder all produced the identical truncated string). A cryptographic hash avoids this because every input byte affects every output character:
 
    - **`--session <uuid>` given** — fold the session id into the key so this exact session gets its own stable identity, distinct from any other session against the same folder:
      ```
-     node -e "console.log(Buffer.from(require('path').resolve(process.cwd()) + ':' + process.argv[1]).toString('base64url').slice(0,32))" -- <session-uuid>
+     node -e "console.log(require('crypto').createHash('sha256').update(require('path').resolve(process.cwd()) + ':' + process.argv[1]).digest('base64url').slice(0,32))" -- <session-uuid>
      ```
      Substitute the literal `--session` value for `<session-uuid>`.
    - **bare (no `--session`)** — no session to fold in, so directory alone (unchanged from before):
      ```
-     node -e "console.log(Buffer.from(require('path').resolve(process.cwd())).toString('base64url').slice(0,32))"
+     node -e "console.log(require('crypto').createHash('sha256').update(require('path').resolve(process.cwd())).digest('base64url').slice(0,32))"
      ```
 
-   Do **not** generate a random UUID, read an environment variable, or invent any other value — always run the exact command for the case that applies. Re-running the SAME command (same directory, same `--session` value or bare) must always reproduce the same `local_id`, so a reconnect reuses the existing connection instead of registering a new one.
+   Do **not** generate a random UUID, read an environment variable, invent any other value, or fall back to plain base64 (see above) — always run the exact command for the case that applies. Re-running the SAME command (same directory, same `--session` value or bare) must always reproduce the same `local_id`, so a reconnect reuses the existing connection instead of registering a new one.
 
    Then call the DevSpec MCP tool `register_connection` with `agent_name: "OpenCode"`, `cwd` set to the project directory, `git_remote` set to the URL from above, and `local_id` set to that computed value. Passing `git_remote` up front avoids a round-trip: the account may be able to access more than one DevSpec project, and without `git_remote` the call fails asking for exactly this. Store the returned `connection_id` and **`codename`** (an auto-minted adjective-animal identity, e.g. "Brave Otter") — tell the user which codename identifies this OpenCode instance on the Agents page.
 
