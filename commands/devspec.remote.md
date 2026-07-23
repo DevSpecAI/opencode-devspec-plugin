@@ -19,11 +19,21 @@ Unlike the Claude Code plugin, this does not spawn a separate background poller 
 
 2. **Register the connection.** First run `git remote get-url origin` in the project directory.
 
-   `register_connection` requires `local_id` — a **stable** value that must be the exact same on every call for this project, or each call registers a brand-new connection instead of reusing one (this is exactly what "idempotent" depends on, and there's no `CLAUDE_SESSION_ID`-equivalent env var available to read here — confirmed live: OpenCode sets no session-identifying env var, so this must be derived, not looked up). Compute it deterministically from the resolved project directory — run:
-   ```
-   node -e "console.log(Buffer.from(require('path').resolve(process.cwd())).toString('base64url').slice(0,32))"
-   ```
-   This matches the hash the DevSpec plugin itself uses for its own local state file, so the two stay in step. Do **not** generate a random UUID, read an environment variable, or invent any other value — always run this exact command.
+   `register_connection` requires `local_id` — a **stable** value that must be the exact same on every call for the SAME target (this project, plus the target session when one is named), or each call registers a brand-new connection instead of reusing one. There's no `CLAUDE_SESSION_ID`-equivalent env var available to read here — confirmed live: OpenCode sets no session-identifying env var, so this must be derived, not looked up.
+
+   **Critically, `local_id` must incorporate the `--session <uuid>` value when one was given** — folder path alone is NOT enough. Folder-only identity was a real, live-observed bug: launching against a second session for the same checkout silently reused the SAME connection and *moved* it away from whichever session had it first ("left A, joined B"), disconnecting that session's agent out from under it. Compute it deterministically:
+
+   - **`--session <uuid>` given** — fold the session id into the key so this exact session gets its own stable identity, distinct from any other session against the same folder:
+     ```
+     node -e "console.log(Buffer.from(require('path').resolve(process.cwd()) + ':' + process.argv[1]).toString('base64url').slice(0,32))" -- <session-uuid>
+     ```
+     Substitute the literal `--session` value for `<session-uuid>`.
+   - **bare (no `--session`)** — no session to fold in, so directory alone (unchanged from before):
+     ```
+     node -e "console.log(Buffer.from(require('path').resolve(process.cwd())).toString('base64url').slice(0,32))"
+     ```
+
+   Do **not** generate a random UUID, read an environment variable, or invent any other value — always run the exact command for the case that applies. Re-running the SAME command (same directory, same `--session` value or bare) must always reproduce the same `local_id`, so a reconnect reuses the existing connection instead of registering a new one.
 
    Then call the DevSpec MCP tool `register_connection` with `agent_name: "OpenCode"`, `cwd` set to the project directory, `git_remote` set to the URL from above, and `local_id` set to that computed value. Passing `git_remote` up front avoids a round-trip: the account may be able to access more than one DevSpec project, and without `git_remote` the call fails asking for exactly this. Store the returned `connection_id` and **`codename`** (an auto-minted adjective-animal identity, e.g. "Brave Otter") — tell the user which codename identifies this OpenCode instance on the Agents page.
 

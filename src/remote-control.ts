@@ -335,8 +335,32 @@ export async function handleSessionError(directory: string, event: unknown): Pro
   await setBusy(directory, false)
 }
 
+/**
+ * DevSpec session id this plugin process is currently bound to. Set once
+ * `recordConnectionEventFromTool` observes a successful `attach_connection`
+ * carrying a session id — mirrors plugin.ts's own `lastKnownSessionId` pin
+ * (same event, same moment), just keyed to the DevSpec session instead of
+ * the OpenCode-internal one.
+ *
+ * Folding this into `stateFile`'s key (below) is what lets two `opencode
+ * serve` processes for the SAME project folder — one per DevSpec session —
+ * keep fully independent local state instead of silently sharing (and
+ * corrupting) one file keyed on folder path alone. Before attach (or for a
+ * bare, sessionless connection) this stays null and state falls back to the
+ * folder-only key, unchanged from before — session-scoping only matters once
+ * a session is actually in play.
+ */
+let boundSessionId: string | null = null
+
+/**
+ * Matches the key `devspec.remote.md` computes for `local_id` (see step 2
+ * there) so the local state file and the server-side connection identity
+ * stay in step: same folder+session in, same hash out, on both sides.
+ */
 function stateFile(directory: string): string {
-  const key = Buffer.from(path.resolve(directory)).toString('base64url').slice(0, 32)
+  const base = path.resolve(directory)
+  const raw = boundSessionId ? `${base}:${boundSessionId}` : base
+  const key = Buffer.from(raw).toString('base64url').slice(0, 32)
   const dir = path.join(os.homedir(), '.devspec', 'opencode-remote-control')
   fs.mkdirSync(dir, { recursive: true })
   return path.join(dir, `${key}.json`)
@@ -429,10 +453,15 @@ export function recordConnectionEventFromTool(
     return
   }
 
-  const existing = readState(directory)
   const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
 
   if (isRegister) {
+    // boundSessionId isn't set yet at this point on a fresh process (attach,
+    // below, is what sets it) — this read/write still lands in the
+    // folder-only file, same as a bare connection. That's fine: the attach
+    // branch below re-binds and migrates state into the session-scoped file
+    // moments later in the same command run, before any poll loop starts.
+    const existing = readState(directory)
     const connectionId = typeof result?.connection_id === 'string' ? result.connection_id : existing?.connectionId
     if (!connectionId) return
     writeState(directory, {
@@ -450,23 +479,33 @@ export function recordConnectionEventFromTool(
   // Attach: connection_id/session_id may come back on the result, or only be
   // present on the call's own args (DevSpec's attach_connection echoes both,
   // but don't assume — fall back to what the model was called with).
+  const sessionId =
+    typeof result?.session_id === 'string'
+      ? result.session_id
+      : typeof argsObj.session_id === 'string'
+        ? (argsObj.session_id as string)
+        : null
+
+  // Bind BEFORE reading `existing` — a reconnect to a session this process
+  // (or a prior run of it) already attached to must resume THAT session's
+  // own state file (cursors, dedup sets), not the transient pre-attach
+  // scratch state the register branch above just wrote to the folder-only
+  // file. See stateFile's doc for why this key flip is what keeps two
+  // concurrent `opencode serve` processes for one folder from sharing state.
+  if (sessionId) boundSessionId = sessionId
+  const existing = readState(directory)
+
   const connectionId =
     typeof result?.connection_id === 'string'
       ? result.connection_id
       : typeof argsObj.connection_id === 'string'
         ? (argsObj.connection_id as string)
         : existing?.connectionId
-  const sessionId =
-    typeof result?.session_id === 'string'
-      ? result.session_id
-      : typeof argsObj.session_id === 'string'
-        ? (argsObj.session_id as string)
-        : existing?.sessionId ?? null
   if (!connectionId) return
 
   writeState(directory, {
     connectionId,
-    sessionId,
+    sessionId: sessionId ?? existing?.sessionId ?? null,
     codename: existing?.codename ?? null,
     lastMirroredMessageId: existing?.lastMirroredMessageId,
     lastDeliveredMessageId: existing?.lastDeliveredMessageId,
@@ -475,17 +514,28 @@ export function recordConnectionEventFromTool(
   })
 }
 
-/** Register (or reuse) this OpenCode instance as a DevSpec connection. Idempotent per directory. */
-export async function ensureConnection(directory: string): Promise<{ auth: ReturnType<typeof resolveDevspecAuth>; state: ConnectionState | null; error?: string }> {
+/**
+ * Register (or reuse) this OpenCode instance as a DevSpec connection.
+ * Idempotent per (directory, sessionId) — pass the target DevSpec session id
+ * when one is already known (see `attachSession`) so this doesn't collapse
+ * onto the same connection as an unrelated session against the same folder;
+ * omit it only for a genuinely sessionless (bare) connection.
+ */
+export async function ensureConnection(
+  directory: string,
+  sessionId?: string | null,
+): Promise<{ auth: ReturnType<typeof resolveDevspecAuth>; state: ConnectionState | null; error?: string }> {
   const auth = resolveDevspecAuth(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url) {
     return { auth, state: null, error: auth.error }
   }
 
+  if (sessionId) boundSessionId = sessionId
   const existing = readState(directory)
   if (existing) return { auth, state: existing }
 
-  const localId = Buffer.from(path.resolve(directory)).toString('base64url').slice(0, 24)
+  const base = path.resolve(directory)
+  const localId = Buffer.from(sessionId ? `${base}:${sessionId}` : base).toString('base64url').slice(0, 32)
   const result: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
     token: auth.token,
@@ -504,7 +554,7 @@ export async function ensureConnection(directory: string): Promise<{ auth: Retur
 
 /** Attach the connection to a DevSpec session — `/devspec.remote --session <id>`. */
 export async function attachSession(directory: string, sessionId: string): Promise<void> {
-  const { auth, state } = await ensureConnection(directory)
+  const { auth, state } = await ensureConnection(directory, sessionId)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) throw new Error(auth.error || 'DevSpec not configured')
   await mcpToolsCall({
     mcpUrl: auth.mcp_url,
@@ -521,6 +571,7 @@ export async function stopConnection(directory: string): Promise<void> {
   const state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
     clearState(directory)
+    boundSessionId = null
     return
   }
   try {
@@ -532,6 +583,7 @@ export async function stopConnection(directory: string): Promise<void> {
     })
   } finally {
     clearState(directory)
+    boundSessionId = null
   }
 }
 
