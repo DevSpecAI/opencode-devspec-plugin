@@ -22,6 +22,7 @@
  * grounded in the real installed SDK types, but treat this as a first
  * implementation pass, not a battle-tested one.
  */
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -353,6 +354,25 @@ export async function handleSessionError(directory: string, event: unknown): Pro
 let boundSessionId: string | null = null
 
 /**
+ * Real bug found live-testing (round 10, same day as the round 9 fix above):
+ * plain `Buffer.from(raw).toString('base64url').slice(0, 32)` does NOT
+ * distinguish sessions in practice. A typical resolved project path is
+ * already well over 32 base64 characters on its own (e.g. a ~100-char
+ * Windows path encodes to 130+ base64 chars), so truncating to 32 chars
+ * keeps ONLY the directory prefix's encoding — the appended `:sessionId`
+ * never survives the slice, no matter what the session id is. Confirmed
+ * live: three different session ids for the same folder all produced the
+ * BYTE-IDENTICAL 32-char key, so every "session-scoped" launch was still
+ * silently sharing one connection/state file, same as before round 9.
+ *
+ * A real hash (not truncated raw encoding) is required so every input byte
+ * — including ones past position ~24 — affects every output character.
+ */
+function hashKey(raw: string): string {
+  return crypto.createHash('sha256').update(raw).digest('base64url').slice(0, 32)
+}
+
+/**
  * Matches the key `devspec.remote.md` computes for `local_id` (see step 2
  * there) so the local state file and the server-side connection identity
  * stay in step: same folder+session in, same hash out, on both sides.
@@ -360,7 +380,7 @@ let boundSessionId: string | null = null
 function stateFile(directory: string): string {
   const base = path.resolve(directory)
   const raw = boundSessionId ? `${base}:${boundSessionId}` : base
-  const key = Buffer.from(raw).toString('base64url').slice(0, 32)
+  const key = hashKey(raw)
   const dir = path.join(os.homedir(), '.devspec', 'opencode-remote-control')
   fs.mkdirSync(dir, { recursive: true })
   return path.join(dir, `${key}.json`)
@@ -535,7 +555,7 @@ export async function ensureConnection(
   if (existing) return { auth, state: existing }
 
   const base = path.resolve(directory)
-  const localId = Buffer.from(sessionId ? `${base}:${sessionId}` : base).toString('base64url').slice(0, 32)
+  const localId = hashKey(sessionId ? `${base}:${sessionId}` : base)
   const result: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
     token: auth.token,
