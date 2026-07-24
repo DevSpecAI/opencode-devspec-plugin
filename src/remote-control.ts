@@ -82,11 +82,18 @@ interface ConnectionState {
   lastMirroredMessageId?: string | null
   /**
    * After we inject an owner command, only mirror assistant messages that
-   * appear *after* this OpenCode message id (correlation). Null = no remote
-   * inject pending baseline (still allow local-terminal mirror of new messages
-   * when attached, never pre-attach history).
+   * appear *after* this OpenCode message id (correlation). Null with
+   * replyBaselineCaptured=true means the snapshot succeeded and there was no
+   * prior assistant (empty history at inject). Null with capture failed must
+   * fail closed — never fall back to newest-in-history.
    */
   replyAfterOpenCodeMessageId?: string | null
+  /**
+   * Whether the pre-inject assistant baseline snapshot succeeded.
+   * false → fail closed on mirror (do not post any assistant for that remote turn).
+   * true + null replyAfter → empty history at inject; any later assistant is new.
+   */
+  replyBaselineCaptured?: boolean
   /** True while waiting for an assistant reply after injecting an owner command. */
   awaitingRemoteReply?: boolean
   /**
@@ -871,18 +878,24 @@ export async function pollAndDeliver(
     try {
       // Baseline: only mirror assistants that appear *after* the last assistant
       // present at inject time (do not post an unrelated prior local answer).
+      // Capture success is tracked separately — a failed snapshot must fail closed
+      // at mirror time (never treat null baseline as "use whole history").
       let replyAfter: string | null = null
+      let baselineCaptured = false
       try {
         const res: any = await (client as any).session.messages({ path: { id: sessionId } })
         const msgs = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
         const assistants = msgs.filter((m: any) => m?.info?.role === 'assistant')
         replyAfter = assistants[assistants.length - 1]?.info?.id ?? null
-      } catch {
-        /* baseline optional — still inject */
+        baselineCaptured = true
+      } catch (err) {
+        logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`)
+        baselineCaptured = false
       }
       state = {
         ...state,
         replyAfterOpenCodeMessageId: replyAfter,
+        replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
       }
       writeState(directory, state)
@@ -920,7 +933,13 @@ export async function pollAndDeliver(
       // the busy flag asserted above, or it would stick at true with no
       // reply ever coming to clear it via mirrorLatestReply's own path.
       await setBusy(directory, false)
-      state = { ...state, busy: false, awaitingRemoteReply: false }
+      state = {
+        ...state,
+        busy: false,
+        awaitingRemoteReply: false,
+        replyAfterOpenCodeMessageId: null,
+        replyBaselineCaptured: undefined,
+      }
       writeState(directory, state)
     }
   }
@@ -1037,33 +1056,49 @@ async function mirrorLatestReply(
   const fresh = readState(directory) ?? state
   const alreadyMirrored = new Set(fresh.mirroredMessageIds ?? [])
   const baseline = fresh.replyAfterOpenCodeMessageId ?? null
+  const baselineCaptured = fresh.replyBaselineCaptured
 
-  // When awaiting a remote reply with a baseline: only assistants *after* that id.
-  // If baseline is missing from the list, FAIL CLOSED (do not post whole history).
+  // When awaiting a remote reply: correlate to pre-inject baseline. Fail closed
+  // if the baseline snapshot failed or the baseline id vanished from history.
   let candidates = assistantMessages
-  if (fresh.awaitingRemoteReply && baseline) {
-    const idx = assistantMessages.findIndex((m) => m?.info?.id === baseline)
-    if (idx < 0) {
+  if (fresh.awaitingRemoteReply) {
+    if (baselineCaptured === false) {
       logPoll(
-        `mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline ${baseline} not in message list`,
+        'mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline snapshot failed at inject',
       )
       return
     }
-    candidates = assistantMessages.slice(idx + 1)
-    if (candidates.length === 0) {
-      logPoll(`mirrorLatestReply: still waiting for assistant after baseline ${baseline}`)
+    if (baseline) {
+      const idx = assistantMessages.findIndex((m) => m?.info?.id === baseline)
+      if (idx < 0) {
+        logPoll(
+          `mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline ${baseline} not in message list`,
+        )
+        return
+      }
+      candidates = assistantMessages.slice(idx + 1)
+      if (candidates.length === 0) {
+        logPoll(`mirrorLatestReply: still waiting for assistant after baseline ${baseline}`)
+        return
+      }
+    } else if (baselineCaptured === true) {
+      // Snapshot succeeded with no prior assistant — any assistant is new.
+      candidates = assistantMessages
+    } else {
+      // Legacy state without replyBaselineCaptured + null baseline: fail closed
+      // rather than risk posting unrelated history.
+      logPoll(
+        'mirrorLatestReply: FAIL CLOSED — awaiting remote reply with null baseline and unknown capture status',
+      )
       return
     }
-  } else if (fresh.awaitingRemoteReply && !baseline) {
-    // Inject had no prior assistant — newest is the only candidate; still OK.
-    candidates = assistantMessages
   }
 
   const last = candidates[candidates.length - 1]
   logPoll(
     `mirrorLatestReply: ${assistantMessages.length} assistant messages, candidates=${candidates.length}, ` +
       `last.id=${last?.info?.id}, lastMirrored=${fresh.lastMirroredMessageId}, ` +
-      `awaiting=${fresh.awaitingRemoteReply} baseline=${baseline}`,
+      `awaiting=${fresh.awaitingRemoteReply} baseline=${baseline} captured=${baselineCaptured}`,
   )
   if (!last?.info?.id || last.info.id === fresh.lastMirroredMessageId || alreadyMirrored.has(last.info.id)) {
     logPoll(`mirrorLatestReply: skip (already mirrored or no last message)`)
@@ -1101,6 +1136,7 @@ async function mirrorLatestReply(
     mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
     awaitingRemoteReply: false,
     replyAfterOpenCodeMessageId: null,
+    replyBaselineCaptured: undefined,
   })
   if (!claimed) return
   // Another writer may have claimed the same id between our check and patch
@@ -1128,6 +1164,7 @@ async function mirrorLatestReply(
       mirroredMessageIds: ids,
       awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
       replyAfterOpenCodeMessageId: fresh.replyAfterOpenCodeMessageId ?? null,
+      replyBaselineCaptured: fresh.replyBaselineCaptured,
     })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
     return

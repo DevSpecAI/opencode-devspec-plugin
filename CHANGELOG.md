@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-07-24
+
+### Remote control — strict baseline fail-closed
+
+- Track `replyBaselineCaptured` separately from the baseline message id.
+- If the pre-inject assistant snapshot **fails**, mirror **fail-closes** (no post of newest-in-history).
+- Empty history at inject (snapshot ok, null baseline) still allows the next assistant as the reply.
+
 ## 0.2.0 - 2026-07-24
 
 ### Remote control — agent-canonical, connection-scoped, session optional
