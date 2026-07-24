@@ -81,6 +81,15 @@ interface ConnectionState {
    */
   lastMirroredMessageId?: string | null
   /**
+   * After we inject an owner command, only mirror assistant messages that
+   * appear *after* this OpenCode message id (correlation). Null = no remote
+   * inject pending baseline (still allow local-terminal mirror of new messages
+   * when attached, never pre-attach history).
+   */
+  replyAfterOpenCodeMessageId?: string | null
+  /** True while waiting for an assistant reply after injecting an owner command. */
+  awaitingRemoteReply?: boolean
+  /**
    * Cursor into the DevSpec transcript (last delivered message id). Without
    * this, every idle poll re-fetched the WHOLE transcript and re-delivered
    * every owner instruction ever posted — a real bug fixed alongside the
@@ -222,18 +231,37 @@ function assistantTextFromMessage(message: { parts?: unknown } | null | undefine
     .trim()
 }
 
+/** Prefer connection_id so the server uses the current attachment (reattach-safe). */
+function postMessageArgs(
+  state: ConnectionState,
+  message: string,
+  extras?: { turn_kind?: 'agent' | 'local_prompt'; model?: { providerID: string; modelID: string } },
+): Record<string, unknown> {
+  const args: Record<string, unknown> = {
+    message,
+    agent_name: AGENT_NAME,
+    ...(extras?.turn_kind ? { turn_kind: extras.turn_kind } : {}),
+    ...(extras?.model ? { model: extras.model } : {}),
+  }
+  if (state.connectionId) args.connection_id = state.connectionId
+  else if (state.sessionId) args.session_id = state.sessionId
+  return args
+}
+
 async function postSessionNotice(
   auth: ReturnType<typeof resolveDevspecAuth>,
-  sessionId: string,
+  state: ConnectionState,
   message: string,
 ): Promise<void> {
   if (!auth.ok || !auth.token || !auth.mcp_url) return
+  // Notices still need an attached session; connection_id path rejects sessionless.
+  if (!state.sessionId && !state.connectionId) return
   try {
     await mcpToolsCall({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'post_session_message',
-      arguments: { session_id: sessionId, agent_name: AGENT_NAME, message },
+      arguments: postMessageArgs(state, message, { turn_kind: 'agent' }),
     })
   } catch (err) {
     logPoll(`postSessionNotice failed: ${err}`)
@@ -300,7 +328,7 @@ export async function checkBusyStall(
   patchState(directory, { stallWarnedAt: state.busySince })
   await postSessionNotice(
     auth,
-    state.sessionId,
+    state,
     `⚠️ OpenCode turn stalled after ${Math.round(elapsed / 1000)}s with no reply text ` +
       `(assistant message \`${lastId}\`). Cleared the busy indicator — check ` +
       `~/.devspec/opencode-remote-control/poll.log if this keeps happening.`,
@@ -326,10 +354,10 @@ export async function handleSessionError(directory: string, event: unknown): Pro
   if (detail.length > 2000) detail = `${detail.slice(0, 2000)}…`
   logPoll(`session.error handled: ${detail}`)
 
-  if (state?.sessionId && auth.ok) {
+  if (state && auth.ok && (state.sessionId || state.connectionId)) {
     await postSessionNotice(
       auth,
-      state.sessionId,
+      state,
       `⚠️ OpenCode reported \`session.error\`. Busy cleared. Detail: ${detail}`,
     )
   }
@@ -628,11 +656,11 @@ const POLL_ERROR_REPORT_COOLDOWN_MS = 60_000
 async function reportPollError(
   auth: ReturnType<typeof resolveDevspecAuth>,
   directory: string,
-  sessionId: string | null,
+  state: ConnectionState | null,
   stage: string,
   err: unknown,
 ): Promise<void> {
-  if (!auth.ok || !auth.token || !auth.mcp_url || !sessionId) return
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId) return
   const message = err instanceof Error ? err.message : String(err)
   const key = `${directory}:${stage}`
   const prior = lastPollErrorReports.get(key)
@@ -643,11 +671,9 @@ async function reportPollError(
     mcpUrl: auth.mcp_url,
     token: auth.token,
     name: 'post_session_message',
-    arguments: {
-      session_id: sessionId,
-      agent_name: AGENT_NAME,
-      message: `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`,
-    },
+    arguments: postMessageArgs(state, `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`, {
+      turn_kind: 'agent',
+    }),
   }).catch(() => {
     // Best-effort — a failed error-report must never crash the poll loop.
   })
@@ -727,7 +753,7 @@ export async function pollAndDeliver(
     // Still surface it: a persistently failing heartbeat means NOTHING below
     // this line ever runs, which previously looked identical to "delivered,
     // just slow" from the owner's side.
-    await reportPollError(auth, directory, state.sessionId, 'heartbeat_connection', err)
+    await reportPollError(auth, directory, state, 'heartbeat_connection', err)
     return
   }
 
@@ -782,7 +808,7 @@ export async function pollAndDeliver(
     // Non-null assertion: `state` is a `let` (reassigned above to compose
     // writes within this call), so TS can't narrow it across this closure —
     // but it's never set back to null anywhere in this function.
-    void reportPollError(auth, directory, state!.sessionId, 'get_session_transcript', err)
+    void reportPollError(auth, directory, state, 'get_session_transcript', err)
     return null
   })
 
@@ -834,6 +860,24 @@ export async function pollAndDeliver(
         : undefined
 
     try {
+      // Baseline: only mirror assistants that appear *after* the last assistant
+      // present at inject time (do not post an unrelated prior local answer).
+      let replyAfter: string | null = null
+      try {
+        const res: any = await (client as any).session.messages({ path: { id: sessionId } })
+        const msgs = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+        const assistants = msgs.filter((m: any) => m?.info?.role === 'assistant')
+        replyAfter = assistants[assistants.length - 1]?.info?.id ?? null
+      } catch {
+        /* baseline optional — still inject */
+      }
+      state = {
+        ...state,
+        replyAfterOpenCodeMessageId: replyAfter,
+        awaitingRemoteReply: true,
+      }
+      writeState(directory, state)
+
       // client.session.promptAsync injects the message directly into the running
       // session (POST /session/:id/message under the hood) — no manual paste.
       await (client as any).session.promptAsync({
@@ -848,13 +892,13 @@ export async function pollAndDeliver(
         mcpUrl: auth.mcp_url,
         token: auth.token,
         name: 'post_session_message',
-        arguments: {
-          session_id: state.sessionId,
-          agent_name: AGENT_NAME,
-          message: model
+        arguments: postMessageArgs(
+          state,
+          model
             ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
             : `⚠️ Could not deliver this message: ${reason}`,
-        },
+          { turn_kind: 'agent' },
+        ),
       }).catch(() => {
         // Best-effort — a failed error-report must never crash the poll loop.
       })
@@ -862,7 +906,8 @@ export async function pollAndDeliver(
       // the busy flag asserted above, or it would stick at true with no
       // reply ever coming to clear it via mirrorLatestReply's own path.
       await setBusy(directory, false)
-      state = { ...state, busy: false }
+      state = { ...state, busy: false, awaitingRemoteReply: false }
+      writeState(directory, state)
     }
   }
 
@@ -870,15 +915,15 @@ export async function pollAndDeliver(
 }
 
 /**
- * Mirror OpenCode's own latest assistant reply back into the DevSpec session,
- * including which model produced it. Only the SINGLE most recent assistant
- * message is checked each poll (not a backlog) — cheap, and avoids flooding
- * DevSpec with a dump of prior history on first connect.
+ * Mirror a completed OpenCode assistant reply into the attached DevSpec session.
  *
- * This direction (OpenCode → DevSpec) did not exist before this change — the
- * plugin only ever delivered DevSpec → OpenCode. Without it, an owner could
- * pick a model and send a message, but would never see OpenCode's answer
- * appear back in the DevSpec session at all.
+ * OpenCode has no separate skill post path — this plugin *is* the agent writer.
+ * Rules (ADR b98a39a9 clean cut):
+ * - Sessionless: never post chat (assignment/progress only).
+ * - Prefer connection_id (server resolves current attachment).
+ * - After a remote inject, only mirror assistants newer than the pre-inject baseline
+ *   so an unrelated older local answer is not re-posted.
+ * - turn_kind: agent.
  */
 async function mirrorLatestReply(
   client: Parameters<Plugin>[0]['client'],
@@ -887,7 +932,8 @@ async function mirrorLatestReply(
   state: ConnectionState,
   sessionId: string,
 ): Promise<void> {
-  if (!auth.ok || !auth.token || !auth.mcp_url || !state.sessionId) return
+  // Sessionless: no room. connection_id without attachment would be rejected server-side.
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state.sessionId || !state.connectionId) return
 
   let messages: any[]
   try {
@@ -899,20 +945,34 @@ async function mirrorLatestReply(
   }
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
-  const last = assistantMessages[assistantMessages.length - 1]
   // Always re-read disk before the dedup decision — a concurrent setBusy /
   // prior mirror may have advanced the cursor since `state` was snapshotted
   // at the top of pollAndDeliver.
   const fresh = readState(directory) ?? state
-  logPoll(
-    `mirrorLatestReply: ${assistantMessages.length} assistant messages, last.id=${last?.info?.id}, ` +
-      `lastMirrored=${fresh.lastMirroredMessageId}`,
-  )
   const alreadyMirrored = new Set(fresh.mirroredMessageIds ?? [])
+  const baseline = fresh.replyAfterOpenCodeMessageId ?? null
+
+  // Prefer the newest assistant after the remote-inject baseline when awaiting.
+  let candidates = assistantMessages
+  if (fresh.awaitingRemoteReply && baseline) {
+    const idx = assistantMessages.findIndex((m) => m?.info?.id === baseline)
+    candidates = idx >= 0 ? assistantMessages.slice(idx + 1) : assistantMessages
+  } else if (fresh.awaitingRemoteReply && !baseline) {
+    candidates = assistantMessages
+  }
+
+  const last = candidates[candidates.length - 1]
+  logPoll(
+    `mirrorLatestReply: ${assistantMessages.length} assistant messages, candidates=${candidates.length}, ` +
+      `last.id=${last?.info?.id}, lastMirrored=${fresh.lastMirroredMessageId}, ` +
+      `awaiting=${fresh.awaitingRemoteReply} baseline=${baseline}`,
+  )
   if (!last?.info?.id || last.info.id === fresh.lastMirroredMessageId || alreadyMirrored.has(last.info.id)) {
     logPoll(`mirrorLatestReply: skip (already mirrored or no last message)`)
     return
   }
+  // When not awaiting a remote reply, still allow local-terminal answers while
+  // attached — but never re-post something older than lastMirrored (handled above).
 
   const text = assistantTextFromMessage(last)
 
@@ -941,6 +1001,8 @@ async function mirrorLatestReply(
   const claimed = patchState(directory, {
     lastMirroredMessageId: last.info.id,
     mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+    awaitingRemoteReply: false,
+    replyAfterOpenCodeMessageId: null,
   })
   if (!claimed) return
   // Another writer may have claimed the same id between our check and patch
@@ -958,12 +1020,7 @@ async function mirrorLatestReply(
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'post_session_message',
-      arguments: {
-        session_id: fresh.sessionId ?? state.sessionId,
-        agent_name: AGENT_NAME,
-        message: text,
-        ...(model ? { model } : {}),
-      },
+      arguments: postMessageArgs(fresh, text, { turn_kind: 'agent', model }),
     })
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.
@@ -971,12 +1028,14 @@ async function mirrorLatestReply(
     patchState(directory, {
       lastMirroredMessageId: fresh.lastMirroredMessageId ?? null,
       mirroredMessageIds: ids,
+      awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
+      replyAfterOpenCodeMessageId: fresh.replyAfterOpenCodeMessageId ?? null,
     })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
     return
   }
 
-  logPoll(`mirrorLatestReply: posted last.id=${last.info.id}`)
+  logPoll(`mirrorLatestReply: posted last.id=${last.info.id} via connection_id`)
 
   // Real bug found live-testing: `session.idle` — the event the busy:false
   // transition was gated on — never fires even once in practice (confirmed
