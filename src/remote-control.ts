@@ -108,6 +108,8 @@ interface ConnectionState {
    * the delivery loop — only needs to cover recent history.
    */
   deliveredMessageIds?: string[]
+  /** Assignment ids already injected into OpenCode (sessionless + attached). */
+  deliveredAssignmentIds?: string[]
   /**
    * Our own last-known assertion of heartbeat_connection's `busy` flag —
    * the SOLE signal that drives the "OpenCode is working…" indicator on the
@@ -788,13 +790,20 @@ export async function pollAndDeliver(
     writeState(directory, state)
   }
 
-  if (!state.sessionId) return
+  // Sessionless path: still receive connection-native assignment work (ADR).
+  // No DevSpec chat posts — inject into the local OpenCode session only.
+  if (!state.sessionId) {
+    await deliverConnectionAssignments(client, auth, directory, state, sessionId)
+    return
+  }
 
   // NOTE: get_connection_dispatch is for agent_assignment work-item batches
   // (autopilot), not ad-hoc chat messages — it has no `owner_messages` field.
-  // The real delivery path is the session transcript's `remote_control` stamp
-  // below; an earlier version of this file called get_connection_dispatch
-  // expecting owner_messages, which silently always returned nothing.
+  // Session owner commands still come from the transcript's remote_control stamp.
+  // Also poll connection dispatch while attached so dual-targeted batches land.
+  await deliverConnectionAssignments(client, auth, directory, state, sessionId)
+  state = readState(directory) ?? state
+
   const transcript: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
     token: auth.token,
@@ -888,20 +897,25 @@ export async function pollAndDeliver(
       // A rejected model/credential must surface back into the DevSpec
       // transcript, not vanish silently on the user's own machine.
       const reason = err instanceof Error ? err.message : String(err)
-      await mcpToolsCall({
-        mcpUrl: auth.mcp_url,
-        token: auth.token,
-        name: 'post_session_message',
-        arguments: postMessageArgs(
-          state,
-          model
-            ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
-            : `⚠️ Could not deliver this message: ${reason}`,
-          { turn_kind: 'agent' },
-        ),
-      }).catch(() => {
-        // Best-effort — a failed error-report must never crash the poll loop.
-      })
+      // Only post errors into DevSpec when attached (sessionless has no room).
+      if (state.sessionId) {
+        await mcpToolsCall({
+          mcpUrl: auth.mcp_url,
+          token: auth.token,
+          name: 'post_session_message',
+          arguments: postMessageArgs(
+            state,
+            model
+              ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
+              : `⚠️ Could not deliver this message: ${reason}`,
+            { turn_kind: 'agent' },
+          ),
+        }).catch(() => {
+          // Best-effort — a failed error-report must never crash the poll loop.
+        })
+      } else {
+        logPoll(`promptAsync failed (sessionless): ${reason}`)
+      }
       // promptAsync itself failed, so no turn is actually running — clear
       // the busy flag asserted above, or it would stick at true with no
       // reply ever coming to clear it via mirrorLatestReply's own path.
@@ -912,6 +926,78 @@ export async function pollAndDeliver(
   }
 
   await mirrorLatestReply(client, auth, directory, state, sessionId)
+}
+
+/**
+ * Poll get_connection_dispatch and inject undelivered assignment batches into
+ * the local OpenCode session (works sessionless — no DevSpec chat post).
+ */
+async function deliverConnectionAssignments(
+  client: Parameters<Plugin>[0]['client'],
+  auth: ReturnType<typeof resolveDevspecAuth>,
+  directory: string,
+  state: ConnectionState,
+  openCodeSessionId: string,
+): Promise<void> {
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state.connectionId) return
+  let dispatch: any
+  try {
+    dispatch = await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'get_connection_dispatch',
+      arguments: { connection_id: state.connectionId },
+    })
+  } catch (err) {
+    logPoll(`get_connection_dispatch failed: ${err}`)
+    return
+  }
+
+  const batches: any[] = Array.isArray(dispatch?.assignments)
+    ? dispatch.assignments
+    : Array.isArray(dispatch?.dispatches)
+      ? dispatch.dispatches
+      : Array.isArray(dispatch)
+        ? dispatch
+        : []
+  if (batches.length === 0) return
+
+  const delivered = new Set(state.deliveredAssignmentIds ?? [])
+  for (const batch of batches) {
+    const id = typeof batch?.id === 'string' ? batch.id : typeof batch?.assignment_id === 'string' ? batch.assignment_id : null
+    if (!id || delivered.has(id)) continue
+    const stateName = String(batch?.state || batch?.status || 'pending')
+    if (stateName === 'completed' || stateName === 'released') continue
+
+    delivered.add(id)
+    state = {
+      ...state,
+      deliveredAssignmentIds: Array.from(delivered).slice(-50),
+    }
+    writeState(directory, state)
+
+    const prompt =
+      `📦 DevSpec assignment for this connection (sessionless-capable).\n\n` +
+      `Assignment reference: \`${id}\`\n\n` +
+      `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
+      `claim_work_item (each member) → implement → record_implementation → resolve_assignment.\n` +
+      `Do not invent a DevSpec chat room. Report progress with report_progress / notes only while sessionless.`
+
+    try {
+      await setBusy(directory, true)
+      await (client as any).session.promptAsync({
+        path: { id: openCodeSessionId },
+        body: { parts: [{ type: 'text', text: prompt }] },
+      })
+      logPoll(`injected assignment ${id} into OpenCode session`)
+    } catch (err) {
+      logPoll(`failed to inject assignment ${id}: ${err}`)
+      // Allow retry on next poll
+      const ids = (readState(directory)?.deliveredAssignmentIds ?? []).filter((x) => x !== id)
+      patchState(directory, { deliveredAssignmentIds: ids })
+      await setBusy(directory, false)
+    }
+  }
 }
 
 /**
@@ -952,12 +1038,24 @@ async function mirrorLatestReply(
   const alreadyMirrored = new Set(fresh.mirroredMessageIds ?? [])
   const baseline = fresh.replyAfterOpenCodeMessageId ?? null
 
-  // Prefer the newest assistant after the remote-inject baseline when awaiting.
+  // When awaiting a remote reply with a baseline: only assistants *after* that id.
+  // If baseline is missing from the list, FAIL CLOSED (do not post whole history).
   let candidates = assistantMessages
   if (fresh.awaitingRemoteReply && baseline) {
     const idx = assistantMessages.findIndex((m) => m?.info?.id === baseline)
-    candidates = idx >= 0 ? assistantMessages.slice(idx + 1) : assistantMessages
+    if (idx < 0) {
+      logPoll(
+        `mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline ${baseline} not in message list`,
+      )
+      return
+    }
+    candidates = assistantMessages.slice(idx + 1)
+    if (candidates.length === 0) {
+      logPoll(`mirrorLatestReply: still waiting for assistant after baseline ${baseline}`)
+      return
+    }
   } else if (fresh.awaitingRemoteReply && !baseline) {
+    // Inject had no prior assistant — newest is the only candidate; still OK.
     candidates = assistantMessages
   }
 
