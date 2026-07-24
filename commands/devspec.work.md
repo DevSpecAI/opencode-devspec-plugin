@@ -75,7 +75,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
      - **`--new` is not supported for OpenCode yet** — if requested, tell the user to pass an existing session UUID or proceed sessionless.
      - **Otherwise leave sessionless** — no `create_session`. Work still runs; Agents page shows the connection.
    - **Progress while implementing:**
-     - **Attached:** optional short progress via `post_session_message({ connection_id, message })` (prefer connection_id). Final human-facing answers when attached also use that path.
+     - **Attached:** the plugin's own poll loop already mirrors your normal OpenCode replies into DevSpec automatically (see `/devspec.remote`'s delivery contract) — do **not** call `post_session_message` yourself for progress updates or the final human-facing answer, or it double-posts. Just say it in your own reply.
      - **Sessionless:** use `report_progress` / implementation notes / assignment protocol only — **never** `post_session_message` and never invent a room.
    - Act only on server-stamped owner commands (`is_owner_instruction === true`).
    - On disconnect / completion, prefer `/devspec.remote-stop` (connection-scoped).

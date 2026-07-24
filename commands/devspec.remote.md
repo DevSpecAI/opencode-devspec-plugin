@@ -57,7 +57,9 @@ Unlike the Claude Code plugin, this does not spawn a separate background poller 
    ───────────────────────────────
    ```
 
-**TERMINAL ONLY — non-negotiable.** Never `post_session_message` this status block, any connect / reconnect / "you're connected" spiel, or disconnect chrome. Presence is the Agents page + connection strip. When you later reply into an attached session, post only a **direct answer** to the owner's command (grounded in the transcript) — no thinking, narration, or process commentary.
+**TERMINAL ONLY — non-negotiable.** Never show this status block, any connect / reconnect / "you're connected" spiel, or disconnect chrome as a chat reply — print it in the terminal only. Presence is the Agents page + connection strip.
+
+**Do not call `post_session_message` yourself for a normal reply — you would double-post.** The plugin already mirrors your own OpenCode chat answer into DevSpec automatically (see the delivery contract at the top of this file); calling `post_session_message` yourself as well posts the same answer twice. Just answer directly in your own OpenCode reply, as a **direct answer** to the owner's command (grounded in the transcript) — no thinking, narration, or process commentary — since that text is exactly what gets mirrored into DevSpec.
 
 ## Security (non-negotiable)
 
@@ -90,5 +92,5 @@ When the conversation produces a durable decision, convention, architecture choi
    - Always `search_memories` first; never duplicate — `supersede_memory` the closest match.
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight`.
 2. **Artifacts** — short plans / ADRs / runbooks via `create_resource` / `update_resource` / `supersede_resource`.
-3. Mirror the offer + capture confirmation into `post_session_message` (when attached) so the phone transcript shows knowledge landing.
+3. When attached, just say so in your own reply (offer, then confirmation once recorded) — the plugin's automatic mirror carries it to the phone transcript. Do not call `post_session_message` yourself for this either.
 4. Don't rely on autopilot post-session extraction for this channel — capture it live.
