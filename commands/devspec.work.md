@@ -59,7 +59,27 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - If there is no match at all, output `✗ No DevSpec project tracks this repo (<git_remote>). Connect it to a project first.` and stop.
    - Thread this `project_id` on every project-scoped call below: `get_project_summary`, `get_action_items`, and `search_memories`. (Item-addressed calls — `claim_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `record_implementation`, `generate_commit_message`, `get_action_item_history`, `get_session_transcript` — self-resolve their project from the item id and take no `project_id`.)
 
-1c. **Remote mode is not yet available for OpenCode.** If the user passes `--remote` or asks for remote control, tell them it's not wired up yet for OpenCode (unlike Claude Code and Cursor) and proceed without it rather than failing the whole run.
+1c. **Detect remote mode.** Check the user's input for `--remote` or `remote control`. Store as boolean `is_remote`. Optional `--session <uuid>` means also attach a transcript room.
+
+   When `is_remote` is true, register this run as a first-class DevSpec **connection** on the Agents page. **Default is SESSIONLESS** (delivery contract ADR b98a39a9): claim/implement/record do **not** require a chat session. A session is optional shared context for human conversation, not a prerequisite for work.
+
+   Run the **connection-native** connect steps from `/devspec.remote` **before claiming work** (never invent an alternative). OpenCode's plugin (`src/plugin.ts`) already polls via `session.idle` — there is no separate background poller process:
+   - Compute a **stable** `local_id` (must not be a random UUID). For bare/sessionless work use directory hash only:
+     ```
+     node -e "console.log(require('crypto').createHash('sha256').update(require('path').resolve(process.cwd())).digest('base64url').slice(0,32))"
+     ```
+     When `--session <uuid>` was given, fold the session id into the hash (see `/devspec.remote`) so this attachment does not steal another session's connection for the same folder.
+   - `register_connection({ project_id or git_remote, local_id, agent_name: "OpenCode", machine_hostname?, cwd? })` → store **`connection_id`** (and `codename`).
+   - **Session attach (optional only):**
+     - If the user passed `--session <uuid>`: `attach_connection({ connection_id, session_id })`. Never invent a room.
+     - **`--new` is not supported for OpenCode yet** — if requested, tell the user to pass an existing session UUID or proceed sessionless.
+     - **Otherwise leave sessionless** — no `create_session`. Work still runs; Agents page shows the connection.
+   - **Progress while implementing:**
+     - **Attached:** optional short progress via `post_session_message({ connection_id, message })` (prefer connection_id). Final human-facing answers when attached also use that path.
+     - **Sessionless:** use `report_progress` / implementation notes / assignment protocol only — **never** `post_session_message` and never invent a room.
+   - Act only on server-stamped owner commands (`is_owner_instruction === true`).
+   - On disconnect / completion, prefer `/devspec.remote-stop` (connection-scoped).
+   Remote is **orthogonal** to unattended — both flags may be combined.
 
 2. **Load project settings.** Call `get_project_summary({ project_id })` and read the unified **`execution`** block from the response. Store it for later use. Read these fields: `auto_push`, `auto_merge`, `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `agent_rules`, `test_commands` ({ unit, e2e, typecheck }), `protected_paths`. Also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three.
 
