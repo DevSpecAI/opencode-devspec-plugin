@@ -240,6 +240,75 @@ function assistantTextFromMessage(message: { parts?: unknown } | null | undefine
     .trim()
 }
 
+const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
+
+/**
+ * Strip the terminal-only status block the devspec.remote command tells the
+ * model to print. Ported from claude-code-devspec-autopilot's mirror-turn.mjs
+ * (same banner template, same rule-line convention) — kept in sync so the
+ * skill's "print this in the terminal only" instruction means the same thing
+ * everywhere it's given, even though OpenCode has no non-chat output surface
+ * to actually keep it out of its own session (unlike Claude/Cursor, where a
+ * Stop hook's mirrored text and terminal stdout are architecturally
+ * separate). Removes from the banner header through the trailing rule line.
+ */
+export function stripRemoteControlBanner(text: string): string {
+  const t = String(text ?? '')
+  const start = t.indexOf(REMOTE_STATUS_BANNER)
+  if (start < 0) return t
+  const afterHeader = t.slice(start + REMOTE_STATUS_BANNER.length)
+  const ruleMatch = afterHeader.match(/\n[─-]{3,}\s*\n?/)
+  let end = start + REMOTE_STATUS_BANNER.length
+  if (ruleMatch && typeof ruleMatch.index === 'number') {
+    end += ruleMatch.index + ruleMatch[0].length
+  } else {
+    const nextBlank = afterHeader.search(/\n\s*\n/)
+    end = nextBlank >= 0 ? start + REMOTE_STATUS_BANNER.length + nextBlank : t.length
+  }
+  return `${t.slice(0, start)}${t.slice(end)}`.replace(/^\s+|\s+$/g, '')
+}
+
+/**
+ * True when assistant text is operational chrome that must never become a
+ * session chat bubble — the terminal status block, or a bare connect/
+ * reconnect one-liner. Fail open for ambiguous / real replies: baseline
+ * correlation (awaitingRemoteReply) already decides WHICH message is new;
+ * this decides WHAT content in that message is actually postable, since
+ * correlation alone lets a genuinely-new-but-still-chrome first reply through.
+ */
+export function isOperationalChrome(text: string): boolean {
+  let t = String(text ?? '').trim()
+  if (!t) return true
+
+  if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
+  if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
+
+  if (t.includes(REMOTE_STATUS_BANNER)) {
+    t = stripRemoteControlBanner(t).trim()
+    if (!t) return true
+    if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
+    if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
+    // Banner plus a tiny leftover (e.g. "Open: Agents page") — still chrome.
+    if (t.length < 80 && /^(Agent|Connection|Session|Status|Open|Stop with):/m.test(t)) return true
+  }
+
+  return false
+}
+
+/**
+ * Prepare an assistant turn's text for mirroring: strip known chrome, then
+ * return null if nothing postable remains (pure chrome) — so a real answer
+ * that happens to follow a pasted status block still gets posted, banner
+ * removed, rather than being dropped along with it.
+ */
+export function prepareMirrorText(text: string): string | null {
+  let t = String(text ?? '').trim()
+  if (!t) return null
+  if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
+  if (!t || isOperationalChrome(t)) return null
+  return t
+}
+
 /** Prefer connection_id so the server uses the current attachment (reattach-safe). */
 function postMessageArgs(
   state: ConnectionState,
@@ -1126,6 +1195,34 @@ async function mirrorLatestReply(
     return
   }
 
+  // Real bug found live-testing: baseline correlation (above) only decides
+  // WHICH message is new post-inject — it has no opinion on WHAT the message
+  // says. The devspec.remote command tells the model to print its connect
+  // status block "in the terminal only", but OpenCode has no channel for
+  // that: every assistant turn the model produces is both shown locally AND
+  // becomes "the latest assistant message" here. So a model that dutifully
+  // follows that instruction produces the status block (or a bare
+  // "connected, ready" line) as a real, correctly-correlated new turn —
+  // confirmed live: it mirrored into a shared session as a reply to an owner
+  // command it never actually answered. prepareMirrorText strips a pasted
+  // banner from an otherwise-real reply, and returns null for pure chrome.
+  const preparedText = prepareMirrorText(text)
+
+  if (!preparedText) {
+    // Claim + treat as a finished (non-)turn so busy clears, but never post.
+    logPoll(`mirrorLatestReply: skip (operational chrome) last.id=${last.info.id}`)
+    alreadyMirrored.add(last.info.id)
+    patchState(directory, {
+      lastMirroredMessageId: last.info.id,
+      mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+      awaitingRemoteReply: false,
+      replyAfterOpenCodeMessageId: null,
+      replyBaselineCaptured: undefined,
+    })
+    await setBusy(directory, false)
+    return
+  }
+
   // Optimistic claim BEFORE the network post — closes the race where two
   // concurrent poll/idle paths both pass the dedup check, both post, then
   // both write. Whichever claims second sees the id already in the set and
@@ -1154,7 +1251,7 @@ async function mirrorLatestReply(
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'post_session_message',
-      arguments: postMessageArgs(fresh, text, { turn_kind: 'agent', model }),
+      arguments: postMessageArgs(fresh, preparedText, { turn_kind: 'agent', model }),
     })
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 - 2026-07-24
+
+### Remote control — never mirror the terminal-only status block
+
+- Baseline correlation (0.2.0/0.2.1) only decides *which* assistant message is new after an owner inject — it has no opinion on *what* the message says. Live-tested: `devspec.remote`'s "print this in the terminal only" instruction has nowhere to go in OpenCode (every assistant turn is both shown locally and picked up by the mirror), so the model's own connect-confirmation block was faithfully mirrored into a shared session as if it were a reply.
+- Added `isOperationalChrome` / `stripRemoteControlBanner` / `prepareMirrorText` (ported from claude-code-devspec-autopilot's `mirror-turn.mjs`) — `mirrorLatestReply` now strips a pasted status block from an otherwise-real answer, and skips posting entirely when nothing postable remains.
+
 ## 0.2.1 - 2026-07-24
 
 ### Remote control — strict baseline fail-closed
