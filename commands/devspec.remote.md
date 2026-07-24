@@ -1,3 +1,7 @@
+## Delivery contract (binding)
+
+Agent posts answers when attached via `post_session_message` — prefer **`connection_id`** (server resolves current session). Sessionless: assignment/`report_progress` only — no chat. Stop/full-turn terminal mirror is **not** the primary path. See DevSpecV2 `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`.
+
 ---
 description: Connect this OpenCode session to DevSpec as a first-class agent connection — available on the Agents page, attach to a session for a live transcript, driven from phone/web.
 ---
