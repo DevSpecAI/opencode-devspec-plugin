@@ -2,6 +2,7 @@ import type { Plugin } from '@opencode-ai/plugin'
 import {
   handleSessionError,
   logPoll,
+  mirrorNow,
   pollAndDeliver,
   recordConnectionEventFromTool,
   setBusy,
@@ -9,18 +10,18 @@ import {
 import { registerBundledCommands } from './register-commands.js'
 
 /**
- * Backstop poll cadence (ms). Originally added alongside `session.idle` as
- * a defensive fallback for the (assumed) case where idle wouldn't refire.
- * Confirmed live via a full event-type log for a connect handshake and
- * several turns: `session.idle` never fires — not once, ever, in this
- * OpenCode version. The events that DO fire are session.created/updated/
- * status/diff and message.updated/part.updated/part.delta. This interval
- * is therefore not a backstop at all — it is the ONLY thing driving
- * delivery and mirroring. Left running at this cadence; see remote-control.ts
- * for the `busy` flag's own fix now that its true "turn finished" signal
- * (session.idle) turned out not to exist either.
+ * Gap after a poll that asked us to wait (an error backoff, or "not connected yet").
+ * This is NOT a poll cadence any more — item c9457ab8 replaced the interval with a
+ * long-poll, so the SERVER holds each request open and the hold itself is the wait.
+ * `pollAndDeliver` returns `delayMs: 0` in the normal case and we go straight back in.
+ *
+ * The old value here was 8000ms — the shortest cadence of any DevSpec plugin, and the
+ * reason OpenCode alone spent 2 of its token's 60 req/min budget every 8 seconds per
+ * connection. Lowering it further (the original plan) would have consumed the entire
+ * per-token budget from a single connection; long-polling spends ~2 req/min AND
+ * delivers instantly. Kept only as the floor for the not-yet-connected case.
  */
-const POLL_INTERVAL_MS = 8000
+const IDLE_RECHECK_MS = 5000
 
 /**
  * DevSpec OpenCode plugin entry point.
@@ -40,12 +41,18 @@ const POLL_INTERVAL_MS = 8000
  * `@opencode-ai/plugin`/`@opencode-ai/sdk` type definitions, not assumed
  * from docs.
  *
- * Remote control (see src/remote-control.ts) still listens for `session.idle`
- * for the low-latency path this was originally designed around, but per the
- * POLL_INTERVAL_MS note above, that event has never been observed to fire —
- * the `setInterval` backstop is what actually delivers and mirrors
- * everything today. Kept in case a future OpenCode version fires it. No
- * separate poller process or inbox file, unlike Claude Code's design — see
+ * DELIVERY vs MIRRORING (changed in 0.3.0, items c9457ab8 + 807eadcb):
+ *   - DELIVERY is the long-poll pump below. It no longer depends on any OpenCode
+ *     event at all, which matters because `session.idle` was historically observed
+ *     never to fire in this host — the old `setInterval` was doing all the work while
+ *     being documented as a mere "backstop".
+ *   - MIRRORING is driven by OpenCode's own `message.updated` (plus `session.idle`
+ *     when it does fire). It used to ride the 8s poll tick; with a ~25s hold that
+ *     would have traded delivery latency for reply latency, so the two concerns are
+ *     now separate. Later runs DID see `session.idle` fire, so both paths are kept —
+ *     `setBusy` and `mirrorNow` are both idempotent.
+ *
+ * Still no separate poller process or inbox file, unlike Claude Code's design — see
  * remote-control.ts for why.
  *
  * The `config` hook registers this package's bundled commands/*.md files
@@ -83,33 +90,75 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   // signal that unambiguously identifies the session driving THIS connect,
   // immune to background noise from sessions we have nothing to do with.
   let lastKnownSessionId: string | null = null
-  let pollInFlight = false
 
-  const poll = async (sessionId: string | null, trigger: string) => {
-    if (!sessionId || pollInFlight) {
-      logPoll(`poll(${trigger}) skipped: sessionId=${sessionId} pollInFlight=${pollInFlight}`)
-      return
-    }
-    pollInFlight = true
+  // ---- The long-poll pump (item c9457ab8) -------------------------------------------
+  // One self-scheduling loop instead of a setInterval: issue a held request, act the
+  // instant it returns, immediately issue the next. `stopped` + the AbortController are
+  // what let `dispose` (below) cut a 25s hold short so a held request can never outlive
+  // the host process — the reason the old interval had to be `unref`'d.
+  let stopped = false
+  const abort = new AbortController()
+  let pumpRunning = false
+
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      if (ms <= 0) return resolve()
+      const t = setTimeout(resolve, ms)
+      // Never let our own backoff timer hold the process open.
+      t.unref?.()
+    })
+
+  const pump = async () => {
+    if (pumpRunning) return
+    pumpRunning = true
+    logPoll('pump: started (long-poll mode)')
     try {
-      await pollAndDeliver(client, directory, sessionId)
-    } catch (err) {
-      // Remote control is best-effort — a delivery failure must never
-      // interrupt the session the user is actually working in.
-      logPoll(`poll(${trigger}) pollAndDeliver threw: ${err}`)
+      while (!stopped) {
+        const sessionId = lastKnownSessionId
+        if (!sessionId) {
+          // No OpenCode session pinned yet (no `/devspec.remote` run in this process).
+          // Costs zero network calls — the gate is purely local.
+          await sleep(IDLE_RECHECK_MS)
+          continue
+        }
+        try {
+          const outcome = await pollAndDeliver(client, directory, sessionId, {
+            signal: abort.signal,
+          })
+          if (outcome.stop) {
+            logPoll(`pump: stopping — ${outcome.reason ?? 'connection ended'}`)
+            stopped = true
+            break
+          }
+          await sleep(outcome.delayMs)
+        } catch (err) {
+          // Remote control is best-effort: a delivery failure must never interrupt the
+          // session the user is actually working in, and must never kill the pump.
+          logPoll(`pump: pollAndDeliver threw: ${err}`)
+          await sleep(IDLE_RECHECK_MS)
+        }
+      }
     } finally {
-      pollInFlight = false
+      pumpRunning = false
+      logPoll('pump: exited')
     }
   }
 
-  const backstop = setInterval(() => {
-    void poll(lastKnownSessionId, 'interval')
-  }, POLL_INTERVAL_MS)
-  // Never let this timer keep the process alive on its own — it's a
-  // best-effort backstop, not a reason for the server to refuse to exit.
-  backstop.unref?.()
+  // Start immediately: with no session pinned yet the loop idles on a purely local
+  // check (no MCP calls at all), so starting early costs nothing and means the first
+  // poll goes out the moment `/devspec.remote` completes its handshake.
+  void pump()
 
   return {
+    /**
+     * Verified present on the Hooks type: `dispose?: () => Promise<void>`. Aborting the
+     * in-flight hold here is what keeps a 25s held request from delaying host shutdown.
+     */
+    dispose: async () => {
+      stopped = true
+      abort.abort()
+      logPoll('dispose: pump stopped and in-flight hold aborted')
+    },
     config: async (cfg) => {
       registerBundledCommands(cfg)
     },
@@ -128,8 +177,19 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       }
       logPoll(`event received: type=${event.type} sessionID=${sessionId} props=${propsSummary}`)
       if (event.type === 'session.idle') {
+        // Turn finished: clear busy and mirror the reply immediately. Delivery is the
+        // pump's job now, so this no longer needs to poll.
         await setBusy(directory, false)
-        await poll(sessionId ?? lastKnownSessionId, 'session.idle')
+        const target = sessionId ?? lastKnownSessionId
+        if (target) await mirrorNow(client, directory, target, { force: true })
+      } else if (event.type === 'message.updated') {
+        // MIRRORING is event-driven now, not a side-effect of the poll tick (see
+        // mirrorNow). With a ~25s hold, hanging mirroring off the tick would have traded
+        // delivery latency for reply latency; this is faster than the old 8s floor and
+        // costs nothing when there is no new reply. mirrorNow is self-throttled because
+        // this event can fire many times per turn.
+        const target = sessionId ?? lastKnownSessionId
+        if (target) await mirrorNow(client, directory, target)
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the
@@ -149,6 +209,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         ) {
           logPoll(`pinning lastKnownSessionId=${input.sessionID} from tool=${input.tool}`)
           lastKnownSessionId = input.sessionID
+          // Re-arm if the pump ever exited (e.g. a previous connection was ended from
+          // the Agents page): a fresh connect must start polling again. The pumpRunning
+          // guard makes this a no-op while it is already looping.
+          if (stopped) {
+            stopped = false
+            logPoll('pump: re-arming after a fresh connect handshake')
+          }
+          void pump()
         }
       } catch {
         // Best-effort — must never break the tool call it's observing.

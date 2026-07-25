@@ -28,8 +28,31 @@ import os from 'node:os'
 import path from 'node:path'
 import type { Plugin } from '@opencode-ai/plugin'
 import { AGENT_NAME } from './agent-identity.js'
-import { mcpToolsCall } from './devspec-client.js'
+import { McpTimeoutError, mcpToolsCall } from './devspec-client.js'
 import { resolveDevspecAuth } from './resolve-devspec-auth.js'
+import {
+  HOLD_HTTP_GRACE_MS,
+  createCarryBuffer,
+  emptyTurnBackoffMs,
+  errorBackoffMs,
+  holdFor,
+  isDeliverableCommand,
+  pollTerminalReason,
+  renderInjectedTurn,
+  resolveServerAttachment,
+  unansweredCommands,
+  type AdvisoryMessage,
+  type CarriedContext,
+} from './poll-turn.js'
+
+// Re-exported so the poll-turn split stays an internal refactor for importers.
+export {
+  isDeliverableCommand,
+  pollTerminalReason,
+  renderInjectedTurn,
+  resolveServerAttachment,
+  holdFor,
+} from './poll-turn.js'
 
 /**
  * Persistent diagnostic log for the poll loop's own decisions — every
@@ -758,333 +781,422 @@ async function reportPollError(
 }
 
 /**
- * Server-authoritative attachment decision — mirrors the Claude poller's
- * `resolveServerAttachment` (devspec-remote-poll.mjs).
- *
- * The heartbeat echo (`hb.session_id`) is the one source of truth for which
- * session this connection is attached to; local state is written FROM it, never
- * used to override it. That is what lets an attach/detach/redirect done from the
- * phone/web Agents page reach this in-process poller at all — the server changes
- * the attachment without ever touching this machine's local state file, so
- * reading the attached session from local state alone would never learn of it.
- *
- * A `not_found` heartbeat means the connection ended server-side and must
- * re-register; it omits `session_id`, so it must NEVER be read as a detach →
- * return no change and leave the current session intact. `changed` is the ONE
- * trigger to reseed the transcript cursor, and it flips only when the
- * server-reported session actually differs from what we currently hold.
+ * Per-connection pump state: the two cursors, the advisory carry buffer, and the
+ * counters that shape backoff. In memory by design — OpenCode injects straight into the
+ * live session, so unlike Claude Code there is no separate poller process to hand a file
+ * to. The message cursor is ALSO persisted (`lastDeliveredMessageId`) so a plugin
+ * restart resumes where it left off instead of re-reading the room; the carry buffer is
+ * rebuilt from the cursor-less catch-up window on the first poll after a restart.
  */
-export function resolveServerAttachment(
-  currentSessionId: string | null,
-  hb: unknown,
-): { sessionId: string | null; changed: boolean } {
-  const obj = hb && typeof hb === 'object' ? (hb as Record<string, unknown>) : null
-  if (!obj || obj.status === 'not_found') {
-    return { sessionId: currentSessionId, changed: false }
+interface PumpState {
+  cursor: string | null
+  dispatchCursor: string | null
+  carry: ReturnType<typeof createCarryBuffer>
+  needsSeed: boolean
+  consecutiveEmpty: number
+  consecutiveErrors: number
+  deliveredDispatchIds: Set<string>
+}
+
+const pumpStates = new Map<string, PumpState>()
+
+function pumpStateFor(
+  connectionId: string,
+  persisted: { cursor: string | null; dispatchIds: string[] },
+): PumpState {
+  let s = pumpStates.get(connectionId)
+  if (!s) {
+    s = {
+      cursor: persisted.cursor,
+      dispatchCursor: null,
+      carry: createCarryBuffer(),
+      // First poll of a process is a SEED: ask for the catch-up window and treat
+      // already-answered commands in it as history rather than as new work.
+      needsSeed: true,
+      consecutiveEmpty: 0,
+      consecutiveErrors: 0,
+      // Seeded from disk so a plugin restart cannot re-inject an assignment it already
+      // handed to the model — the interval version persisted this and losing it would
+      // have been a silent regression.
+      deliveredDispatchIds: new Set(persisted.dispatchIds),
+    }
+    pumpStates.set(connectionId, s)
   }
-  const raw = obj.session_id
-  const hbSession = typeof raw === 'string' && raw ? raw : null
-  return { sessionId: hbSession, changed: hbSession !== currentSessionId }
+  return s
+}
+
+/** Drop pump state for a connection (teardown / stop). */
+export function forgetPumpState(connectionId: string): void {
+  pumpStates.delete(connectionId)
 }
 
 /**
- * Poll DevSpec for owner commands and inject any into the live OpenCode
- * session directly. Call this from the `session.idle` event — no separate
- * poller process or inbox file needed, unlike Claude Code's design.
+ * What the pump should do after one poll. `delayMs: 0` is the normal answer — the
+ * server HELD the request, so the wait already happened and we go straight back in.
+ */
+export interface PollOutcome {
+  delayMs: number
+  /** The connection is gone server-side: stop pumping and do NOT restart. */
+  stop: boolean
+  /** Terminal reason, when stop is true. */
+  reason?: string
+}
+
+/**
+ * ONE held `poll_connection` call: heartbeat + dispatch inbox + room delta in a single
+ * request (items c9457ab8 + 807eadcb).
+ *
+ * WHAT THIS REPLACED
+ * The old tick was three MCP calls (`heartbeat_connection` + `get_connection_dispatch` +
+ * `get_session_transcript`) on an 8s `setInterval` — the shortest cadence of any DevSpec
+ * plugin, spending 2 of the token's 60 req/min budget every 8s per connection. Worse, it
+ * then threw the room away: `allMessages.filter(m => m?.remote_control?.is_owner_instruction)`
+ * kept only owner instructions and advanced the cursor past everything else, so a
+ * question like "what do you think of this?" reached the model with no trace of the
+ * conversation that prompted it. This was the ONLY hard discard among the plugins.
+ *
+ * NOW: the server holds one request open, answers the instant anything lands, and
+ * returns the turn already tiered into commands / owner-ambient / room-context. We
+ * inject what it sends — the labelling is the server's, not ours (Ali, 24 Jul:
+ * standardise what we control on the server rather than forcing plugin uniformity).
  */
 export async function pollAndDeliver(
   client: Parameters<Plugin>[0]['client'],
   directory: string,
   sessionId: string,
-): Promise<void> {
+  opts: { signal?: AbortSignal } = {},
+): Promise<PollOutcome> {
   const auth = resolveDevspecAuth(directory)
-  // `state` is intentionally `let`, not `const` — real bug found live-
-  // testing: every writeState call in this function used to spread from
-  // ONE snapshot captured here at the top, so each successive write threw
-  // away whatever the PREVIOUS write in this same invocation had just set
-  // (deliveredMessageIds clobbering lastDeliveredMessageId, mirrorLatestReply's
-  // write then clobbering both of those back to their pre-poll values).
-  // Confirmed live: a message got delivered and answered correctly, then
-  // re-delivered and re-answered again on the very next 8s poll, because
-  // the dedup bookkeeping this same cycle had just written was erased
-  // before the cycle even finished. Every write below now also updates
-  // this local binding, so later writes in the same call compose on top
-  // of earlier ones instead of reverting them.
+  // `state` is intentionally `let`: every writeState below also updates this binding so
+  // later writes in the same call compose on top of earlier ones instead of reverting
+  // them. A single snapshot spread into several writes is a real bug this file has had
+  // twice (delivery bookkeeping erased mid-cycle, causing re-delivery).
   let state = readState(directory)
-  if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
-  logPoll(`pollAndDeliver start sessionId(opencode)=${sessionId} devspecSession=${state.sessionId} busy=${state.busy} lastDelivered=${state.lastDeliveredMessageId} lastMirrored=${state.lastMirroredMessageId}`)
-
-  let hb: unknown
-  try {
-    hb = await mcpToolsCall({
-      mcpUrl: auth.mcp_url,
-      token: auth.token,
-      name: 'heartbeat_connection',
-      // Re-assert our fixed identity + last-known busy value on every keep-alive,
-      // per heartbeat_connection's own documented contract ("re-assert on
-      // keep-alives") — otherwise a long-running turn's busy:true would silently
-      // decay back to idle server-side after its freshness window.
-      arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy: state.busy ?? false },
-    })
-  } catch (err) {
-    // connection may have ended server-side — next idle cycle will re-check.
-    // Still surface it: a persistently failing heartbeat means NOTHING below
-    // this line ever runs, which previously looked identical to "delivered,
-    // just slow" from the owner's side.
-    await reportPollError(auth, directory, state, 'heartbeat_connection', err)
-    return
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
+    // Not connected yet (no `/devspec.remote` run). Idle cheaply — and note this costs
+    // NO network calls, unlike the interval it replaces.
+    return { delayMs: 5_000, stop: false }
   }
 
-  // Ported from the Claude Code poller's activity-verb emission: while a
-  // turn is genuinely in progress, re-assert report_keepalive on the SAME
-  // cadence as the routine busy-heartbeat above (this function already runs
-  // every 8s via the interval backstop) — mirrors "one poll tick = one
-  // keepalive (attended cadence)" from the reference implementation.
-  if (state.busy) {
+  const pump = pumpStateFor(state.connectionId, {
+    cursor: state.lastDeliveredMessageId ?? null,
+    dispatchIds: state.deliveredAssignmentIds ?? [],
+  })
+  const turnActive = state.busy === true
+  const hold = holdFor({ attached: !!state.sessionId, turnActive })
+
+  // While a turn genuinely runs, keep the activity lease alive and let the stall
+  // detector clear a hung turn. Unchanged from the interval version, except the cadence
+  // is now the hold length rather than 8s.
+  if (turnActive) {
     await reportActivity(directory, 'keepalive')
-    // Stall detector — clears busy + posts a warning when a turn sits
-    // busy with empty assistant text past STALL_TIMEOUT_MS. Must run
-    // BEFORE delivery/mirror so a hung prior turn doesn't block forever.
     await checkBusyStall(client, directory, sessionId)
     state = readState(directory) ?? state
   }
 
-  // Server-authoritative attachment. The heartbeat response — not local state —
-  // is the source of truth for which session this connection is attached to. An
-  // attach / detach / redirect done from the phone or web Agents page changes it
-  // server-side WITHOUT touching this machine's state file, so this poll used to
-  // never see it (it read state.sessionId only). Adopt the server's answer here,
-  // and only here. `not_found` is guarded inside resolveServerAttachment as
-  // "re-register needed" (never a detach), so the session is left intact for it.
-  const adopt = resolveServerAttachment(state.sessionId, hb)
+  let res: any
+  try {
+    res = await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'poll_connection',
+      arguments: {
+        connection_id: state.connectionId,
+        agent_name: AGENT_NAME,
+        wait_ms: hold.waitMs,
+        check_tier: hold.checkTier,
+        // Re-assert our own last-known busy on every poll, per the tool's contract —
+        // otherwise a long turn's busy:true decays to idle server-side mid-turn.
+        busy: state.busy ?? false,
+        ...(pump.cursor ? { cursor: pump.cursor } : {}),
+        ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
+        ...(pump.needsSeed ? { catch_up: true } : {}),
+      },
+      timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
+      signal: opts.signal,
+    })
+    pump.consecutiveErrors = 0
+  } catch (err) {
+    if (err instanceof McpTimeoutError) {
+      // The hold outlived its client ceiling. That is not an error — it means nothing
+      // arrived — so go straight back in rather than backing off.
+      logPoll(`poll_connection hit the client ceiling (${err.timeoutMs}ms) — re-issuing`)
+      return { delayMs: 0, stop: false }
+    }
+    if (opts.signal?.aborted) return { delayMs: 0, stop: true, reason: 'host_shutdown' }
+    pump.consecutiveErrors++
+    const rateLimited = /rate limit/i.test(err instanceof Error ? err.message : String(err))
+    const backoff = errorBackoffMs(pump.consecutiveErrors, { rateLimited })
+    // Surface it into the room too: a persistently failing poll means nothing below this
+    // line ever runs, which from the owner's side is indistinguishable from "delivered,
+    // just slow".
+    await reportPollError(auth, directory, state, 'poll_connection', err)
+    logPoll(`poll_connection failed (${pump.consecutiveErrors}) — retrying in ${backoff}ms: ${err}`)
+    return { delayMs: backoff, stop: false }
+  }
+
+  // Teardown (UI End, /devspec.remote-stop elsewhere, already-ended row). One check now
+  // covers what the separate heartbeat used to: the poll IS the heartbeat.
+  const terminal = pollTerminalReason(res)
+  if (terminal) {
+    logPoll(`connection ended (${terminal}) — stopping the pump; do not restart`)
+    await setBusy(directory, false).catch(() => {})
+    forgetPumpState(state.connectionId)
+    return { delayMs: 0, stop: true, reason: terminal }
+  }
+
+  // Server-authoritative attachment: an attach/detach/redirect from the phone or web
+  // changes the room WITHOUT touching this machine's state file, so the response — never
+  // local state — decides which room we are in.
+  const adopt = resolveServerAttachment(state.sessionId, res)
   if (adopt.changed) {
-    // Adopt the server's session and reseed the transcript cursor exactly once so
-    // delivery starts fresh from the newly-attached room instead of resuming an
-    // old room's cursor. deliveredMessageIds is left alone — its bounded set
-    // still guards against re-delivering anything we genuinely already handled.
+    logPoll(`server attachment ${state.sessionId ?? '(none)'} → ${adopt.sessionId ?? '(none)'}`)
     state = { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
     writeState(directory, state)
+    // Fresh room: drop the cursor and any carried context from the old one, and treat
+    // the next window as history rather than as new commands.
+    pump.cursor = null
+    pump.carry.reset()
+    pump.needsSeed = true
+    return { delayMs: 0, stop: false }
   }
 
-  // Sessionless path: still receive connection-native assignment work (ADR).
-  // No DevSpec chat posts — inject into the local OpenCode session only.
-  if (!state.sessionId) {
-    await deliverConnectionAssignments(client, auth, directory, state, sessionId)
-    return
+  if (res?.changed !== true) {
+    // The hold ran its course with nothing new. No sleep: holding IS the wait.
+    pump.needsSeed = false
+    pump.consecutiveEmpty = 0
+    return { delayMs: 0, stop: false }
   }
 
-  // NOTE: get_connection_dispatch is for agent_assignment work-item batches
-  // (autopilot), not ad-hoc chat messages — it has no `owner_messages` field.
-  // Session owner commands still come from the transcript's remote_control stamp.
-  // Also poll connection dispatch while attached so dual-targeted batches land.
-  await deliverConnectionAssignments(client, auth, directory, state, sessionId)
-  state = readState(directory) ?? state
+  // ---- Something landed: consume the packaged, tiered turn --------------------------
+  const offered: any[] = Array.isArray(res.commands) ? res.commands : []
+  // Fail closed: only commands the endpoint addressed to US, with an authority we
+  // recognise, may drive the model. A rejected entry is logged, never silently eaten.
+  const roomCommands = offered.filter((m) => isDeliverableCommand(m, state!.connectionId))
+  if (roomCommands.length !== offered.length) {
+    logPoll(
+      `REJECTED ${offered.length - roomCommands.length} command(s) not addressed to this connection`,
+    )
+  }
+  const ownerAmbient: AdvisoryMessage[] = Array.isArray(res.owner_ambient) ? res.owner_ambient : []
+  const roomContext: AdvisoryMessage[] = Array.isArray(res.room_context) ? res.room_context : []
+  const dispatches: any[] = Array.isArray(res.dispatches) ? res.dispatches : []
 
-  const transcript: any = await mcpToolsCall({
-    mcpUrl: auth.mcp_url,
-    token: auth.token,
-    name: 'get_session_transcript',
-    arguments: {
-      session_id: state.sessionId,
-      connection_id: state.connectionId,
-      ...(state.lastDeliveredMessageId ? { after_message_id: state.lastDeliveredMessageId } : {}),
-    },
-  }).catch((err) => {
-    // Non-null assertion: `state` is a `let` (reassigned above to compose
-    // writes within this call), so TS can't narrow it across this closure —
-    // but it's never set back to null anywhere in this function.
-    void reportPollError(auth, directory, state, 'get_session_transcript', err)
-    return null
-  })
+  // Advisory NEVER wakes the model on its own — it is carried forward and attached to
+  // the next command. See createCarryBuffer for why attaching only this response's
+  // advisory would not have fixed the 1-2-3 failure.
+  if (ownerAmbient.length > 0 || roomContext.length > 0) {
+    pump.carry.add(ownerAmbient, roomContext)
+    logPoll(
+      `carried advisory: +${ownerAmbient.length} owner-ambient, +${roomContext.length} room-context (buffer ${pump.carry.size})`,
+    )
+  }
 
-  const allMessages: any[] = Array.isArray(transcript?.messages) ? transcript.messages : []
-  if (allMessages.length > 0) {
-    // Advance the cursor even for messages we don't deliver (advisory context) —
-    // without this, every idle poll re-fetched the WHOLE transcript and
-    // re-delivered every owner instruction ever posted to this session.
-    state = { ...state, lastDeliveredMessageId: allMessages[allMessages.length - 1].id }
+  // Dispatched work becomes a command: the assignment reference is what wakes the agent.
+  // Replaces this file's own get_connection_dispatch call — same inbox, one round trip.
+  const freshDispatches = dispatches.filter(
+    (d) => typeof d?.id === 'string' && !pump.deliveredDispatchIds.has(d.id) &&
+      !['completed', 'released'].includes(String(d?.state ?? d?.status ?? 'pending')),
+  )
+  const dispatchCommands = freshDispatches.map((d) => ({
+    id: `dispatch:${d.id}`,
+    created_at: typeof d?.created_at === 'string' ? d.created_at : new Date().toISOString(),
+    addressed_to: res.addressed_to,
+    authority: { kind: 'owner', capabilities: ['full'] },
+    content:
+      `📦 DevSpec assignment dispatched to this connection (assignment \`${d.id}\`).\n\n` +
+      `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
+      `claim_work_item (each member, in position order) → implement → record_implementation → ` +
+      `resolve_assignment.\n` +
+      `While sessionless, report progress with report_progress / item notes — do not invent a chat room.`,
+  }))
+
+  // On a seed window, filter out commands already answered before this process existed.
+  const liveRoomCommands = pump.needsSeed
+    ? (unansweredCommands(roomCommands as any, roomContext) as any[])
+    : roomCommands
+  pump.needsSeed = false
+
+  // Dedup against what we have already injected (a bounded set — the cursor alone is not
+  // enough, as a racing/stale cursor read has caused triple-delivery in this file before).
+  const deliveredIds = new Set(state.deliveredMessageIds ?? [])
+  const commands = [...dispatchCommands, ...liveRoomCommands].filter(
+    (m) => !(typeof m?.id === 'string' && deliveredIds.has(m.id)),
+  )
+
+  if (typeof res.cursor === 'string' && res.cursor) pump.cursor = res.cursor
+  if (typeof res.dispatch_cursor === 'string') pump.dispatchCursor = res.dispatch_cursor
+  // Advance the persisted cursor even for advisory-only turns, or every poll would
+  // re-fetch the same window forever.
+  if (pump.cursor && pump.cursor !== state.lastDeliveredMessageId) {
+    state = { ...state, lastDeliveredMessageId: pump.cursor }
     writeState(directory, state)
   }
 
-  const toDeliver = allMessages.filter((m) => m?.remote_control?.is_owner_instruction === true)
-  const deliveredIds = new Set(state.deliveredMessageIds ?? [])
+  if (commands.length === 0) {
+    // Changed, but nothing to deliver (advisory-only, or all already delivered).
+    // Advisory-only is normal and must NOT back off — otherwise a chatty room slows
+    // command delivery. Only a genuinely empty change escalates.
+    const advisoryOnly = ownerAmbient.length > 0 || roomContext.length > 0
+    if (advisoryOnly) {
+      pump.consecutiveEmpty = 0
+      await mirrorLatestReply(client, auth, directory, state, sessionId)
+      return { delayMs: 0, stop: false }
+    }
+    pump.consecutiveEmpty++
+    const floor = emptyTurnBackoffMs(pump.consecutiveEmpty, hold.waitMs)
+    if (pump.consecutiveEmpty === 1 || pump.consecutiveEmpty % 10 === 0) {
+      logPoll(
+        `empty change (${pump.consecutiveEmpty}) — backing off ${floor}ms. ` +
+          `Repeated empty changes mean a server-side marker is hot for a reason the ` +
+          `response does not carry (see item 85f5c74e) — investigate, do not normalise.`,
+      )
+    }
+    return { delayMs: floor, stop: false }
+  }
+  pump.consecutiveEmpty = 0
+
+  for (const m of commands) {
+    if (typeof m?.id === 'string') deliveredIds.add(m.id)
+  }
+  for (const d of freshDispatches) pump.deliveredDispatchIds.add(d.id)
+  // Claim BEFORE injecting and persist immediately, so a concurrent poll — or a restarted
+  // process — sees these ids as delivered rather than independently delivering them again.
+  state = {
+    ...state,
+    deliveredMessageIds: Array.from(deliveredIds).slice(-50),
+    ...(freshDispatches.length > 0
+      ? { deliveredAssignmentIds: Array.from(pump.deliveredDispatchIds).slice(-50) }
+      : {}),
+  }
+  writeState(directory, state)
+
+  // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
+  // by every command in the delta. Injecting per-command would queue separate OpenCode
+  // turns, and only the first would carry the context they all share.
+  const context: CarriedContext | null = pump.carry.take()
+  const text = renderInjectedTurn({
+    commands: commands as any,
+    context,
+    deliveryContract: typeof res.delivery_contract === 'string' ? res.delivery_contract : null,
+  })
   logPoll(
-    `fetched ${allMessages.length} messages, ${toDeliver.length} owner instructions, ` +
-      `undelivered=${toDeliver.filter((m) => typeof m?.id === 'string' && !deliveredIds.has(m.id)).map((m) => m.id).join(',') || 'none'}`,
+    `injecting ${commands.length} command(s) with context: ` +
+      `${context?.owner_ambient.length ?? 0} owner-ambient, ${context?.room_context.length ?? 0} room-context, ` +
+      `${context?.dropped ?? 0} dropped`,
   )
 
-  // Assert busy BEFORE kicking off any turn — see setBusy's doc. Only the
-  // undelivered ones matter (an all-already-delivered batch means nothing
-  // new is actually starting).
-  if (toDeliver.some((m) => typeof m?.id === 'string' && !deliveredIds.has(m.id))) {
-    await setBusy(directory, true)
-    state = { ...state, busy: true } // keep our local copy in sync with what setBusy just wrote
-  }
+  // Per-message provider/model override — only meaningful for provider-agnostic hosts.
+  const rawModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
+  const model =
+    rawModel && typeof rawModel === 'object' &&
+    typeof rawModel.providerID === 'string' && typeof rawModel.modelID === 'string'
+      ? { providerID: rawModel.providerID, modelID: rawModel.modelID }
+      : undefined
 
-  for (const msg of toDeliver) {
-    if (typeof msg?.id === 'string' && deliveredIds.has(msg.id)) continue // see deliveredMessageIds doc
+  await setBusy(directory, true)
+  state = { ...state, busy: true }
 
-    // Mark as claimed BEFORE calling promptAsync (not after) and persist
-    // immediately — closes the race window as tightly as possible so a
-    // concurrent/overlapping poll invocation sees this id already delivered
-    // rather than independently fetching and delivering it a second time.
-    if (typeof msg?.id === 'string') {
-      deliveredIds.add(msg.id)
-      state = { ...state, deliveredMessageIds: Array.from(deliveredIds).slice(-50) }
-      writeState(directory, state)
-    }
-
-    const text = typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg?.content ?? msg)
-    // Per-message provider/model override — only meaningful for
-    // provider-agnostic tools (OpenCode). Verified live: promptAsync's body
-    // accepts an optional {providerID, modelID} independent of any agent config.
-    const rawModel = msg?.dispatch_model
-    const model =
-      rawModel && typeof rawModel === 'object' && typeof rawModel.providerID === 'string' && typeof rawModel.modelID === 'string'
-        ? { providerID: rawModel.providerID, modelID: rawModel.modelID }
-        : undefined
-
+  try {
+    // Baseline: only mirror assistant messages that appear AFTER the last one present at
+    // inject time. Capture success is tracked separately — a failed snapshot must fail
+    // closed at mirror time, never fall back to "newest in history".
+    let replyAfter: string | null = null
+    let baselineCaptured = false
     try {
-      // Baseline: only mirror assistants that appear *after* the last assistant
-      // present at inject time (do not post an unrelated prior local answer).
-      // Capture success is tracked separately — a failed snapshot must fail closed
-      // at mirror time (never treat null baseline as "use whole history").
-      let replyAfter: string | null = null
-      let baselineCaptured = false
-      try {
-        const res: any = await (client as any).session.messages({ path: { id: sessionId } })
-        const msgs = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
-        const assistants = msgs.filter((m: any) => m?.info?.role === 'assistant')
-        replyAfter = assistants[assistants.length - 1]?.info?.id ?? null
-        baselineCaptured = true
-      } catch (err) {
-        logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`)
-        baselineCaptured = false
-      }
-      state = {
-        ...state,
-        replyAfterOpenCodeMessageId: replyAfter,
-        replyBaselineCaptured: baselineCaptured,
-        awaitingRemoteReply: true,
-      }
-      writeState(directory, state)
-
-      // client.session.promptAsync injects the message directly into the running
-      // session (POST /session/:id/message under the hood) — no manual paste.
-      await (client as any).session.promptAsync({
-        path: { id: sessionId },
-        body: { parts: [{ type: 'text', text }], ...(model ? { model } : {}) },
-      })
+      const snap: any = await (client as any).session.messages({ path: { id: sessionId } })
+      const msgs = Array.isArray(snap?.data) ? snap.data : Array.isArray(snap) ? snap : []
+      const assistants = msgs.filter((m: any) => m?.info?.role === 'assistant')
+      replyAfter = assistants[assistants.length - 1]?.info?.id ?? null
+      baselineCaptured = true
     } catch (err) {
-      // A rejected model/credential must surface back into the DevSpec
-      // transcript, not vanish silently on the user's own machine.
-      const reason = err instanceof Error ? err.message : String(err)
-      // Only post errors into DevSpec when attached (sessionless has no room).
-      if (state.sessionId) {
-        await mcpToolsCall({
-          mcpUrl: auth.mcp_url,
-          token: auth.token,
-          name: 'post_session_message',
-          arguments: postMessageArgs(
-            state,
-            model
-              ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
-              : `⚠️ Could not deliver this message: ${reason}`,
-            { turn_kind: 'agent' },
-          ),
-        }).catch(() => {
-          // Best-effort — a failed error-report must never crash the poll loop.
-        })
-      } else {
-        logPoll(`promptAsync failed (sessionless): ${reason}`)
-      }
-      // promptAsync itself failed, so no turn is actually running — clear
-      // the busy flag asserted above, or it would stick at true with no
-      // reply ever coming to clear it via mirrorLatestReply's own path.
-      await setBusy(directory, false)
-      state = {
-        ...state,
-        busy: false,
-        awaitingRemoteReply: false,
-        replyAfterOpenCodeMessageId: null,
-        replyBaselineCaptured: undefined,
-      }
-      writeState(directory, state)
+      logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`)
+      baselineCaptured = false
     }
+    state = {
+      ...state,
+      replyAfterOpenCodeMessageId: replyAfter,
+      replyBaselineCaptured: baselineCaptured,
+      awaitingRemoteReply: true,
+    }
+    writeState(directory, state)
+
+    await (client as any).session.promptAsync({
+      path: { id: sessionId },
+      body: { parts: [{ type: 'text', text }], ...(model ? { model } : {}) },
+    })
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    if (state.sessionId) {
+      await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'post_session_message',
+        arguments: postMessageArgs(
+          state,
+          model
+            ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
+            : `⚠️ Could not deliver this message: ${reason}`,
+          { turn_kind: 'agent' },
+        ),
+      }).catch(() => {})
+    } else {
+      logPoll(`promptAsync failed (sessionless): ${reason}`)
+    }
+    // No turn is actually running, so clear the busy we just asserted.
+    await setBusy(directory, false)
+    state = {
+      ...state,
+      busy: false,
+      awaitingRemoteReply: false,
+      replyAfterOpenCodeMessageId: null,
+      replyBaselineCaptured: undefined,
+    }
+    writeState(directory, state)
   }
 
   await mirrorLatestReply(client, auth, directory, state, sessionId)
+  return { delayMs: 0, stop: false }
 }
 
 /**
- * Poll get_connection_dispatch and inject undelivered assignment batches into
- * the local OpenCode session (works sessionless — no DevSpec chat post).
+ * Mirror a finished reply without polling — driven by OpenCode's OWN events.
+ *
+ * Why this exists: the interval version mirrored replies as a side-effect of its 8s
+ * tick. With long-poll a tick happens roughly every 25s, so hanging mirroring off it
+ * would have made replies take up to 25s to reach the room — trading delivery latency
+ * for reply latency. Instead the pump owns DELIVERY and OpenCode's own message events
+ * own MIRRORING, which is both faster than the old 8s floor and free.
+ *
+ * Cheap-guarded: at most one mirror in flight per directory, and at most one attempt per
+ * MIRROR_MIN_GAP_MS, because `message.updated` can fire many times per turn.
  */
-async function deliverConnectionAssignments(
+const MIRROR_MIN_GAP_MS = 1_500
+const mirrorGuards = new Map<string, { at: number; inFlight: boolean }>()
+
+export async function mirrorNow(
   client: Parameters<Plugin>[0]['client'],
-  auth: ReturnType<typeof resolveDevspecAuth>,
   directory: string,
-  state: ConnectionState,
-  openCodeSessionId: string,
+  sessionId: string,
+  { force = false }: { force?: boolean } = {},
 ): Promise<void> {
-  if (!auth.ok || !auth.token || !auth.mcp_url || !state.connectionId) return
-  let dispatch: any
+  const auth = resolveDevspecAuth(directory)
+  const state = readState(directory)
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId) return
+
+  const guard = mirrorGuards.get(directory) ?? { at: 0, inFlight: false }
+  if (guard.inFlight) return
+  if (!force && Date.now() - guard.at < MIRROR_MIN_GAP_MS) return
+  guard.inFlight = true
+  guard.at = Date.now()
+  mirrorGuards.set(directory, guard)
   try {
-    dispatch = await mcpToolsCall({
-      mcpUrl: auth.mcp_url,
-      token: auth.token,
-      name: 'get_connection_dispatch',
-      arguments: { connection_id: state.connectionId },
-    })
+    await mirrorLatestReply(client, auth, directory, state, sessionId)
   } catch (err) {
-    logPoll(`get_connection_dispatch failed: ${err}`)
-    return
-  }
-
-  const batches: any[] = Array.isArray(dispatch?.assignments)
-    ? dispatch.assignments
-    : Array.isArray(dispatch?.dispatches)
-      ? dispatch.dispatches
-      : Array.isArray(dispatch)
-        ? dispatch
-        : []
-  if (batches.length === 0) return
-
-  const delivered = new Set(state.deliveredAssignmentIds ?? [])
-  for (const batch of batches) {
-    const id = typeof batch?.id === 'string' ? batch.id : typeof batch?.assignment_id === 'string' ? batch.assignment_id : null
-    if (!id || delivered.has(id)) continue
-    const stateName = String(batch?.state || batch?.status || 'pending')
-    if (stateName === 'completed' || stateName === 'released') continue
-
-    delivered.add(id)
-    state = {
-      ...state,
-      deliveredAssignmentIds: Array.from(delivered).slice(-50),
-    }
-    writeState(directory, state)
-
-    const prompt =
-      `📦 DevSpec assignment for this connection (sessionless-capable).\n\n` +
-      `Assignment reference: \`${id}\`\n\n` +
-      `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
-      `claim_work_item (each member) → implement → record_implementation → resolve_assignment.\n` +
-      `Do not invent a DevSpec chat room. Report progress with report_progress / notes only while sessionless.`
-
-    try {
-      await setBusy(directory, true)
-      await (client as any).session.promptAsync({
-        path: { id: openCodeSessionId },
-        body: { parts: [{ type: 'text', text: prompt }] },
-      })
-      logPoll(`injected assignment ${id} into OpenCode session`)
-    } catch (err) {
-      logPoll(`failed to inject assignment ${id}: ${err}`)
-      // Allow retry on next poll
-      const ids = (readState(directory)?.deliveredAssignmentIds ?? []).filter((x) => x !== id)
-      patchState(directory, { deliveredAssignmentIds: ids })
-      await setBusy(directory, false)
-    }
+    logPoll(`mirrorNow failed: ${err}`)
+  } finally {
+    guard.inFlight = false
+    mirrorGuards.set(directory, guard)
   }
 }
 

@@ -10,9 +10,36 @@ export interface McpToolCallArgs {
   token: string
   name: string
   arguments?: Record<string, unknown>
+  /**
+   * Client-side ceiling in ms. REQUIRED in spirit for `poll_connection`: that call is a
+   * LONG-POLL the server holds open, and `fetch` has no default timeout, so a silently
+   * dropped TCP connection would leave the pump awaiting a response that never comes —
+   * no heartbeat, no delivery, and indistinguishable from "the owner sent nothing".
+   * Omit for ordinary short calls.
+   */
+  timeoutMs?: number
+  /** Abort the request from outside (plugin `dispose`, so a held poll cannot outlive the host). */
+  signal?: AbortSignal
 }
 
-export async function mcpToolsCall({ mcpUrl, token, name, arguments: toolArgs }: McpToolCallArgs): Promise<unknown> {
+/** Thrown when a request exceeded its own `timeoutMs` (not a server error). */
+export class McpTimeoutError extends Error {
+  readonly timeoutMs: number
+  constructor(name: string, timeoutMs: number) {
+    super(`MCP ${name} exceeded its ${timeoutMs}ms client timeout`)
+    this.name = 'McpTimeoutError'
+    this.timeoutMs = timeoutMs
+  }
+}
+
+export async function mcpToolsCall({
+  mcpUrl,
+  token,
+  name,
+  arguments: toolArgs,
+  timeoutMs,
+  signal,
+}: McpToolCallArgs): Promise<unknown> {
   const body = {
     jsonrpc: '2.0',
     id: Date.now(),
@@ -20,15 +47,47 @@ export async function mcpToolsCall({ mcpUrl, token, name, arguments: toolArgs }:
     params: { name, arguments: toolArgs || {} },
   }
 
-  const res = await fetch(mcpUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-    },
-    body: JSON.stringify(body),
-  })
+  // One controller for both reasons a request can be cut short: our own ceiling, and an
+  // external abort (host shutdown). AbortSignal.any would be neater but is too new to
+  // rely on across the Node/Bun runtimes OpenCode ships on.
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let timedOut = false
+  if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+    // Never let our own ceiling keep the host process alive.
+    timer.unref?.()
+  }
+  const onExternalAbort = () => controller.abort()
+  if (signal) {
+    if (signal.aborted) controller.abort()
+    else signal.addEventListener('abort', onExternalAbort, { once: true })
+  }
+
+  let res: Response
+  try {
+    res = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    // Distinguish "we cut it off" from a genuine transport failure: a held poll timing
+    // out is NORMAL (it means nothing arrived) and must not trigger error backoff.
+    if (timedOut) throw new McpTimeoutError(name, timeoutMs as number)
+    throw err
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (signal) signal.removeEventListener('abort', onExternalAbort)
+  }
 
   const text = await res.text()
   if (!res.ok) {
