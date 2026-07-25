@@ -1,12 +1,12 @@
-## Delivery contract (binding)
-
-The in-process plugin posts answers when attached via `post_session_message({ connection_id, turn_kind: "agent" })` (server resolves current session). After a remote inject it only mirrors assistants newer than the pre-inject baseline — never an unrelated older local answer. Sessionless: assignment/`report_progress` only — no chat. See DevSpecV2 `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`.
-
 ---
 description: Connect this OpenCode session to DevSpec as a first-class agent connection — available on the Agents page, attach to a session for a live transcript, driven from phone/web.
 ---
 
 # DevSpec Remote Control (OpenCode)
+
+## Delivery contract (binding)
+
+The in-process plugin posts answers when attached via `post_session_message({ connection_id, turn_kind: "agent" })` (server resolves current session). After a remote inject it only mirrors assistants newer than the pre-inject baseline — never an unrelated older local answer. Sessionless: assignment/`report_progress` only — no chat. See DevSpecV2 `docs/REMOTE-CONTROL-DELIVERY-CONTRACT.md`.
 
 Arguments: $ARGUMENTS
 
