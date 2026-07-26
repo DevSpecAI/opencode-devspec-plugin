@@ -310,10 +310,107 @@ function renderAdvisoryLine(m: AdvisoryMessage): string {
  * own phrasing (Ali, 24 Jul — standardise what we control on the server, don't force
  * plugin uniformity).
  */
+/**
+ * Largest single attachment we will inline as a `data:` URL on the injected turn.
+ * A phone screenshot is well under this; a 30MB PDF would wedge the request, so it is
+ * declined out loud instead (item 99165e12 — never silently dropped).
+ */
+export const MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
+
+export interface AttachmentInput {
+  filename?: unknown
+  mimeType?: unknown
+  type?: unknown
+  sizeBytes?: unknown
+  content?: unknown
+  dataUrl?: unknown
+}
+
+export interface FilePart {
+  type: 'file'
+  mime: string
+  url: string
+  filename?: string
+}
+
+/**
+ * Turn the attachments on a delivered turn's commands into OpenCode `FilePartInput`s.
+ *
+ * Before this, the injected body was `parts: [{ type: 'text', text }]` and nothing else
+ * — so a screenshot sent with "why does this look wrong?" reached the model as the
+ * sentence alone, with no signal that an image had ever existed. The model could not
+ * even report the loss.
+ *
+ * Anything too large, or with no usable payload, is returned in `declined` so the
+ * caller can say so in the text. Silence is the one outcome that is not allowed.
+ */
+export function buildAttachmentParts(
+  commands: Array<{ attachments?: unknown }>,
+): { parts: FilePart[]; declined: Array<{ filename: string; reason: string }> } {
+  const parts: FilePart[] = []
+  const declined: Array<{ filename: string; reason: string }> = []
+
+  for (const cmd of Array.isArray(commands) ? commands : []) {
+    const list = Array.isArray(cmd?.attachments) ? (cmd.attachments as AttachmentInput[]) : []
+    for (const a of list) {
+      if (!a || typeof a !== 'object') continue
+      const filename = typeof a.filename === 'string' && a.filename ? a.filename : 'attachment'
+      const mime =
+        typeof a.mimeType === 'string' && a.mimeType ? a.mimeType : 'application/octet-stream'
+
+      // dataUrl is content re-encoded; either is fine, prefer the ready-made one.
+      let url: string | null = null
+      if (typeof a.dataUrl === 'string' && a.dataUrl.startsWith('data:')) {
+        url = a.dataUrl
+      } else if (typeof a.content === 'string' && a.content.length > 0) {
+        url = `data:${mime};base64,${a.content}`
+      }
+      if (!url) {
+        declined.push({ filename, reason: 'no payload was delivered with it' })
+        continue
+      }
+
+      // Measure the DECODED size — base64 overstates by ~4/3 and the cap is about
+      // what the request has to carry, not how it happens to be encoded.
+      const b64 = url.slice(url.indexOf(',') + 1)
+      const approxBytes =
+        typeof a.sizeBytes === 'number' && Number.isFinite(a.sizeBytes)
+          ? a.sizeBytes
+          : Math.floor((b64.length * 3) / 4)
+      if (approxBytes > MAX_ATTACHMENT_BYTES) {
+        declined.push({
+          filename,
+          reason: `it is ${Math.round(approxBytes / 1024 / 1024)}MB, over the ${Math.round(
+            MAX_ATTACHMENT_BYTES / 1024 / 1024,
+          )}MB limit`,
+        })
+        continue
+      }
+
+      parts.push({ type: 'file', mime, url, filename })
+    }
+  }
+
+  return { parts, declined }
+}
+
+/** The line that tells the model an attachment exists but did not make it through. */
+export function renderDeclinedAttachments(
+  declined: Array<{ filename: string; reason: string }>,
+): string | null {
+  if (!Array.isArray(declined) || declined.length === 0) return null
+  return (
+    '## Attachments that did NOT come through\n' +
+    declined.map((d) => `- \`${d.filename}\` — ${d.reason}`).join('\n') +
+    '\nSay so if the command depends on one of these; do not guess at its contents.'
+  )
+}
+
 export function renderInjectedTurn(input: {
   commands: Array<{ content?: unknown; addressed_to?: { label?: string; connection_id?: string }; author?: { name?: string } }>
   context?: CarriedContext | null
   deliveryContract?: string | null
+  declinedAttachments?: Array<{ filename: string; reason: string }>
 }): string {
   const commands = Array.isArray(input.commands) ? input.commands : []
   const ctx = input.context ?? null
@@ -357,6 +454,11 @@ export function renderInjectedTurn(input: {
       typeof cmd?.content === 'string' ? cmd.content : JSON.stringify(cmd?.content ?? cmd)
     parts.push(commands.length > 1 ? `### ${i + 1}.\n${body}` : body)
   })
+
+  // After the commands, so the model has read what was asked before learning that
+  // part of it did not arrive.
+  const declined = renderDeclinedAttachments(input.declinedAttachments ?? [])
+  if (declined) parts.push(declined)
 
   if (input.deliveryContract) parts.push(`_${input.deliveryContract}_`)
 

@@ -33,6 +33,7 @@ import { resolveDevspecAuth } from './resolve-devspec-auth.js'
 import {
   HOLD_HTTP_GRACE_MS,
   createCarryBuffer,
+  buildAttachmentParts,
   emptyTurnBackoffMs,
   errorBackoffMs,
   holdFor,
@@ -47,6 +48,7 @@ import {
 
 // Re-exported so the poll-turn split stays an internal refactor for importers.
 export {
+  buildAttachmentParts,
   isDeliverableCommand,
   pollTerminalReason,
   renderInjectedTurn,
@@ -1075,10 +1077,14 @@ export async function pollAndDeliver(
   // by every command in the delta. Injecting per-command would queue separate OpenCode
   // turns, and only the first would carry the context they all share.
   const context: CarriedContext | null = pump.carry.take()
+  // Attachments ride the same turn as real file parts (item 99165e12). Anything too
+  // large to inline is named in the text rather than vanishing.
+  const { parts: fileParts, declined: declinedAttachments } = buildAttachmentParts(commands as any)
   const text = renderInjectedTurn({
     commands: commands as any,
     context,
     deliveryContract: typeof res.delivery_contract === 'string' ? res.delivery_contract : null,
+    declinedAttachments,
   })
   logPoll(
     `injecting ${commands.length} command(s) with context: ` +
@@ -1123,7 +1129,10 @@ export async function pollAndDeliver(
 
     await (client as any).session.promptAsync({
       path: { id: sessionId },
-      body: { parts: [{ type: 'text', text }], ...(model ? { model } : {}) },
+      body: {
+        parts: [{ type: 'text', text }, ...fileParts],
+        ...(model ? { model } : {}),
+      },
     })
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)

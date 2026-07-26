@@ -29,6 +29,10 @@ import {
   resolveServerAttachment,
   trimAdvisoryCarry,
   unansweredCommands,
+  buildAttachmentParts,
+  renderDeclinedAttachments,
+  renderInjectedTurn as _rit,
+  MAX_ATTACHMENT_BYTES,
 } from '../dist/poll-turn.js'
 
 const ME = 'conn-me'
@@ -354,5 +358,109 @@ describe('hold length and backoff', () => {
     assert.ok(errorBackoffMs(1, { rateLimited: true }) > errorBackoffMs(1))
     assert.equal(errorBackoffMs(99), 30_000)
     assert.equal(errorBackoffMs(99, { rateLimited: true }), 30_000)
+  })
+})
+
+/**
+ * Attachments (item 99165e12). The injected body used to be text-only, so a screenshot
+ * sent with "why does this look wrong?" reached the model as the sentence alone — and
+ * the model could not even report that something was missing. These lock in that an
+ * image becomes a real file part, and that anything refused says so out loud.
+ */
+describe('buildAttachmentParts', () => {
+  const b64 = (bytes) => Buffer.alloc(bytes, 7).toString('base64')
+
+  const cmdWith = (over = {}) => ({
+    id: 'm1',
+    content: 'why does this look wrong?',
+    attachments: [
+      {
+        filename: 'shot.png',
+        mimeType: 'image/png',
+        type: 'image',
+        sizeBytes: 1024,
+        content: b64(1024),
+        ...over,
+      },
+    ],
+  })
+
+  it('turns an image attachment into a file part the model can actually see', () => {
+    const { parts, declined } = buildAttachmentParts([cmdWith()])
+    assert.equal(parts.length, 1)
+    assert.equal(parts[0].type, 'file')
+    assert.equal(parts[0].mime, 'image/png')
+    assert.equal(parts[0].filename, 'shot.png')
+    assert.ok(parts[0].url.startsWith('data:image/png;base64,'))
+    assert.deepEqual(declined, [])
+  })
+
+  it('prefers a ready-made dataUrl over re-encoding content', () => {
+    const { parts } = buildAttachmentParts([
+      cmdWith({ dataUrl: 'data:image/png;base64,AAAA', content: b64(64) }),
+    ])
+    assert.equal(parts[0].url, 'data:image/png;base64,AAAA')
+  })
+
+  it('a command with no attachments produces no parts and no noise', () => {
+    const { parts, declined } = buildAttachmentParts([{ id: 'm1', content: 'just text' }])
+    assert.deepEqual(parts, [])
+    assert.deepEqual(declined, [])
+  })
+
+  it('DECLINES an oversized attachment instead of wedging the request', () => {
+    const { parts, declined } = buildAttachmentParts([
+      cmdWith({ filename: 'huge.pdf', mimeType: 'application/pdf', type: 'document',
+                sizeBytes: MAX_ATTACHMENT_BYTES + 1, content: 'AAAA' }),
+    ])
+    assert.deepEqual(parts, [])
+    assert.equal(declined.length, 1)
+    assert.equal(declined[0].filename, 'huge.pdf')
+    assert.match(declined[0].reason, /over the/)
+  })
+
+  it('declines a metadata-only stub rather than emitting a broken part', () => {
+    const { parts, declined } = buildAttachmentParts([
+      { id: 'm1', attachments: [{ filename: 'ghost.png', mimeType: 'image/png', type: 'image' }] },
+    ])
+    assert.deepEqual(parts, [])
+    assert.match(declined[0].reason, /no payload/)
+  })
+
+  it('measures the DECODED size, so base64 inflation cannot cause a false refusal', () => {
+    // ~3MB decoded is ~4MB as base64 — under the cap decoded, over it encoded.
+    const bytes = 3 * 1024 * 1024
+    const { parts, declined } = buildAttachmentParts([
+      cmdWith({ sizeBytes: undefined, content: b64(bytes) }),
+    ])
+    assert.equal(parts.length, 1, 'should accept: decoded size is under the cap')
+    assert.deepEqual(declined, [])
+  })
+
+  it('collects attachments across every command in the turn', () => {
+    const { parts } = buildAttachmentParts([cmdWith(), cmdWith({ filename: 'two.png' })])
+    assert.deepEqual(parts.map((p) => p.filename), ['shot.png', 'two.png'])
+  })
+})
+
+describe('renderDeclinedAttachments', () => {
+  it('is silent when nothing was declined', () => {
+    assert.equal(renderDeclinedAttachments([]), null)
+  })
+
+  it('names the file and the reason so the model can say what it is missing', () => {
+    const out = renderDeclinedAttachments([{ filename: 'huge.pdf', reason: 'it is 9MB, over the 4MB limit' }])
+    assert.match(out, /huge\.pdf/)
+    assert.match(out, /9MB/)
+    assert.match(out, /do not guess/)
+  })
+
+  it('appears in the injected turn so the loss is visible to the model', () => {
+    const text = _rit({
+      commands: [{ content: 'look at this' }],
+      declinedAttachments: [{ filename: 'huge.pdf', reason: 'too big' }],
+    })
+    assert.match(text, /Attachments that did NOT come through/)
+    assert.match(text, /huge\.pdf/)
   })
 })
