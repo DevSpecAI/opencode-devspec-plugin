@@ -75,5 +75,5 @@ On an error, print `✗ DevSpec connection failed: {error}` and suggest checking
 - If scope error (read-only token) when calling `report_connection_check`:
   ```
   ✗ Read-only token — cannot report verification.
-    Generate a read-write token in DevSpec: Settings > MCP Tokens.
+    Generate a read-write token in DevSpec: You → Connections → Connect a tool (Read & write).
   ```

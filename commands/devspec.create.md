@@ -26,7 +26,7 @@ Create a new action item in DevSpec without leaving the terminal.
 4. If the call fails with a scope error (read-only token), output:
    ```
    ✗ Read-only token — cannot create action items.
-     Generate a read-write token in DevSpec: Settings > MCP Tokens.
+     Generate a read-write token in DevSpec: You → Connections → Connect a tool (Read & write).
    ```
 
 5. On success, output:

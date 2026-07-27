@@ -30,7 +30,7 @@ Associate a git commit with a DevSpec action item for traceability.
 6. If scope error (read-only token):
    ```
    ✗ Read-only token — cannot link commits.
-     Generate a read-write token in DevSpec: Settings > MCP Tokens.
+     Generate a read-write token in DevSpec: You → Connections → Connect a tool (Read & write).
    ```
 
 7. On success:
