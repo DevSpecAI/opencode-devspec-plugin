@@ -39,6 +39,7 @@ import {
   holdFor,
   isDeliverableCommand,
   pollTerminalReason,
+  RECOVERABLE_TERMINAL_MAX,
   renderInjectedTurn,
   resolveServerAttachment,
   unansweredCommands,
@@ -51,6 +52,7 @@ export {
   buildAttachmentParts,
   isDeliverableCommand,
   pollTerminalReason,
+  PERMANENT_END_REASONS,
   renderInjectedTurn,
   resolveServerAttachment,
   holdFor,
@@ -797,6 +799,11 @@ interface PumpState {
   needsSeed: boolean
   consecutiveEmpty: number
   consecutiveErrors: number
+  /**
+   * Consecutive teardowns the server would not attribute to a person. Reset by any
+   * clean poll, so only a SUSTAINED absence stops the pump (brief e691c68a).
+   */
+  consecutiveRecoverableEnds: number
   deliveredDispatchIds: Set<string>
 }
 
@@ -817,6 +824,7 @@ function pumpStateFor(
       needsSeed: true,
       consecutiveEmpty: 0,
       consecutiveErrors: 0,
+      consecutiveRecoverableEnds: 0,
       // Seeded from disk so a plugin restart cannot re-inject an assignment it already
       // handed to the model — the interval version persisted this and losing it would
       // have been a silent regression.
@@ -940,12 +948,41 @@ export async function pollAndDeliver(
   // Teardown (UI End, /devspec.remote-stop elsewhere, already-ended row). One check now
   // covers what the separate heartbeat used to: the poll IS the heartbeat.
   const terminal = pollTerminalReason(res)
-  if (terminal) {
-    logPoll(`connection ended (${terminal}) — stopping the pump; do not restart`)
+  if (terminal?.recoverable) {
+    // The server says gone, but will not attribute it to a person — so we do not
+    // treat it as one. This is the redeploy case: during a container swap
+    // poll_connection briefly cannot see a row that is perfectly alive, and the old
+    // code stopped the pump permanently on the strength of it (brief e691c68a).
+    pump.consecutiveRecoverableEnds++
+    const label = terminal.reason ?? 'no reason given'
+    if (pump.consecutiveRecoverableEnds < RECOVERABLE_TERMINAL_MAX) {
+      const backoff = errorBackoffMs(pump.consecutiveRecoverableEnds)
+      logPoll(
+        `${terminal.status} (${label}) — recoverable, not a UI end; retrying in ${backoff}ms ` +
+          `(${pump.consecutiveRecoverableEnds}/${RECOVERABLE_TERMINAL_MAX})`,
+      )
+      return { delayMs: backoff, stop: false }
+    }
+    // Out of patience. Stand down, but say plainly that this was NOT a UI end, so
+    // whoever reads the log knows the bond may simply be re-registered.
+    logPoll(
+      `${terminal.status} (${label}) — still gone after ${RECOVERABLE_TERMINAL_MAX} tries; ` +
+        `stopping the pump. This was NOT a UI end — re-register the same bond to resume.`,
+    )
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
-    return { delayMs: 0, stop: true, reason: terminal }
+    return { delayMs: 0, stop: true, reason: terminal.reason ?? 'server_ended' }
   }
+  if (terminal) {
+    // A deliberate human end ('ui' / 'local_stop'). This one must stick.
+    const reason = terminal.reason ?? 'ended_from_ui'
+    logPoll(`connection ended (${reason}) — stopping the pump; do not restart`)
+    await setBusy(directory, false).catch(() => {})
+    forgetPumpState(state.connectionId)
+    return { delayMs: 0, stop: true, reason }
+  }
+  // A clean poll clears the recoverable streak — a blip that resolves is over.
+  pump.consecutiveRecoverableEnds = 0
 
   // Server-authoritative attachment: an attach/detach/redirect from the phone or web
   // changes the room WITHOUT touching this machine's state file, so the response — never

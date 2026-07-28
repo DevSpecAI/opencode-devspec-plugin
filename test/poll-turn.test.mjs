@@ -274,16 +274,82 @@ describe('trimAdvisoryCarry', () => {
   })
 })
 
+/**
+ * Regression cover for brief e691c68a.
+ *
+ * On 2026-07-28 a Coolify redeploy of staging made poll_connection briefly answer
+ * `not_found` for connections that were perfectly alive. This function returned the
+ * string 'ended_from_ui' — asserting a human had clicked End on the Agents page —
+ * and the pump stopped for good with "do not restart". Nobody had touched the
+ * Agents page.
+ *
+ * The rule: only a deliberate human act is permanent. Absence of a reason means we
+ * do not know, and "we do not know" is recoverable.
+ */
 describe('pollTerminalReason', () => {
-  it('stops on a connection that is gone or was ended mid-hold', () => {
-    assert.equal(pollTerminalReason({ status: 'not_found' }), 'ended_from_ui')
-    assert.equal(pollTerminalReason({ status: 'ended', end_reason: 'ui' }), 'ui')
+  it('treats a reasonless not_found as RECOVERABLE, not as a UI end', () => {
+    // THE regression. This used to return the string 'ended_from_ui'.
+    assert.deepEqual(pollTerminalReason({ status: 'not_found' }), {
+      reason: null,
+      recoverable: true,
+      status: 'not_found',
+    })
+  })
+
+  it('treats a reasonless ended as RECOVERABLE too', () => {
+    assert.deepEqual(pollTerminalReason({ status: 'ended' }), {
+      reason: null,
+      recoverable: true,
+      status: 'ended',
+    })
+  })
+
+  it('keeps a real Agents-page End permanent', () => {
+    assert.deepEqual(pollTerminalReason({ status: 'ended', end_reason: 'ui' }), {
+      reason: 'ui',
+      recoverable: false,
+      status: 'ended',
+    })
+  })
+
+  it('keeps the stop command permanent', () => {
+    // Re-registering would resurrect an agent the human just switched off.
+    assert.equal(
+      pollTerminalReason({ status: 'ended', end_reason: 'local_stop' }).recoverable,
+      false,
+    )
+  })
+
+  it('treats every non-human end reason as recoverable', () => {
+    for (const reason of ['idle_timeout', 'owner_gone', 'auth', 'server_ended']) {
+      const verdict = pollTerminalReason({ status: 'ended', end_reason: reason })
+      assert.equal(verdict.recoverable, true, `${reason} should be recoverable`)
+      assert.equal(verdict.reason, reason)
+    }
   })
 
   it('keeps polling for an ordinary response', () => {
     assert.equal(pollTerminalReason({ changed: false }), null)
     assert.equal(pollTerminalReason({ changed: true, commands: [] }), null)
     assert.equal(pollTerminalReason(null), null)
+  })
+})
+
+describe('resolveServerAttachment — a teardown is never a detach', () => {
+  it('leaves the room intact on an ended response we are riding out', () => {
+    // A teardown response carries no session_id; reading that absence as a detach
+    // would silently unattach a live agent mid-redeploy (brief e691c68a).
+    assert.deepEqual(resolveServerAttachment('sess-1', { status: 'ended' }), {
+      sessionId: 'sess-1',
+      changed: false,
+    })
+  })
+
+  it('leaves the room intact on not_found', () => {
+    assert.deepEqual(resolveServerAttachment('sess-1', { status: 'not_found' }), {
+      sessionId: 'sess-1',
+      changed: false,
+    })
   })
 })
 

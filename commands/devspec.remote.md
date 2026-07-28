@@ -100,3 +100,17 @@ When the conversation produces a durable decision, convention, architecture choi
 2. **Artifacts** — short plans / ADRs / runbooks via `create_resource` / `update_resource` / `supersede_resource`.
 3. When attached, just say so in your own reply (offer, then confirmation once recorded) — the plugin's automatic mirror carries it to the phone transcript. Do not call `post_session_message` yourself for this either.
 4. Don't rely on autopilot post-session extraction for this channel — capture it live.
+
+## When the connection "ends" — recoverable vs permanent
+
+"Ended" and "ended by a human" are not the same thing, and only the second one sticks:
+
+| Server says | Meaning | What the pump does |
+|---|---|---|
+| `end_reason: 'ui'` | A person clicked End on the Agents page | Stops for good. Stay disconnected. |
+| `end_reason: 'local_stop'` | A person ran `/devspec.remote-stop` | Stops for good. |
+| Anything else — any other reason, or none at all | The server will not vouch that a human did this. A web-app redeploy looks exactly like this. | **Rides it out** and retries; if still gone after 10 tries it stops, saying plainly it was NOT a UI end, and the same bond may be re-registered. |
+
+During a redeploy the poll log shows `recoverable, not a UI end; retrying (n/10)`. That is the pump working, not failing — do not restart it and do not tell the user they were disconnected.
+
+Never infer a UI End from silence. That inference is what took every agent offline during a staging redeploy on 2026-07-28 (brief `e691c68a`).

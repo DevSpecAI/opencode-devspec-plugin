@@ -181,19 +181,69 @@ export function createCarryBuffer() {
 }
 
 /**
+ * Ends a HUMAN deliberately caused, and which must therefore stick.
+ *
+ * 'ui' is the Agents-page End (the server stamps it in end-remote-control.ts).
+ * 'local_stop' is the stop command. Coming back from either would resurrect an
+ * agent somebody just switched off. Everything else — an idle timeout, a stale
+ * owner_gone, an auth blip, or no reason at all — is the server saying "gone, but
+ * not because a person said so", which is recoverable.
+ */
+export const PERMANENT_END_REASONS = ['ui', 'local_stop', 'ended_from_ui'] as const
+
+/**
+ * How many CONSECUTIVE recoverable teardowns to ride out before stopping the pump.
+ *
+ * A redeploy is over in seconds, so this only has to outlast a container swap. If
+ * the connection really is gone for good the count runs out and the pump stops
+ * cleanly — without ever claiming a human ended it.
+ */
+export const RECOVERABLE_TERMINAL_MAX = 10
+
+/**
+ * What a terminal poll response means: did a human end this, or is it just gone?
+ *
+ * A discriminated result rather than a string, so that reading a recoverable end as
+ * permanent is a COMPILE error rather than a convention someone can forget.
+ */
+export interface TerminalVerdict {
+  /** The server's own word for it, or null when it would not say. */
+  reason: string | null
+  /** True unless a human deliberately did this. Default-true is the point. */
+  recoverable: boolean
+  status: 'not_found' | 'ended'
+}
+
+/**
  * Terminal condition from a poll response, or null to keep polling.
  *
  * poll_connection reports teardown two ways: `not_found` (the row is gone / already
  * ended, e.g. an Agents-page End before the call) and `ended` (torn down DURING the
  * hold, so the server stops holding rather than making us wait out the full window).
+ *
+ * WHAT THIS USED TO DO, AND WHY IT WAS WRONG (brief e691c68a):
+ *
+ *   return r.end_reason ? r.end_reason : 'ended_from_ui'
+ *
+ * When the server gave no reason we supplied the one reason that means "stay dead",
+ * asserting a human had clicked End. On 2026-07-28 a Coolify redeploy of staging
+ * made poll_connection briefly answer `not_found` for connections that were
+ * perfectly alive, and every connected agent across every tool disabled itself and
+ * refused to restart. Nobody had touched the Agents page.
+ *
+ * Absence of proof is not proof of a UI End.
  */
-export function pollTerminalReason(res: unknown): string | null {
+export function pollTerminalReason(res: unknown): TerminalVerdict | null {
   if (!res || typeof res !== 'object') return null
   const r = res as { status?: unknown; end_reason?: unknown }
-  if (r.status === 'not_found' || r.status === 'ended') {
-    return typeof r.end_reason === 'string' && r.end_reason ? r.end_reason : 'ended_from_ui'
+  if (r.status !== 'not_found' && r.status !== 'ended') return null
+  const reason = typeof r.end_reason === 'string' && r.end_reason ? r.end_reason : null
+  return {
+    reason,
+    // No reason → NOT permanent. That is the whole fix in one line.
+    recoverable: !reason || !(PERMANENT_END_REASONS as readonly string[]).includes(reason),
+    status: r.status,
   }
-  return null
 }
 
 /**
@@ -258,13 +308,17 @@ export function unansweredCommands(
  *
  * A `not_found` response means the connection ended server-side; it omits `session_id`,
  * so it must NEVER be read as a detach → return no change and leave the room intact.
+ *
+ * `ended` is excluded for the same reason (brief e691c68a): a teardown response the
+ * pump is deliberately riding out carries no attachment either, and reading that
+ * absence as a detach would silently unattach a live agent mid-redeploy.
  */
 export function resolveServerAttachment(
   currentSessionId: string | null,
   res: unknown,
 ): { sessionId: string | null; changed: boolean } {
   const obj = res && typeof res === 'object' ? (res as Record<string, unknown>) : null
-  if (!obj || obj.status === 'not_found') {
+  if (!obj || obj.status === 'not_found' || obj.status === 'ended') {
     return { sessionId: currentSessionId, changed: false }
   }
   const raw = obj.session_id
