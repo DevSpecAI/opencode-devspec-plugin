@@ -183,6 +183,15 @@ interface ConnectionState {
    * impossible regardless of how the pointer itself gets confused.
    */
   mirroredMessageIds?: string[]
+  /**
+   * Recent content hashes of replies already posted to DevSpec (manual
+   * model `post_session_message` OR plugin mirror). Live regression
+   * (session 506e2926 / Climbing Zebra): docs told the model not to call
+   * `post_session_message`, but it still did — so mirror + model each
+   * posted the same answer ~1–2s apart. Hash dedup makes that structurally
+   * impossible even when the model ignores the skill wording.
+   */
+  recentPostedContentHashes?: string[]
 }
 
 /**
@@ -265,6 +274,85 @@ function assistantTextFromMessage(message: { parts?: unknown } | null | undefine
     .map((p: any) => p.text)
     .join('\n')
     .trim()
+}
+
+/** Normalize reply text before hashing so trivial whitespace drift cannot bypass dedup. */
+export function normalizePostedContent(text: string): string {
+  return String(text ?? '')
+    .replace(/\r\n/g, '\n')
+    .trim()
+}
+
+/** Stable short hash of a reply body (used for mirror ↔ manual-post dedup). */
+export function hashPostedContent(text: string): string {
+  return crypto.createHash('sha256').update(normalizePostedContent(text), 'utf8').digest('hex').slice(0, 32)
+}
+
+/**
+ * True when this OpenCode assistant message already invoked DevSpec's
+ * `post_session_message` (any MCP name variant). Mirror must not post again.
+ */
+export function messageHasPostSessionMessageTool(
+  message: { parts?: unknown } | null | undefined,
+): boolean {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue
+    const part = p as Record<string, unknown>
+    const candidates = [part.tool, part.name, part.toolName, part.call]
+      .filter((v): v is string => typeof v === 'string')
+      .map((v) => v.toLowerCase())
+    for (const name of candidates) {
+      if (name === 'post_session_message' || name.endsWith('_post_session_message') || name.endsWith('/post_session_message')) {
+        return true
+      }
+    }
+    // Nested tool metadata shapes observed across OpenCode versions.
+    const nested = part.tool as Record<string, unknown> | undefined
+    if (nested && typeof nested === 'object') {
+      const nestedName = typeof nested.name === 'string' ? nested.name.toLowerCase() : ''
+      if (
+        nestedName === 'post_session_message' ||
+        nestedName.endsWith('_post_session_message') ||
+        nestedName.endsWith('/post_session_message')
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function rememberPostedContentHash(directory: string, hash: string): void {
+  const state = readState(directory)
+  if (!state) return
+  const prev = state.recentPostedContentHashes ?? []
+  if (prev.includes(hash)) return
+  patchState(directory, {
+    recentPostedContentHashes: [...prev, hash].slice(-40),
+  })
+}
+
+/**
+ * Record a successful model-initiated `post_session_message` so the auto-mirror
+ * skips the same body. Wired from `tool.execute.after` in plugin.ts.
+ */
+export function recordManualPostSessionMessage(directory: string, toolName: string, args: unknown): void {
+  const lower = String(toolName ?? '').toLowerCase()
+  if (
+    lower !== 'post_session_message' &&
+    !lower.endsWith('_post_session_message') &&
+    !lower.endsWith('/post_session_message') &&
+    lower !== 'devspec_post_session_message'
+  ) {
+    return
+  }
+  const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
+  const message = typeof argsObj.message === 'string' ? argsObj.message : null
+  if (!message || !normalizePostedContent(message)) return
+  const hash = hashPostedContent(message)
+  rememberPostedContentHash(directory, hash)
+  logPoll(`recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}…`)
 }
 
 const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
@@ -625,6 +713,7 @@ export function recordConnectionEventFromTool(
       lastDeliveredMessageId: existing?.lastDeliveredMessageId,
       deliveredMessageIds: existing?.deliveredMessageIds,
       mirroredMessageIds: existing?.mirroredMessageIds,
+      recentPostedContentHashes: existing?.recentPostedContentHashes,
     })
     return
   }
@@ -664,6 +753,7 @@ export function recordConnectionEventFromTool(
     lastDeliveredMessageId: existing?.lastDeliveredMessageId,
     deliveredMessageIds: existing?.deliveredMessageIds,
     mirroredMessageIds: existing?.mirroredMessageIds,
+    recentPostedContentHashes: existing?.recentPostedContentHashes,
   })
 }
 
@@ -1216,9 +1306,18 @@ export async function pollAndDeliver(
  *
  * Cheap-guarded: at most one mirror in flight per directory, and at most one attempt per
  * MIRROR_MIN_GAP_MS, because `message.updated` can fire many times per turn.
+ *
+ * Settle debounce (item a70cdf78): `message.updated` often fires with the
+ * assistant text BEFORE the model finishes a `post_session_message` tool call.
+ * Mirroring immediately then double-posts when the tool lands ~1s later.
+ * `scheduleMirrorNow` waits MIRROR_SETTLE_MS so `tool.execute.after` can
+ * record the manual-post hash first; `session.idle` still flushes immediately.
  */
 const MIRROR_MIN_GAP_MS = 1_500
+/** Wait after the last message.updated before mirroring — covers tool-call lag. */
+export const MIRROR_SETTLE_MS = 2_000
 const mirrorGuards = new Map<string, { at: number; inFlight: boolean }>()
+const mirrorSettleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 export async function mirrorNow(
   client: Parameters<Plugin>[0]['client'],
@@ -1244,6 +1343,40 @@ export async function mirrorNow(
     guard.inFlight = false
     mirrorGuards.set(directory, guard)
   }
+}
+
+/**
+ * Debounced mirror for `message.updated` — resets on every update so we only
+ * run after the turn has gone quiet long enough for a manual post tool to land.
+ */
+export function scheduleMirrorNow(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+): void {
+  const prev = mirrorSettleTimers.get(directory)
+  if (prev) clearTimeout(prev)
+  const timer = setTimeout(() => {
+    mirrorSettleTimers.delete(directory)
+    void mirrorNow(client, directory, sessionId)
+  }, MIRROR_SETTLE_MS)
+  // Don't keep the process alive solely for this timer.
+  if (typeof timer === 'object' && timer && 'unref' in timer) {
+    ;(timer as NodeJS.Timeout).unref()
+  }
+  mirrorSettleTimers.set(directory, timer)
+}
+
+/** Cancel any pending settle timer and mirror immediately (session.idle path). */
+export function flushMirrorNow(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+): void {
+  const prev = mirrorSettleTimers.get(directory)
+  if (prev) clearTimeout(prev)
+  mirrorSettleTimers.delete(directory)
+  void mirrorNow(client, directory, sessionId, { force: true })
 }
 
 /**
@@ -1381,6 +1514,33 @@ async function mirrorLatestReply(
     return
   }
 
+  // Mechanical double-post guard (a70cdf78): if the model already called
+  // post_session_message for this turn (tool part on the message, or hash
+  // recorded from tool.execute.after during the settle window), claim the
+  // OpenCode message id and do NOT post again.
+  const contentHash = hashPostedContent(preparedText)
+  const alreadyPostedByHash = (fresh.recentPostedContentHashes ?? []).includes(contentHash)
+  const alreadyPostedByTool = messageHasPostSessionMessageTool(last)
+  if (alreadyPostedByHash || alreadyPostedByTool) {
+    logPoll(
+      `mirrorLatestReply: skip (already posted via ${alreadyPostedByTool ? 'tool' : 'content-hash'}) ` +
+        `last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…`,
+    )
+    alreadyMirrored.add(last.info.id)
+    patchState(directory, {
+      lastMirroredMessageId: last.info.id,
+      mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+      awaitingRemoteReply: false,
+      replyAfterOpenCodeMessageId: null,
+      replyBaselineCaptured: undefined,
+      recentPostedContentHashes: (fresh.recentPostedContentHashes ?? []).includes(contentHash)
+        ? fresh.recentPostedContentHashes
+        : [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
+    })
+    await setBusy(directory, false)
+    return
+  }
+
   // Optimistic claim BEFORE the network post — closes the race where two
   // concurrent poll/idle paths both pass the dedup check, both post, then
   // both write. Whichever claims second sees the id already in the set and
@@ -1392,6 +1552,9 @@ async function mirrorLatestReply(
     awaitingRemoteReply: false,
     replyAfterOpenCodeMessageId: null,
     replyBaselineCaptured: undefined,
+    // Claim the content hash too so a racing manual post that lands during
+    // our network round-trip is remembered, and a second mirror path skips.
+    recentPostedContentHashes: [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
   })
   if (!claimed) return
   // Another writer may have claimed the same id between our check and patch
@@ -1414,12 +1577,14 @@ async function mirrorLatestReply(
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.
     const ids = (readState(directory)?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id)
+    const hashes = (readState(directory)?.recentPostedContentHashes ?? []).filter((h) => h !== contentHash)
     patchState(directory, {
       lastMirroredMessageId: fresh.lastMirroredMessageId ?? null,
       mirroredMessageIds: ids,
       awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
       replyAfterOpenCodeMessageId: fresh.replyAfterOpenCodeMessageId ?? null,
       replyBaselineCaptured: fresh.replyBaselineCaptured,
+      recentPostedContentHashes: hashes,
     })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
     return

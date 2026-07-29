@@ -1,10 +1,12 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import {
+  flushMirrorNow,
   handleSessionError,
   logPoll,
-  mirrorNow,
   pollAndDeliver,
   recordConnectionEventFromTool,
+  recordManualPostSessionMessage,
+  scheduleMirrorNow,
   setBusy,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
@@ -178,18 +180,18 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       logPoll(`event received: type=${event.type} sessionID=${sessionId} props=${propsSummary}`)
       if (event.type === 'session.idle') {
         // Turn finished: clear busy and mirror the reply immediately. Delivery is the
-        // pump's job now, so this no longer needs to poll.
+        // pump's job now, so this no longer needs to poll. Flush any pending settle
+        // timer from message.updated so we do not double-fire after the idle path.
         await setBusy(directory, false)
         const target = sessionId ?? lastKnownSessionId
-        if (target) await mirrorNow(client, directory, target, { force: true })
+        if (target) flushMirrorNow(client, directory, target)
       } else if (event.type === 'message.updated') {
         // MIRRORING is event-driven now, not a side-effect of the poll tick (see
-        // mirrorNow). With a ~25s hold, hanging mirroring off the tick would have traded
-        // delivery latency for reply latency; this is faster than the old 8s floor and
-        // costs nothing when there is no new reply. mirrorNow is self-throttled because
-        // this event can fire many times per turn.
+        // scheduleMirrorNow). Debounce so a model that still calls
+        // post_session_message (against skill docs) can record its content hash
+        // before we mirror — otherwise text lands first and we double-post.
         const target = sessionId ?? lastKnownSessionId
-        if (target) await mirrorNow(client, directory, target)
+        if (target) scheduleMirrorNow(client, directory, target)
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the
@@ -200,6 +202,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     'tool.execute.after': async (input, output) => {
       try {
         recordConnectionEventFromTool(directory, input.tool, input.args, output)
+        recordManualPostSessionMessage(directory, input.tool, input.args)
         if (
           (input.tool === 'devspec_register_connection' ||
             input.tool.endsWith('register_connection') ||

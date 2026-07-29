@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2 - 2026-07-29
+
+### Remote control — mechanical guard against double-posted replies
+
+Live regression (Climbing Zebra / session `506e2926`): every substantive reply appeared twice in DevSpec ~1–2s apart. Docs (`42391f84`) already told the model not to call `post_session_message` (the plugin auto-mirrors), but the model still sometimes did — so mirror + manual post both landed.
+
+- **Settle debounce** on `message.updated` (`scheduleMirrorNow`, 2s) so a manual `post_session_message` tool can finish and be recorded before mirroring; `session.idle` still flushes immediately.
+- **`recordManualPostSessionMessage`** on `tool.execute.after` remembers a content hash of the posted body.
+- **`mirrorLatestReply` skips** when that hash is present, or when the assistant message already has a `post_session_message` tool part — then claims the OpenCode message id so busy clears without a second DevSpec bubble.
+- Tests: `test/mirror-dedup.test.mjs`.
+
+**Requires a reinstall / reload** of the OpenCode plugin for the guard to take effect.
+
 ## 0.3.0 - 2026-07-25
 
 ### Remote control — long-poll delivery, and the room finally reaches the model
