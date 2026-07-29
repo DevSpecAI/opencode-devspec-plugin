@@ -365,11 +365,20 @@ function renderAdvisoryLine(m: AdvisoryMessage): string {
  * plugin uniformity).
  */
 /**
- * Largest single attachment we will inline as a `data:` URL on the injected turn.
+ * Largest single attachment we will accept for a remote inject at all.
  * A phone screenshot is well under this; a 30MB PDF would wedge the request, so it is
  * declined out loud instead (item 99165e12 — never silently dropped).
  */
 export const MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
+
+/**
+ * Soft cap for inlining as a `data:` URL on the injected turn.
+ * Live stall (session 506e2926): a ~673KB PNG inlined as base64 left OpenCode
+ * busy ~132s with no reply text. Above this size we prefer a file:// spill
+ * (via `materializeLarge`) so the model still sees the image without stuffing
+ * hundreds of KB of base64 into the prompt payload.
+ */
+export const INLINE_DATA_URL_MAX_BYTES = 256 * 1024
 
 export interface AttachmentInput {
   filename?: unknown
@@ -387,6 +396,13 @@ export interface FilePart {
   filename?: string
 }
 
+export type MaterializeLargeAttachment = (input: {
+  filename: string
+  mime: string
+  bytes: number
+  buffer: Buffer
+}) => string | null
+
 /**
  * Turn the attachments on a delivered turn's commands into OpenCode `FilePartInput`s.
  *
@@ -397,12 +413,17 @@ export interface FilePart {
  *
  * Anything too large, or with no usable payload, is returned in `declined` so the
  * caller can say so in the text. Silence is the one outcome that is not allowed.
+ *
+ * Pass `materializeLarge` from the host (remote-control) to spill oversize-but-allowed
+ * payloads to disk and return a `file://` URL — unit tests can stub this.
  */
 export function buildAttachmentParts(
   commands: Array<{ attachments?: unknown }>,
+  opts?: { materializeLarge?: MaterializeLargeAttachment },
 ): { parts: FilePart[]; declined: Array<{ filename: string; reason: string }> } {
   const parts: FilePart[] = []
   const declined: Array<{ filename: string; reason: string }> = []
+  const materializeLarge = opts?.materializeLarge
 
   for (const cmd of Array.isArray(commands) ? commands : []) {
     const list = Array.isArray(cmd?.attachments) ? (cmd.attachments as AttachmentInput[]) : []
@@ -438,6 +459,35 @@ export function buildAttachmentParts(
             MAX_ATTACHMENT_BYTES / 1024 / 1024,
           )}MB limit`,
         })
+        continue
+      }
+
+      if (approxBytes > INLINE_DATA_URL_MAX_BYTES) {
+        if (!materializeLarge) {
+          declined.push({
+            filename,
+            reason: `it is ${Math.round(approxBytes / 1024)}KB — too large to inline as a data URL (limit ${Math.round(
+              INLINE_DATA_URL_MAX_BYTES / 1024,
+            )}KB). Re-send a cropped/smaller screenshot, or use a host that spills to disk.`,
+          })
+          continue
+        }
+        let buffer: Buffer
+        try {
+          buffer = Buffer.from(b64, 'base64')
+        } catch {
+          declined.push({ filename, reason: 'its payload could not be decoded' })
+          continue
+        }
+        const spilled = materializeLarge({ filename, mime, bytes: approxBytes, buffer })
+        if (!spilled) {
+          declined.push({
+            filename,
+            reason: `it is ${Math.round(approxBytes / 1024)}KB and could not be written to disk for OpenCode`,
+          })
+          continue
+        }
+        parts.push({ type: 'file', mime, url: spilled, filename })
         continue
       }
 

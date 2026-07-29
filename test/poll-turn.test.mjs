@@ -33,6 +33,7 @@ import {
   renderDeclinedAttachments,
   renderInjectedTurn as _rit,
   MAX_ATTACHMENT_BYTES,
+  INLINE_DATA_URL_MAX_BYTES,
 } from '../dist/poll-turn.js'
 
 const ME = 'conn-me'
@@ -485,6 +486,33 @@ describe('buildAttachmentParts', () => {
     assert.match(declined[0].reason, /over the/)
   })
 
+  it('declines mid-size attachments when no materializeLarge spill is provided', () => {
+    const bytes = INLINE_DATA_URL_MAX_BYTES + 1024
+    const { parts, declined } = buildAttachmentParts([
+      cmdWith({ filename: 'phone.png', sizeBytes: bytes, content: b64(64) }),
+    ])
+    assert.deepEqual(parts, [])
+    assert.equal(declined.length, 1)
+    assert.match(declined[0].reason, /too large to inline/i)
+  })
+
+  it('spills mid-size attachments via materializeLarge instead of inlining base64', () => {
+    const bytes = INLINE_DATA_URL_MAX_BYTES + 1024
+    const { parts, declined } = buildAttachmentParts(
+      [cmdWith({ filename: 'phone.png', sizeBytes: bytes, content: b64(64) })],
+      {
+        materializeLarge: ({ filename, buffer }) => {
+          assert.equal(filename, 'phone.png')
+          assert.ok(Buffer.isBuffer(buffer))
+          return 'file:///tmp/phone.png'
+        },
+      },
+    )
+    assert.deepEqual(declined, [])
+    assert.equal(parts.length, 1)
+    assert.equal(parts[0].url, 'file:///tmp/phone.png')
+  })
+
   it('declines a metadata-only stub rather than emitting a broken part', () => {
     const { parts, declined } = buildAttachmentParts([
       { id: 'm1', attachments: [{ filename: 'ghost.png', mimeType: 'image/png', type: 'image' }] },
@@ -494,12 +522,15 @@ describe('buildAttachmentParts', () => {
   })
 
   it('measures the DECODED size, so base64 inflation cannot cause a false refusal', () => {
-    // ~3MB decoded is ~4MB as base64 — under the cap decoded, over it encoded.
+    // ~3MB decoded is ~4MB as base64 — under the hard cap decoded, over it encoded.
+    // Spill to file rather than inlining (over INLINE_DATA_URL_MAX_BYTES).
     const bytes = 3 * 1024 * 1024
-    const { parts, declined } = buildAttachmentParts([
-      cmdWith({ sizeBytes: undefined, content: b64(bytes) }),
-    ])
-    assert.equal(parts.length, 1, 'should accept: decoded size is under the cap')
+    const { parts, declined } = buildAttachmentParts(
+      [cmdWith({ sizeBytes: undefined, content: b64(bytes) })],
+      { materializeLarge: () => 'file:///tmp/big.bin' },
+    )
+    assert.equal(parts.length, 1, 'should accept: decoded size is under the hard cap')
+    assert.equal(parts[0].url, 'file:///tmp/big.bin')
     assert.deepEqual(declined, [])
   })
 

@@ -26,6 +26,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { Plugin } from '@opencode-ai/plugin'
 import { AGENT_NAME } from './agent-identity.js'
 import { McpTimeoutError, mcpToolsCall } from './devspec-client.js'
@@ -422,6 +423,37 @@ export function prepareMirrorText(text: string): string | null {
   if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
   if (!t || isOperationalChrome(t)) return null
   return t
+}
+
+/**
+ * Spill an oversize attachment to ~/.devspec/opencode-remote-control/attachments/
+ * and return a file:// URL OpenCode can open. Used when decoded size exceeds
+ * INLINE_DATA_URL_MAX_BYTES but is still under MAX_ATTACHMENT_BYTES.
+ */
+export function materializeLargeAttachmentToDisk(input: {
+  filename: string
+  mime: string
+  bytes: number
+  buffer: Buffer
+}): string | null {
+  try {
+    const dir = path.join(os.homedir(), '.devspec', 'opencode-remote-control', 'attachments')
+    fs.mkdirSync(dir, { recursive: true })
+    const safe =
+      String(input.filename || 'attachment')
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
+        .slice(0, 80) || 'attachment'
+    const filePath = path.join(dir, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${safe}`)
+    fs.writeFileSync(filePath, input.buffer)
+    const url = pathToFileURL(filePath).href
+    logPoll(
+      `materializeLargeAttachmentToDisk: wrote ${input.bytes}B → ${filePath} (${input.mime})`,
+    )
+    return url
+  } catch (err) {
+    logPoll(`materializeLargeAttachmentToDisk failed: ${err}`)
+    return null
+  }
 }
 
 /** Prefer connection_id so the server uses the current attachment (reattach-safe). */
@@ -1206,7 +1238,9 @@ export async function pollAndDeliver(
   const context: CarriedContext | null = pump.carry.take()
   // Attachments ride the same turn as real file parts (item 99165e12). Anything too
   // large to inline is named in the text rather than vanishing.
-  const { parts: fileParts, declined: declinedAttachments } = buildAttachmentParts(commands as any)
+  const { parts: fileParts, declined: declinedAttachments } = buildAttachmentParts(commands as any, {
+    materializeLarge: materializeLargeAttachmentToDisk,
+  })
   const text = renderInjectedTurn({
     commands: commands as any,
     context,

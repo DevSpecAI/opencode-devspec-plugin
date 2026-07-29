@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3 - 2026-07-29
+
+### Remote control — large screenshots no longer stall the turn
+
+Live report (session `506e2926`): a ~673KB PNG inlined as a `data:` URL left OpenCode busy ~132s with no reply text (stall warning only). Hard cap was 4MB, so the image was delivered — but stuffing that much base64 into the inject payload hung the model.
+
+- Soft inline cap **`INLINE_DATA_URL_MAX_BYTES` = 256KB**. Larger (still ≤4MB) attachments spill to `~/.devspec/opencode-remote-control/attachments/` as `file://` URLs via `materializeLargeAttachmentToDisk`.
+- Without a spill host, mid-size attachments are declined out loud (never silent).
+- Tests cover spill / decline / hard-cap paths.
+
+**Requires plugin reload (0.3.3).**
+
 ## 0.3.2 - 2026-07-29
 
 ### Remote control — mechanical guard against double-posted replies
