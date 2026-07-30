@@ -975,6 +975,39 @@ export interface PollOutcome {
 }
 
 /**
+ * Wake text for a playbook_run dispatch. Must NOT send the agent down the
+ * assignment protocol — wrong tools, and a look-only playbook would lose its
+ * permission line. Keep in step with Cursor's playbookRunCommandText.
+ */
+function playbookRunCommandText(d: Record<string, unknown>): string {
+  const permission =
+    d.permission === 'can_push'
+      ? 'You MAY edit, commit and push.'
+      : d.permission === 'can_commit'
+        ? 'You MAY edit and commit locally, but MUST NOT push.'
+        : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+
+  const runId = typeof d.run_id === 'string' ? d.run_id : String(d.id ?? '')
+  const name = typeof d.playbook_name === 'string' ? d.playbook_name : 'playbook'
+
+  return [
+    `▶️ Playbook run dispatched to this connection: "${name}" (run ${runId}).`,
+    '',
+    'What to do:',
+    `1. claim_playbook_run({ run_id: "${runId}" }) — if it comes back claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    '2. Do the work described below, in this repo.',
+    '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    '',
+    `Permission: ${permission}`,
+    '',
+    'The instruction:',
+    typeof d.instruction === 'string' && d.instruction.trim()
+      ? d.instruction
+      : '(claim the run to read it)',
+  ].join('\n')
+}
+
+/**
  * ONE held `poll_connection` call: heartbeat + dispatch inbox + room delta in a single
  * request (items c9457ab8 + 807eadcb).
  *
@@ -1153,24 +1186,34 @@ export async function pollAndDeliver(
     )
   }
 
-  // Dispatched work becomes a command: the assignment reference is what wakes the agent.
-  // Replaces this file's own get_connection_dispatch call — same inbox, one round trip.
+  // Dispatched work becomes a command. Playbook runs and assignments share the
+  // same inbox — branch on kind so a look-only playbook is never described as
+  // an assignment (and never loses its permission line). Parity with Cursor's
+  // playbookRunCommandText (item 25a1c4e6 / Codex sibling 09ffbba9).
   const freshDispatches = dispatches.filter(
     (d) => typeof d?.id === 'string' && !pump.deliveredDispatchIds.has(d.id) &&
       !['completed', 'released'].includes(String(d?.state ?? d?.status ?? 'pending')),
   )
-  const dispatchCommands = freshDispatches.map((d) => ({
-    id: `dispatch:${d.id}`,
-    created_at: typeof d?.created_at === 'string' ? d.created_at : new Date().toISOString(),
-    addressed_to: res.addressed_to,
-    authority: { kind: 'owner', capabilities: ['full'] },
-    content:
-      `📦 DevSpec assignment dispatched to this connection (assignment \`${d.id}\`).\n\n` +
-      `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
-      `claim_work_item (each member, in position order) → implement → record_implementation → ` +
-      `resolve_assignment.\n` +
-      `While sessionless, report progress with report_progress / item notes — do not invent a chat room.`,
-  }))
+  const dispatchCommands = freshDispatches.map((d) => {
+    const kind = typeof d?.kind === 'string' ? d.kind : 'assignment'
+    const content =
+      kind === 'playbook_run'
+        ? playbookRunCommandText(d)
+        : (
+          `📦 DevSpec assignment dispatched to this connection (assignment \`${d.id}\`).\n\n` +
+          `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
+          `claim_work_item (each member, in position order) → implement → record_implementation → ` +
+          `resolve_assignment.\n` +
+          `While sessionless, report progress with report_progress / item notes — do not invent a chat room.`
+        )
+    return {
+      id: `dispatch:${d.id}`,
+      created_at: typeof d?.created_at === 'string' ? d.created_at : new Date().toISOString(),
+      addressed_to: res.addressed_to,
+      authority: { kind: 'owner', capabilities: ['full'] },
+      content,
+    }
+  })
 
   // On a seed window, filter out commands already answered before this process existed.
   const liveRoomCommands = pump.needsSeed
