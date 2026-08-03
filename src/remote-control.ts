@@ -639,7 +639,8 @@ function stateFile(directory: string): string {
   return path.join(dir, `${key}.json`)
 }
 
-function readState(directory: string): ConnectionState | null {
+/** Exported for regression tests (item 67794386) — prefer patchState in production paths. */
+export function readState(directory: string): ConnectionState | null {
   try {
     return JSON.parse(fs.readFileSync(stateFile(directory), 'utf8'))
   } catch {
@@ -647,7 +648,13 @@ function readState(directory: string): ConnectionState | null {
   }
 }
 
-function writeState(directory: string, state: ConnectionState): void {
+/**
+ * Full replace of the on-disk state file. Only safe for handshake / clear paths
+ * that intentionally own the whole snapshot. Mid-tick poll updates MUST use
+ * patchState — a stale `writeState({ ...inMemory })` rolls back concurrent
+ * mirror claims (live: session f3af591e double-posted msg_fc80605c).
+ */
+export function writeState(directory: string, state: ConnectionState): void {
   fs.writeFileSync(stateFile(directory), JSON.stringify(state, null, 2), { mode: 0o600 })
 }
 
@@ -659,8 +666,13 @@ function writeState(directory: string, state: ConnectionState): void {
  * lastMirrored got reset to the previous id and the next poll posted the
  * same reply twice into DevSpec. Always merge onto the latest disk
  * snapshot so concurrent writers only touch their own keys.
+ *
+ * Regression (67794386 / f3af591e): pollAndDeliver still used writeState with
+ * a stale in-memory spread for cursor / delivered-ids / inject-baseline; the
+ * advisory echo of a just-mirrored reply then re-mirrored the same OpenCode
+ * message. Every mid-tick persistence must go through this helper.
  */
-function patchState(directory: string, patch: Partial<ConnectionState>): ConnectionState | null {
+export function patchState(directory: string, patch: Partial<ConnectionState>): ConnectionState | null {
   const current = readState(directory)
   if (!current) return null
   const next = { ...current, ...patch }
@@ -1148,8 +1160,12 @@ export async function pollAndDeliver(
   const adopt = resolveServerAttachment(state.sessionId, res)
   if (adopt.changed) {
     logPoll(`server attachment ${state.sessionId ?? '(none)'} → ${adopt.sessionId ?? '(none)'}`)
-    state = { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
-    writeState(directory, state)
+    // patchState — never writeState a stale full snapshot (mirror claims race).
+    state =
+      patchState(directory, {
+        sessionId: adopt.sessionId,
+        lastDeliveredMessageId: null,
+      }) ?? { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
     // Fresh room: drop the cursor and any carried context from the old one, and treat
     // the next window as history rather than as new commands.
     pump.cursor = null
@@ -1234,10 +1250,14 @@ export async function pollAndDeliver(
   if (typeof res.cursor === 'string' && res.cursor) pump.cursor = res.cursor
   if (typeof res.dispatch_cursor === 'string') pump.dispatchCursor = res.dispatch_cursor
   // Advance the persisted cursor even for advisory-only turns, or every poll would
-  // re-fetch the same window forever.
+  // re-fetch the same window forever. MUST patchState — a full writeState of the
+  // pre-await in-memory snapshot wipes concurrent mirror claims (f3af591e).
   if (pump.cursor && pump.cursor !== state.lastDeliveredMessageId) {
-    state = { ...state, lastDeliveredMessageId: pump.cursor }
-    writeState(directory, state)
+    state =
+      patchState(directory, { lastDeliveredMessageId: pump.cursor }) ?? {
+        ...state,
+        lastDeliveredMessageId: pump.cursor,
+      }
   }
 
   if (commands.length === 0) {
@@ -1247,7 +1267,9 @@ export async function pollAndDeliver(
     const advisoryOnly = ownerAmbient.length > 0 || roomContext.length > 0
     if (advisoryOnly) {
       pump.consecutiveEmpty = 0
-      await mirrorLatestReply(client, auth, directory, state, sessionId)
+      // Event-driven mirroring owns replies; advisory echo must not bypass the
+      // in-flight / min-gap guard with a bare mirrorLatestReply (double-post race).
+      await mirrorNow(client, directory, sessionId)
       return { delayMs: 0, stop: false }
     }
     pump.consecutiveEmpty++
@@ -1269,14 +1291,16 @@ export async function pollAndDeliver(
   for (const d of freshDispatches) pump.deliveredDispatchIds.add(d.id)
   // Claim BEFORE injecting and persist immediately, so a concurrent poll — or a restarted
   // process — sees these ids as delivered rather than independently delivering them again.
-  state = {
-    ...state,
-    deliveredMessageIds: Array.from(deliveredIds).slice(-50),
-    ...(freshDispatches.length > 0
-      ? { deliveredAssignmentIds: Array.from(pump.deliveredDispatchIds).slice(-50) }
-      : {}),
+  // patchState only — never clobber mirror claim fields with a stale full snapshot.
+  {
+    const deliveryPatch: Partial<ConnectionState> = {
+      deliveredMessageIds: Array.from(deliveredIds).slice(-50),
+    }
+    if (freshDispatches.length > 0) {
+      deliveryPatch.deliveredAssignmentIds = Array.from(pump.deliveredDispatchIds).slice(-50)
+    }
+    state = patchState(directory, deliveryPatch) ?? { ...state, ...deliveryPatch }
   }
-  writeState(directory, state)
 
   // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
   // by every command in the delta. Injecting per-command would queue separate OpenCode
@@ -1308,7 +1332,8 @@ export async function pollAndDeliver(
       : undefined
 
   await setBusy(directory, true)
-  state = { ...state, busy: true }
+  // setBusy already patchState'd busy — re-read so we don't spread a pre-await snapshot later.
+  state = readState(directory) ?? { ...state, busy: true }
 
   try {
     // Baseline: only mirror assistant messages that appear AFTER the last one present at
@@ -1326,13 +1351,17 @@ export async function pollAndDeliver(
       logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`)
       baselineCaptured = false
     }
-    state = {
-      ...state,
-      replyAfterOpenCodeMessageId: replyAfter,
-      replyBaselineCaptured: baselineCaptured,
-      awaitingRemoteReply: true,
-    }
-    writeState(directory, state)
+    state =
+      patchState(directory, {
+        replyAfterOpenCodeMessageId: replyAfter,
+        replyBaselineCaptured: baselineCaptured,
+        awaitingRemoteReply: true,
+      }) ?? {
+        ...state,
+        replyAfterOpenCodeMessageId: replyAfter,
+        replyBaselineCaptured: baselineCaptured,
+        awaitingRemoteReply: true,
+      }
 
     await (client as any).session.promptAsync({
       path: { id: sessionId },
@@ -1343,13 +1372,14 @@ export async function pollAndDeliver(
     })
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
-    if (state.sessionId) {
+    const freshForNotice = readState(directory) ?? state
+    if (freshForNotice.sessionId) {
       await mcpToolsCall({
         mcpUrl: auth.mcp_url,
         token: auth.token,
         name: 'post_session_message',
         arguments: postMessageArgs(
-          state,
+          freshForNotice,
           model
             ? `⚠️ Could not run this message on \`${model.providerID}/${model.modelID}\`: ${reason}`
             : `⚠️ Could not deliver this message: ${reason}`,
@@ -1361,17 +1391,17 @@ export async function pollAndDeliver(
     }
     // No turn is actually running, so clear the busy we just asserted.
     await setBusy(directory, false)
-    state = {
-      ...state,
-      busy: false,
-      awaitingRemoteReply: false,
-      replyAfterOpenCodeMessageId: null,
-      replyBaselineCaptured: undefined,
-    }
-    writeState(directory, state)
+    state =
+      patchState(directory, {
+        awaitingRemoteReply: false,
+        replyAfterOpenCodeMessageId: null,
+        replyBaselineCaptured: undefined,
+      }) ?? state
   }
 
-  await mirrorLatestReply(client, auth, directory, state, sessionId)
+  // Prefer the guarded path — session.idle / message.updated own the real flush;
+  // this is a best-effort nudge that must not race a bare concurrent mirror.
+  await mirrorNow(client, directory, sessionId)
   return { delayMs: 0, stop: false }
 }
 
