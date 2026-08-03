@@ -1,6 +1,9 @@
 /**
- * Single source of truth for THIS plugin's agent identity — mirrors the Claude
- * and Cursor DevSpec plugins' `agent-identity` module.
+ * Single source of truth for THIS plugin's agent identity.
+ *
+ * Every DevSpec plugin has its own module like this one, in its own repo. They are
+ * independent implementations — nothing here is copied from or to another plugin —
+ * and `test/agent-identity.test.mjs` pins this value so it cannot drift.
  *
  * The agent name is a FIXED property of the plugin, not runtime state, an
  * LLM-passed arg, or a copied literal scattered across call sites. Every
