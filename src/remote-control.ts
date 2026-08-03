@@ -978,6 +978,9 @@ export interface PollOutcome {
  * Wake text for a playbook_run dispatch. Must NOT send the agent down the
  * assignment protocol — wrong tools, and a look-only playbook would lose its
  * permission line. Keep in step with Cursor's playbookRunCommandText.
+ *
+ * Always pass provider on claim (hard match against preferred_provider). Omitting
+ * it fails even when this agent is the named one — same habit as claim_work_item.
  */
 function playbookRunCommandText(d: Record<string, unknown>): string {
   const permission =
@@ -994,7 +997,7 @@ function playbookRunCommandText(d: Record<string, unknown>): string {
     `▶️ Playbook run dispatched to this connection: "${name}" (run ${runId}).`,
     '',
     'What to do:',
-    `1. claim_playbook_run({ run_id: "${runId}" }) — if it comes back claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_playbook_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the playbook names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Do the work described below, in this repo.',
     '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
