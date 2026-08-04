@@ -1,13 +1,13 @@
+import { prepareMirrorText } from './mirror-chrome.js'
+
 /**
  * Pure logic for the long-poll tick and the tiered turn OpenCode injects
  * (items c9457ab8 + 807eadcb).
  *
- * Deliberately dependency-free and separate from remote-control.ts: that file reaches
- * for fs, the OpenCode SDK client and the MCP transport, so nothing in it can be
- * exercised without a live plugin host. Everything here is a plain function over plain
- * data, so the two decisions that actually matter — "is this a command I may act on?"
- * and "what text does the model receive?" — are unit-testable. Same reasoning (and same
- * shape) as poll-markers.ts / card-attribution.ts on the server side.
+ * Deliberately free of fs / SDK / MCP deps (those live in remote-control.ts) so
+ * the authority and turn-render decisions stay unit-testable. May import other
+ * plain-data modules such as mirror-chrome. Same reasoning (and same shape) as
+ * poll-markers.ts / card-attribution.ts on the server side.
  *
  * OpenCode is NOT a fork of the canonical devspec-remote-poll.mjs; it is a bespoke
  * in-process client. The wire contract it consumes is identical, so the constants and
@@ -277,9 +277,15 @@ export function errorBackoffMs(
  * contain owner commands that were ALREADY answered before this plugin process existed.
  * Re-delivering those would re-inject finished turns into the OpenCode session.
  *
- * Anything at or before the newest agent reply in the window is completed history; only
- * commands after it are the live, unanswered turn. Advisory is NOT filtered — old room
- * context is exactly what a reconnecting agent needs to arrive oriented (item 55655986).
+ * Anything at or before the newest *settling* agent reply in the window is completed
+ * history; only commands after it are the live, unanswered turn. Advisory is NOT
+ * filtered — old room context is exactly what a reconnecting agent needs to arrive
+ * oriented (item 55655986).
+ *
+ * Empty / chrome-only external_agent bubbles must NOT settle prior commands
+ * (session 0ffe97cb): a leaked status-fence leftover would otherwise permanently
+ * suppress the owner's still-unanswered dispatch. When content is missing from the
+ * room row, fail open and keep the old timestamp behaviour.
  */
 export function unansweredCommands(
   commands: Array<{ created_at?: string }> | null | undefined,
@@ -291,6 +297,7 @@ export function unansweredCommands(
   for (const m of room) {
     const isReply = m?.message_type === 'external_agent' || m?.author?.kind === 'external_agent'
     if (!isReply || typeof m?.created_at !== 'string') continue
+    if (typeof m.content === 'string' && prepareMirrorText(m.content) === null) continue
     if (!lastReplyAt || m.created_at > lastReplyAt) lastReplyAt = m.created_at
   }
   if (!lastReplyAt) return cmds
