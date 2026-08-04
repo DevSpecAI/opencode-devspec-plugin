@@ -95,7 +95,7 @@ When the conversation produces a durable decision, convention, architecture choi
 1. **Memories (primary)** — interactive, human-in-the-loop:
    - Prefer: ask the owner *"Should I record this as a decided memory/convention?"* then `record_memory` (or `supersede_memory` if updating).
    - If the owner already clearly decided, propose the memory text in your reply and record after a clear yes.
-   - Always `search_memories` first; never duplicate — `supersede_memory` the closest match.
+   - Always `search_memories` first; never duplicate — `supersede_memory` the closest match. `search_memories` returns a CARD (title, one-line summary, id) — `get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it. 
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight`.
 2. **Artifacts** — short plans / ADRs / runbooks via `create_resource` / `update_resource` / `supersede_resource`.
 3. When attached, just say so in your own reply (offer, then confirmation once recorded) — the plugin's automatic mirror carries it to the phone transcript. Do not call `post_session_message` yourself for this either.
