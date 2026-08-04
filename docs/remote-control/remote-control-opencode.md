@@ -37,6 +37,8 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Reintroducing a detached wait “for consistency” with Claude.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
 - Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
+- Returning early on `adopt.changed` without consuming the same poll’s packaged turn — the catch-up window for the new room is often already in that response; discarding it skips the owner’s pending command (session `1383cbb8`).
+- Advancing the message cursor (in-memory `pump.cursor` **or** persisted `lastDeliveredMessageId`) when deliverable commands were present but not injected — the next poll’s `cursor` arg permanently skips them (`shouldAdvanceMessageCursor`).
 
 ## Failure modes
 
@@ -44,11 +46,12 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Stall: busy stuck with empty assistant text (see stall timeout / `poll.log`).
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
+- Connect + attach lands, status banner prints, owner command never injects: adopt discarded the seed package and/or cursor advanced past unanswered commands (session `1383cbb8`; fixed via adopt fall-through + `shouldAdvanceMessageCursor`).
 
 ## Key files
 
 - `src/remote-control.ts` — poll loop, inject, mirror, busy
-- `src/poll-turn.ts` — pure command gate + `renderInjectedTurn` + `unansweredCommands`
+- `src/poll-turn.ts` — pure command gate + `renderInjectedTurn` + `unansweredCommands` + `shouldAdvanceMessageCursor`
 - `src/mirror-chrome.ts` — fence-aware status strip / `prepareMirrorText` (shared by mirror + seed-window filtering)
 - `src/agent-identity.ts` — `AGENT_NAME = 'OpenCode'`
 - `commands/devspec.remote.md`

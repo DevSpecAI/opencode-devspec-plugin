@@ -305,6 +305,42 @@ export function unansweredCommands(
 }
 
 /**
+ * Whether to persist / apply the server's message cursor after a changed poll.
+ *
+ * Advance when the packaged turn was fully consumed — injected, true advisory-only,
+ * or seed-filtered as already answered. Hold when deliverable commands were present
+ * but not injected: advancing past them permanently skips the owner's pending
+ * dispatch until reconnect (session 1383cbb8 / item f663ad91).
+ *
+ * Also never update the in-memory poll cursor when holding — the next poll's
+ * `cursor` argument is what skips messages on the wire.
+ */
+export function shouldAdvanceMessageCursor(opts: {
+  injectCount: number
+  deliverableRoomCount: number
+  seedKeptCount: number
+  wasSeed: boolean
+  dispatchCount: number
+}): boolean {
+  const {
+    injectCount,
+    deliverableRoomCount,
+    seedKeptCount,
+    wasSeed,
+    dispatchCount,
+  } = opts
+  if (injectCount > 0) return true
+  // Nothing addressable in the package (advisory-only / empty / rejected-elsewhere).
+  if (deliverableRoomCount === 0 && dispatchCount === 0) return true
+  // Seed window intentionally dropped every room command as already answered.
+  if (wasSeed && deliverableRoomCount > 0 && seedKeptCount === 0 && dispatchCount === 0) {
+    return true
+  }
+  // Deliverable work existed but nothing made it into the inject set — hold.
+  return false
+}
+
+/**
  * Server-authoritative attachment decision.
  *
  * The poll response's `session_id` (read from the live markers server-side) is the one

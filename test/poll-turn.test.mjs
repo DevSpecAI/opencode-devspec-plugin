@@ -27,6 +27,7 @@ import {
   pollTerminalReason,
   renderInjectedTurn,
   resolveServerAttachment,
+  shouldAdvanceMessageCursor,
   trimAdvisoryCarry,
   unansweredCommands,
   buildAttachmentParts,
@@ -402,6 +403,73 @@ describe('unansweredCommands (cold-launch / reattach window)', () => {
   it('delivers everything when the window contains no agent reply', () => {
     const cmds = [{ id: 'a', created_at: '2026-07-25T10:00:00.000Z' }]
     assert.deepEqual(unansweredCommands(cmds, []).map((c) => c.id), ['a'])
+  })
+})
+
+describe('shouldAdvanceMessageCursor — never skip uninjected deliverables', () => {
+  it('advances after a successful inject', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 1,
+        deliverableRoomCount: 1,
+        seedKeptCount: 1,
+        wasSeed: true,
+        dispatchCount: 0,
+      }),
+      true,
+    )
+  })
+
+  it('advances on true advisory-only / empty packages', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 0,
+        deliverableRoomCount: 0,
+        seedKeptCount: 0,
+        wasSeed: false,
+        dispatchCount: 0,
+      }),
+      true,
+    )
+  })
+
+  it('advances when the seed window dropped every room command as already answered', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 0,
+        deliverableRoomCount: 2,
+        seedKeptCount: 0,
+        wasSeed: true,
+        dispatchCount: 0,
+      }),
+      true,
+    )
+  })
+
+  it('HOLDS when deliverable room commands survived seed but were not injected', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 0,
+        deliverableRoomCount: 1,
+        seedKeptCount: 1,
+        wasSeed: true,
+        dispatchCount: 0,
+      }),
+      false,
+    )
+  })
+
+  it('HOLDS when dispatches were packaged but not injected', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 0,
+        deliverableRoomCount: 0,
+        seedKeptCount: 0,
+        wasSeed: false,
+        dispatchCount: 1,
+      }),
+      false,
+    )
   })
 })
 

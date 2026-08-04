@@ -43,6 +43,7 @@ import {
   RECOVERABLE_TERMINAL_MAX,
   renderInjectedTurn,
   resolveServerAttachment,
+  shouldAdvanceMessageCursor,
   unansweredCommands,
   type AdvisoryMessage,
   type CarriedContext,
@@ -66,6 +67,7 @@ export {
   PERMANENT_END_REASONS,
   renderInjectedTurn,
   resolveServerAttachment,
+  shouldAdvanceMessageCursor,
   holdFor,
 } from './poll-turn.js'
 
@@ -1108,14 +1110,18 @@ export async function pollAndDeliver(
         lastDeliveredMessageId: null,
       }) ?? { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
     // Fresh room: drop the cursor and any carried context from the old one, and treat
-    // the next window as history rather than as new commands.
+    // this / the next window as a seed (history + unanswered live commands).
     pump.cursor = null
     pump.carry.reset()
     pump.needsSeed = true
-    return { delayMs: 0, stop: false }
-  }
-
-  if (res?.changed !== true) {
+    // Do NOT return early when this hold already packaged a turn for the new room —
+    // discarding it permanently skips the owner's pending command (session 1383cbb8).
+    if (res?.changed !== true) {
+      // Attachment moved but no packaged turn yet — keep needsSeed for catch-up.
+      return { delayMs: 0, stop: false }
+    }
+    // Fall through and consume the packaged turn as the seed window.
+  } else if (res?.changed !== true) {
     // The hold ran its course with nothing new. No sleep: holding IS the wait.
     pump.needsSeed = false
     pump.consecutiveEmpty = 0
@@ -1176,9 +1182,27 @@ export async function pollAndDeliver(
   })
 
   // On a seed window, filter out commands already answered before this process existed.
-  const liveRoomCommands = pump.needsSeed
+  const wasSeed = pump.needsSeed
+  const liveRoomCommands = wasSeed
     ? (unansweredCommands(roomCommands as any, roomContext) as any[])
     : roomCommands
+  if (wasSeed && roomCommands.length > 0) {
+    const keptIds = new Set(
+      liveRoomCommands.map((c) => (typeof c?.id === 'string' ? c.id : null)).filter(Boolean),
+    )
+    const dropped = roomCommands.filter(
+      (c) => typeof c?.id === 'string' && !keptIds.has(c.id),
+    )
+    if (dropped.length > 0) {
+      logPoll(
+        `seed filter dropped ${dropped.length} already-answered command(s): ` +
+          dropped.map((c) => c.id).join(', '),
+      )
+    }
+    if (liveRoomCommands.length > 0) {
+      logPoll(`seed window: ${liveRoomCommands.length} unanswered command(s) to inject`)
+    }
+  }
   pump.needsSeed = false
 
   // Dedup against what we have already injected (a bounded set — the cursor alone is not
@@ -1188,17 +1212,38 @@ export async function pollAndDeliver(
     (m) => !(typeof m?.id === 'string' && deliveredIds.has(m.id)),
   )
 
-  if (typeof res.cursor === 'string' && res.cursor) pump.cursor = res.cursor
   if (typeof res.dispatch_cursor === 'string') pump.dispatchCursor = res.dispatch_cursor
-  // Advance the persisted cursor even for advisory-only turns, or every poll would
-  // re-fetch the same window forever. MUST patchState — a full writeState of the
-  // pre-await in-memory snapshot wipes concurrent mirror claims (f3af591e).
-  if (pump.cursor && pump.cursor !== state.lastDeliveredMessageId) {
-    state =
-      patchState(directory, { lastDeliveredMessageId: pump.cursor }) ?? {
-        ...state,
-        lastDeliveredMessageId: pump.cursor,
-      }
+  // Advance the message cursor only when the packaged turn was fully consumed.
+  // Holding both the in-memory and persisted cursor is required — next poll's
+  // `cursor` arg is what skips messages on the wire (session 1383cbb8).
+  // MUST patchState — a full writeState of the pre-await snapshot wipes mirror claims.
+  const nextCursor = typeof res.cursor === 'string' && res.cursor ? res.cursor : null
+  const advanceCursor = shouldAdvanceMessageCursor({
+    injectCount: commands.length,
+    deliverableRoomCount: roomCommands.length,
+    seedKeptCount: liveRoomCommands.length,
+    wasSeed,
+    dispatchCount: dispatchCommands.length,
+  })
+  if (nextCursor && advanceCursor) {
+    pump.cursor = nextCursor
+    if (pump.cursor !== state.lastDeliveredMessageId) {
+      state =
+        patchState(directory, { lastDeliveredMessageId: pump.cursor }) ?? {
+          ...state,
+          lastDeliveredMessageId: pump.cursor,
+        }
+    }
+  } else if (nextCursor && !advanceCursor) {
+    logPoll(
+      `holding message cursor — deliverable work not injected ` +
+        `(room=${roomCommands.length}, seedKept=${liveRoomCommands.length}, ` +
+        `dispatch=${dispatchCommands.length}, inject=${commands.length}); will retry`,
+    )
+    // Keep seed semantics so the next poll still asks for catch-up.
+    if (wasSeed || liveRoomCommands.length > 0 || dispatchCommands.length > 0) {
+      pump.needsSeed = true
+    }
   }
 
   if (commands.length === 0) {
