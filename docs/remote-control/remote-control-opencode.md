@@ -2,7 +2,7 @@
 
 **Family:** native runtime (not local-poller).  
 **Read first:** `docs/remote-control/remote-control-overview.md`.  
-**Plugin repo:** `opencode-devspec-plugin` (`src/remote-control.ts`, `src/poll-turn.ts`).
+**Plugin repo:** `opencode-devspec-plugin` (`src/remote-control.ts`, `src/poll-turn.ts`, `src/mirror-chrome.ts`).
 
 ## How a message reaches OpenCode
 
@@ -11,7 +11,7 @@
 3. On deliverable commands, plugin builds a turn via `renderInjectedTurn` (context labelled advisory; commands last).
 4. Plugin calls `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door.
 5. OpenCode model runs a normal turn in that session.
-6. Plugin mirrors the latest assistant reply back with `post_session_message`, with dedup against model-initiated posts.
+6. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts).
 7. Activity: pickup / keepalive / complete around the injected turn.
 
 There is **no** separate inbox wait process and **no** “re-arm the wait” step.
@@ -35,17 +35,21 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Injecting slash-looking text expecting host commands.
 - Dropping mirror dedup while also letting the model `post_session_message`.
 - Reintroducing a detached wait “for consistency” with Claude.
+- Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
+- Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
 
 ## Failure modes
 
 - Double reply: mirror + model both post the same answer.
 - Stall: busy stuck with empty assistant text (see stall timeout / `poll.log`).
 - State lost-update between idle handler and mirror path.
+- Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
 
 ## Key files
 
 - `src/remote-control.ts` — poll loop, inject, mirror, busy
-- `src/poll-turn.ts` — pure command gate + `renderInjectedTurn`
+- `src/poll-turn.ts` — pure command gate + `renderInjectedTurn` + `unansweredCommands`
+- `src/mirror-chrome.ts` — fence-aware status strip / `prepareMirrorText` (shared by mirror + seed-window filtering)
 - `src/agent-identity.ts` — `AGENT_NAME = 'OpenCode'`
 - `commands/devspec.remote.md`
 - `~/.devspec/opencode-remote-control/poll.log` — local diagnostics
