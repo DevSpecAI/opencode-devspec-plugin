@@ -26,6 +26,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
 | Slash commands | Host UI commands (e.g. `/clear`) are **not** remote-control. Injecting `"/clear"` as prompt text does not run them. |
+| OpenCode serve password | Laptop-local HTTP basic auth for rocket `serve`↔attach only. DevSpec MCP never stores or sends it. See `remote-control-opencode.md`. |
 
 ## Three implementation families
 
