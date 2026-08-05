@@ -48,13 +48,19 @@ import {
   type AdvisoryMessage,
   type CarriedContext,
 } from './poll-turn.js'
-import { prepareMirrorText } from './mirror-chrome.js'
+import {
+  isDevspecRemoteControlCommand,
+  prepareMirrorText,
+  shouldSkipConnectTurnMirror,
+} from './mirror-chrome.js'
 
 export {
   REMOTE_STATUS_BANNER,
   collapseOrphanMarkdownFences,
+  isDevspecRemoteControlCommand,
   isOperationalChrome,
   prepareMirrorText,
+  shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
 } from './mirror-chrome.js'
@@ -205,6 +211,19 @@ interface ConnectionState {
    * impossible even when the model ignores the skill wording.
    */
   recentPostedContentHashes?: string[]
+  /**
+   * OpenCode assistant message ids that must never be mirrored — filled from
+   * `command.executed` for `/devspec.remote` / `/devspec.remote-stop` so the
+   * connect skill turn cannot settle a pending owner dispatch (e7ecc1de).
+   */
+  nonMirrorMessageIds?: string[]
+  /**
+   * Set on register / first attach so a connect-turn mirror that races ahead
+   * of `command.executed` is still skipped. Cleared once that skip lands or
+   * a real post-inject mirror runs. Not set on re-attach to an already-bound
+   * session (avoids eating a normal TUI reply after a mid-session reattach).
+   */
+  connectMirrorSuppressed?: boolean
 }
 
 /**
@@ -701,6 +720,9 @@ export function recordConnectionEventFromTool(
       deliveredMessageIds: existing?.deliveredMessageIds,
       mirroredMessageIds: existing?.mirroredMessageIds,
       recentPostedContentHashes: existing?.recentPostedContentHashes,
+      nonMirrorMessageIds: existing?.nonMirrorMessageIds,
+      // Fresh register — suppress until the connect skill turn is claimed.
+      connectMirrorSuppressed: true,
     })
     return
   }
@@ -732,6 +754,10 @@ export function recordConnectionEventFromTool(
         : existing?.connectionId
   if (!connectionId) return
 
+  // First bind into a session this state file has never held — suppress the
+  // connect turn. Re-attach when sessionId was already set must NOT suppress
+  // (would eat a normal TUI reply after a mid-session reattach).
+  const firstSessionBind = !existing?.sessionId
   writeState(directory, {
     connectionId,
     sessionId: sessionId ?? existing?.sessionId ?? null,
@@ -741,7 +767,32 @@ export function recordConnectionEventFromTool(
     deliveredMessageIds: existing?.deliveredMessageIds,
     mirroredMessageIds: existing?.mirroredMessageIds,
     recentPostedContentHashes: existing?.recentPostedContentHashes,
+    nonMirrorMessageIds: existing?.nonMirrorMessageIds,
+    connectMirrorSuppressed: firstSessionBind ? true : existing?.connectMirrorSuppressed,
   })
+}
+
+/**
+ * Record an OpenCode `command.executed` for `/devspec.remote` /
+ * `/devspec.remote-stop` so mirrorLatestReply never posts that assistant turn.
+ */
+export function recordRemoteControlSkillCommand(
+  directory: string,
+  props: Record<string, unknown> | null | undefined,
+): void {
+  if (!props) return
+  if (!isDevspecRemoteControlCommand(props.name)) return
+  const messageId = typeof props.messageID === 'string' ? props.messageID : null
+  if (!messageId) return
+  const existing = readState(directory)
+  if (!existing) return
+  const ids = new Set(existing.nonMirrorMessageIds ?? [])
+  if (ids.has(messageId)) return
+  ids.add(messageId)
+  patchState(directory, {
+    nonMirrorMessageIds: Array.from(ids).slice(-50),
+  })
+  logPoll(`recordRemoteControlSkillCommand: skip-mirror id=${messageId} name=${props.name}`)
 }
 
 /**
@@ -1563,6 +1614,34 @@ async function mirrorLatestReply(
   // When not awaiting a remote reply, still allow local-terminal answers while
   // attached — but never re-post something older than lastMirrored (handled above).
 
+  // Connect skill turn (e7ecc1de): never post — would settle unanswered
+  // owner dispatches that landed during attach. command.executed ids +
+  // post-handshake suppress; not NLP chrome.
+  if (
+    shouldSkipConnectTurnMirror({
+      messageId: last.info.id,
+      nonMirrorMessageIds: fresh.nonMirrorMessageIds,
+      connectMirrorSuppressed: fresh.connectMirrorSuppressed,
+      awaitingRemoteReply: fresh.awaitingRemoteReply,
+    })
+  ) {
+    logPoll(
+      `mirrorLatestReply: skip (connect skill / handshake suppress) last.id=${last.info.id} ` +
+        `suppressed=${Boolean(fresh.connectMirrorSuppressed)} awaiting=${Boolean(fresh.awaitingRemoteReply)}`,
+    )
+    alreadyMirrored.add(last.info.id)
+    patchState(directory, {
+      lastMirroredMessageId: last.info.id,
+      mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+      connectMirrorSuppressed: false,
+      awaitingRemoteReply: false,
+      replyAfterOpenCodeMessageId: null,
+      replyBaselineCaptured: undefined,
+    })
+    await setBusy(directory, false)
+    return
+  }
+
   const text = assistantTextFromMessage(last)
 
   if (!text) {
@@ -1648,6 +1727,8 @@ async function mirrorLatestReply(
     awaitingRemoteReply: false,
     replyAfterOpenCodeMessageId: null,
     replyBaselineCaptured: undefined,
+    // A successful real mirror means the connect handshake is over.
+    connectMirrorSuppressed: false,
     // Claim the content hash too so a racing manual post that lands during
     // our network round-trip is remembered, and a second mirror path skips.
     recentPostedContentHashes: [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),

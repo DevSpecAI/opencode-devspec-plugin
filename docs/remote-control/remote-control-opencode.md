@@ -11,7 +11,7 @@
 3. On deliverable commands, plugin builds a turn via `renderInjectedTurn` (context labelled advisory; commands last).
 4. Plugin calls `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door.
 5. OpenCode model runs a normal turn in that session.
-6. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts).
+6. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts). **Exception:** the `/devspec.remote` / `/devspec.remote-stop` skill turn itself is never mirrored (`shouldSkipConnectTurnMirror` / `command.executed` message id) — that turn is terminal-only status.
 7. Activity: pickup / keepalive / complete around the injected turn.
 
 There is **no** separate inbox wait process and **no** “re-arm the wait” step.
@@ -39,6 +39,7 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
 - Returning early on `adopt.changed` without consuming the same poll’s packaged turn — the catch-up window for the new room is often already in that response; discarding it skips the owner’s pending command (session `1383cbb8`).
 - Advancing the message cursor (in-memory `pump.cursor` **or** persisted `lastDeliveredMessageId`) when deliverable commands were present but not injected — the next poll’s `cursor` arg permanently skips them (`shouldAdvanceMessageCursor`).
+- Mirroring the `/devspec.remote` connect turn (or NLP-guessing its narration as chrome) — connect skill replies are terminal-only; skipping them is by `command.executed` message id + handshake suppress (`shouldSkipConnectTurnMirror`), not by widening `isOperationalChrome`.
 
 ## Failure modes
 
@@ -47,12 +48,14 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
 - Connect + attach lands, status banner prints, owner command never injects: adopt discarded the seed package and/or cursor advanced past unanswered commands (session `1383cbb8`; fixed via adopt fall-through + `shouldAdvanceMessageCursor`).
+- **Connect turn mirrored as a reply during a mid-attach dispatch** (session `e7ecc1de`): `/devspec.remote` prints terminal-only status plus process narration ("Oriented… Holding for long-poll…"). Banner strip leaves the narration; the mirror posts it; `unansweredCommands` treats it as the answer and drops the pending owner command from the seed inject. **Guard:** never mirror the connect skill turn — `command.executed` for `devspec.remote` / `devspec.remote-stop` records the assistant `messageID` in `nonMirrorMessageIds`, and register / first-attach sets `connectMirrorSuppressed` so a `flushMirrorNow` that races ahead of that event still skips. Cleared after the skip (or when awaiting a real inject reply). Do **not** NLP-widen chrome for "oriented/holding" prose; do **not** weaken the seed filter.
 
 ## Key files
 
-- `src/remote-control.ts` — poll loop, inject, mirror, busy
+- `src/remote-control.ts` — poll loop, inject, mirror, busy; `recordRemoteControlSkillCommand`
 - `src/poll-turn.ts` — pure command gate + `renderInjectedTurn` + `unansweredCommands` + `shouldAdvanceMessageCursor`
-- `src/mirror-chrome.ts` — fence-aware status strip / `prepareMirrorText` (shared by mirror + seed-window filtering)
+- `src/mirror-chrome.ts` — fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` (shared by mirror + seed-window filtering)
+- `src/plugin.ts` — long-poll pump + `command.executed` → skip-mirror ids
 - `src/agent-identity.ts` — `AGENT_NAME = 'OpenCode'`
 - `commands/devspec.remote.md`
 - `~/.devspec/opencode-remote-control/poll.log` — local diagnostics

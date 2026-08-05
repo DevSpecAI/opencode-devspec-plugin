@@ -6,6 +6,7 @@ import {
   pollAndDeliver,
   recordConnectionEventFromTool,
   recordManualPostSessionMessage,
+  recordRemoteControlSkillCommand,
   scheduleMirrorNow,
   setBusy,
 } from './remote-control.js'
@@ -197,6 +198,10 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // busy and surface the payload into DevSpec — previously only the
         // type line landed in poll.log and the UI stayed "working…".
         await handleSessionError(directory, event)
+      } else if (event.type === 'command.executed') {
+        // `/devspec.remote` / `/devspec.remote-stop` assistant turns must never
+        // mirror into the room (session e7ecc1de connect-turn race).
+        recordRemoteControlSkillCommand(directory, props ?? null)
       }
     },
     'tool.execute.after': async (input, output) => {

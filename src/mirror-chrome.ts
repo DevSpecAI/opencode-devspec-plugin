@@ -99,3 +99,43 @@ export function prepareMirrorText(text: string): string | null {
   if (!t || isOperationalChrome(t)) return null
   return t
 }
+
+/** Slash commands whose assistant turn must never be mirrored into DevSpec. */
+export const DEVSPEC_REMOTE_CONTROL_COMMANDS = new Set([
+  'devspec.remote',
+  'devspec.remote-stop',
+])
+
+/** True for `/devspec.remote` and `/devspec.remote-stop` (OpenCode command.executed name). */
+export function isDevspecRemoteControlCommand(name: unknown): boolean {
+  return typeof name === 'string' && DEVSPEC_REMOTE_CONTROL_COMMANDS.has(name)
+}
+
+/**
+ * Whether mirrorLatestReply must skip posting this OpenCode assistant message.
+ *
+ * Session e7ecc1de: the `/devspec.remote` connect turn printed status + process
+ * narration; prepareMirrorText kept the narration (real prose); the mirror
+ * posted it; unansweredCommands then treated it as the answer to a pending
+ * dispatch that landed during attach. Skipping the connect skill turn (by
+ * command.executed message id and/or a short post-handshake suppress) stops
+ * that race without NLP-guessing narration or weakening the seed filter.
+ */
+export function shouldSkipConnectTurnMirror(opts: {
+  messageId: string | null | undefined
+  nonMirrorMessageIds?: Iterable<string> | null
+  connectMirrorSuppressed?: boolean | null
+  awaitingRemoteReply?: boolean | null
+}): boolean {
+  const id = typeof opts.messageId === 'string' ? opts.messageId : ''
+  if (id && opts.nonMirrorMessageIds) {
+    for (const x of opts.nonMirrorMessageIds) {
+      if (x === id) return true
+    }
+  }
+  // Handshake suppress covers the race where flushMirrorNow runs before
+  // command.executed records the skill message id. Never suppress a real
+  // post-inject remote reply.
+  if (opts.connectMirrorSuppressed && !opts.awaitingRemoteReply) return true
+  return false
+}

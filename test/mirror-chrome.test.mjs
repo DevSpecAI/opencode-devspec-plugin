@@ -6,8 +6,10 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  isDevspecRemoteControlCommand,
   isOperationalChrome,
   prepareMirrorText,
+  shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
 } from '../dist/mirror-chrome.js'
@@ -54,6 +56,85 @@ describe('prepareMirrorText — fence-aware chrome (0ffe97cb)', () => {
 
   it('keeps an ordinary real reply', () => {
     assert.equal(prepareMirrorText('1 + 1 is 2.'), '1 + 1 is 2.')
+  })
+})
+
+describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => {
+  it('skips when the message id was recorded from command.executed', () => {
+    assert.equal(
+      shouldSkipConnectTurnMirror({
+        messageId: 'msg_connect',
+        nonMirrorMessageIds: ['msg_connect'],
+        connectMirrorSuppressed: false,
+        awaitingRemoteReply: false,
+      }),
+      true,
+    )
+  })
+
+  it('skips while handshake suppress is on and not awaiting an inject reply', () => {
+    assert.equal(
+      shouldSkipConnectTurnMirror({
+        messageId: 'msg_other',
+        nonMirrorMessageIds: [],
+        connectMirrorSuppressed: true,
+        awaitingRemoteReply: false,
+      }),
+      true,
+    )
+  })
+
+  it('does not suppress a post-inject remote reply even during handshake', () => {
+    assert.equal(
+      shouldSkipConnectTurnMirror({
+        messageId: 'msg_answer',
+        nonMirrorMessageIds: [],
+        connectMirrorSuppressed: true,
+        awaitingRemoteReply: true,
+      }),
+      false,
+    )
+  })
+
+  it('does not skip an ordinary local reply after handshake cleared', () => {
+    assert.equal(
+      shouldSkipConnectTurnMirror({
+        messageId: 'msg_local',
+        nonMirrorMessageIds: ['msg_connect'],
+        connectMirrorSuppressed: false,
+        awaitingRemoteReply: false,
+      }),
+      false,
+    )
+  })
+
+  it('recognises remote-control skill command names', () => {
+    assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
+    assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
+    assert.equal(isDevspecRemoteControlCommand('devspec.work'), false)
+  })
+})
+
+describe('unansweredCommands — connect narration must not settle (regression)', () => {
+  it('keeps a pending dispatch when no agent bubble was mirrored (post-fix)', () => {
+    // After the connect-turn skip-mirror fix, the narration never enters the
+    // room — so the seed filter correctly keeps the mid-attach dispatch.
+    const cmds = [{ id: 'math', created_at: '2026-08-05T19:15:59.854Z' }]
+    const room = []
+    assert.deepEqual(unansweredCommands(cmds, room).map((c) => c.id), ['math'])
+  })
+
+  it('still settles when a real answer was mirrored after the dispatch', () => {
+    const cmds = [{ id: 'math', created_at: '2026-08-05T19:15:59.854Z' }]
+    const room = [
+      {
+        message_type: 'external_agent',
+        author: { kind: 'external_agent' },
+        created_at: '2026-08-05T19:16:53.000Z',
+        content: '2',
+      },
+    ]
+    assert.deepEqual(unansweredCommands(cmds, room), [])
   })
 })
 
