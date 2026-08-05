@@ -47,8 +47,9 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Reintroducing a detached wait “for consistency” with Claude.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
 - Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
-- Returning early on `adopt.changed` without consuming the same poll’s packaged turn — the catch-up window for the new room is often already in that response; discarding it skips the owner’s pending command (session `1383cbb8`).
+- Returning early on `adopt.changed` without a follow-up null-cursor seed — fixed by always re-polling with `cursor:null` + `catch_up` after adopt (session `23da0643` / item `2411dd5a`). Do **not** fall through and consume the pre-adopt package: it was opened under the previous room's cursor, and advisory-only advance permanently skips a cold-launch dispatch that lands moments later (often with a backdated paint timestamp).
 - Advancing the message cursor (in-memory `pump.cursor` **or** persisted `lastDeliveredMessageId`) when deliverable commands were present but not injected — the next poll’s `cursor` arg permanently skips them (`shouldAdvanceMessageCursor`).
+- Cold-launch paint timestamp reused as server `created_at` for `local_agent_dispatch` — wire order must be insertion time (DevSpecV2 chat route); optimistic UI may keep paint time locally.
 - Mirroring the `/devspec.remote` connect turn (or NLP-guessing its narration as chrome) — connect skill replies are terminal-only; skipping them is by `command.executed` message id + handshake suppress (`shouldSkipConnectTurnMirror`), not by widening `isOperationalChrome`.
 
 ## Failure modes
@@ -57,7 +58,7 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Stall: busy stuck with empty assistant text (see stall timeout / `poll.log`).
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
-- Connect + attach lands, status banner prints, owner command never injects: adopt discarded the seed package and/or cursor advanced past unanswered commands (session `1383cbb8`; fixed via adopt fall-through + `shouldAdvanceMessageCursor`).
+- Connect + attach lands, status banner prints, owner command never injects: pre-adopt package consumed as seed / cursor advanced past unanswered commands (sessions `1383cbb8`, `23da0643`). **Guard:** after `adopt.changed`, always re-poll with `cursor:null` + `catch_up` (`adoptRequiresNullCursorRepoll`); never fall through. Server: do not backdate `local_agent_dispatch` `created_at` to the optimistic paint time; honour `catch_up` in packaging.
 - **Connect turn mirrored as a reply during a mid-attach dispatch** (session `e7ecc1de`): `/devspec.remote` prints terminal-only status plus process narration ("Oriented… Holding for long-poll…"). Banner strip leaves the narration; the mirror posts it; `unansweredCommands` treats it as the answer and drops the pending owner command from the seed inject. **Guard:** never mirror the connect skill turn — `command.executed` for `devspec.remote` / `devspec.remote-stop` records the assistant `messageID` in `nonMirrorMessageIds`, and register / first-attach sets `connectMirrorSuppressed` so a `flushMirrorNow` that races ahead of that event still skips. Cleared after the skip (or when awaiting a real inject reply). Do **not** NLP-widen chrome for "oriented/holding" prose; do **not** weaken the seed filter.
 
 ## Key files

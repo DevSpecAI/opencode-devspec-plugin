@@ -30,6 +30,7 @@ import {
   shouldAdvanceMessageCursor,
   trimAdvisoryCarry,
   unansweredCommands,
+  adoptRequiresNullCursorRepoll,
   buildAttachmentParts,
   renderDeclinedAttachments,
   renderInjectedTurn as _rit,
@@ -470,6 +471,14 @@ describe('shouldAdvanceMessageCursor — never skip uninjected deliverables', ()
       }),
       false,
     )
+  })
+})
+
+describe('adoptRequiresNullCursorRepoll — never seed from a pre-adopt package', () => {
+  it('always requires a null-cursor re-poll after attachment change', () => {
+    // Session 23da0643: fall-through consumed advisory-only join markers and
+    // advanced lastDelivered past a cold-launch dispatch that landed moments later.
+    assert.equal(adoptRequiresNullCursorRepoll(), true)
   })
 })
 
