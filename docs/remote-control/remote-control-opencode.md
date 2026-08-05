@@ -68,4 +68,29 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - `src/plugin.ts` — long-poll pump + `command.executed` → skip-mirror ids
 - `src/agent-identity.ts` — `AGENT_NAME = 'OpenCode'`
 - `commands/devspec.remote.md`
-- `~/.devspec/opencode-remote-control/poll.log` — local diagnostics
+- `~/.devspec/opencode-remote-control/poll.log` — local diagnostics (human lines + structured `story {…}` JSON)
+
+## Logging — reconstructing a connection story
+
+Fragile remote sessions are debugged from two places that share one phase vocabulary:
+
+| Source | Where | What |
+|---|---|---|
+| **Axiom (server)** | DevSpec MCP tool logs | `msg == "Remote-control story"` with `connectionId`, `sessionId`, `data.phase`, `data.outcome`, `reason` |
+| **Local poll.log** | `~/.devspec/opencode-remote-control/poll.log` | Same phases as JSON lines prefixed `story ` (plus human `logPoll` lines). Kept for offline debug when Axiom is empty. |
+
+**Shared phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
+
+OpenCode emits client-side stories at seed filter, inject, advisory wake, mirror skip/post, poll errors, and stall timeout. The server emits the same vocabulary from MCP tools after staging deploy of the breadcrumbs change.
+
+**Axiom recipe** (dataset `devspec`):
+
+```
+['devspec']
+| where msg == "Remote-control story"
+| where connectionId == "<connection-uuid>"
+| sort by _time asc
+| project _time, ['data.phase'], ['data.outcome'], reason, sessionId, ['data.agent'], ['data.tool']
+```
+
+**Local recipe:** open `poll.log` and grep `story ` for the same connectionId. Do not dump model token streams into either log.

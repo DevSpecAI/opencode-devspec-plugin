@@ -53,6 +53,7 @@ import {
   prepareMirrorText,
   shouldSkipConnectTurnMirror,
 } from './mirror-chrome.js'
+import { logRemoteControlStory } from './remote-control-story.js'
 
 export {
   REMOTE_STATUS_BANNER,
@@ -512,6 +513,17 @@ export async function checkBusyStall(
   logPoll(
     `STALL: busy ${elapsed}ms with empty assistant text (last.id=${lastId}) — clearing busy and posting warning`,
   )
+  logRemoteControlStory({
+    phase: 'stall',
+    outcome: 'stalled',
+    connectionId: state.connectionId,
+    sessionId: state.sessionId,
+    agent: AGENT_NAME,
+    codename: state.codename,
+    tool: 'checkBusyStall',
+    reason: 'empty_assistant_timeout',
+    data: { elapsed_ms: elapsed, stall_timeout_ms: STALL_TIMEOUT_MS, last_id: lastId },
+  })
   patchState(directory, { stallWarnedAt: state.busySince })
   await postSessionNotice(
     auth,
@@ -1106,6 +1118,17 @@ export async function pollAndDeliver(
     // just slow".
     await reportPollError(auth, directory, state, 'poll_connection', err)
     logPoll(`poll_connection failed (${pump.consecutiveErrors}) — retrying in ${backoff}ms: ${err}`)
+    logRemoteControlStory({
+      phase: 'poll_error',
+      outcome: 'error',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'poll_connection',
+      reason: rateLimited ? 'rate_limited' : 'poll_failed',
+      data: { consecutiveErrors: pump.consecutiveErrors, backoff_ms: backoff },
+    })
     return { delayMs: backoff, stop: false }
   }
 
@@ -1249,9 +1272,35 @@ export async function pollAndDeliver(
         `seed filter dropped ${dropped.length} already-answered command(s): ` +
           dropped.map((c) => c.id).join(', '),
       )
+      logRemoteControlStory({
+        phase: 'seed_filter',
+        outcome: 'dropped',
+        connectionId: state.connectionId,
+        sessionId: state.sessionId,
+        agent: AGENT_NAME,
+        codename: state.codename,
+        tool: 'poll_connection',
+        reason: 'already_answered',
+        data: {
+          dropped: dropped.length,
+          kept: liveRoomCommands.length,
+          dropped_ids: dropped.map((c) => c.id).filter(Boolean),
+        },
+      })
     }
     if (liveRoomCommands.length > 0) {
       logPoll(`seed window: ${liveRoomCommands.length} unanswered command(s) to inject`)
+      logRemoteControlStory({
+        phase: 'seed_filter',
+        outcome: 'kept',
+        connectionId: state.connectionId,
+        sessionId: state.sessionId,
+        agent: AGENT_NAME,
+        codename: state.codename,
+        tool: 'poll_connection',
+        reason: 'unanswered',
+        data: { kept: liveRoomCommands.length },
+      })
     }
   }
   pump.needsSeed = false
@@ -1304,6 +1353,20 @@ export async function pollAndDeliver(
     const advisoryOnly = ownerAmbient.length > 0 || roomContext.length > 0
     if (advisoryOnly) {
       pump.consecutiveEmpty = 0
+      logRemoteControlStory({
+        phase: 'wake',
+        outcome: 'advisory_only',
+        connectionId: state.connectionId,
+        sessionId: state.sessionId,
+        agent: AGENT_NAME,
+        codename: state.codename,
+        tool: 'poll_connection',
+        reason: 'room_delta',
+        data: {
+          owner_ambient: ownerAmbient.length,
+          room_context: roomContext.length,
+        },
+      })
       // Event-driven mirroring owns replies; advisory echo must not bypass the
       // in-flight / min-gap guard with a bare mirrorLatestReply (double-post race).
       await mirrorNow(client, directory, sessionId)
@@ -1359,6 +1422,21 @@ export async function pollAndDeliver(
       `${context?.owner_ambient.length ?? 0} owner-ambient, ${context?.room_context.length ?? 0} room-context, ` +
       `${context?.dropped ?? 0} dropped`,
   )
+  logRemoteControlStory({
+    phase: 'inject',
+    outcome: 'injected',
+    connectionId: state.connectionId,
+    sessionId: state.sessionId,
+    agent: AGENT_NAME,
+    codename: state.codename,
+    tool: 'promptAsync',
+    reason: 'owner_commands',
+    data: {
+      commands: commands.length,
+      owner_ambient: context?.owner_ambient.length ?? 0,
+      room_context: context?.room_context.length ?? 0,
+    },
+  })
 
   // Per-message provider/model override — only meaningful for provider-agnostic hosts.
   const rawModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
@@ -1629,6 +1707,17 @@ async function mirrorLatestReply(
       `mirrorLatestReply: skip (connect skill / handshake suppress) last.id=${last.info.id} ` +
         `suppressed=${Boolean(fresh.connectMirrorSuppressed)} awaiting=${Boolean(fresh.awaitingRemoteReply)}`,
     )
+    logRemoteControlStory({
+      phase: 'mirror_decision',
+      outcome: 'skip',
+      connectionId: fresh.connectionId,
+      sessionId: fresh.sessionId,
+      agent: AGENT_NAME,
+      codename: fresh.codename,
+      tool: 'mirrorLatestReply',
+      reason: 'connect_turn_suppress',
+      data: { message_id: last.info.id },
+    })
     alreadyMirrored.add(last.info.id)
     patchState(directory, {
       lastMirroredMessageId: last.info.id,
@@ -1677,6 +1766,17 @@ async function mirrorLatestReply(
   if (!preparedText) {
     // Claim + treat as a finished (non-)turn so busy clears, but never post.
     logPoll(`mirrorLatestReply: skip (operational chrome) last.id=${last.info.id}`)
+    logRemoteControlStory({
+      phase: 'mirror_decision',
+      outcome: 'skip',
+      connectionId: fresh.connectionId,
+      sessionId: fresh.sessionId,
+      agent: AGENT_NAME,
+      codename: fresh.codename,
+      tool: 'mirrorLatestReply',
+      reason: 'operational_chrome',
+      data: { message_id: last.info.id },
+    })
     alreadyMirrored.add(last.info.id)
     patchState(directory, {
       lastMirroredMessageId: last.info.id,
@@ -1701,6 +1801,17 @@ async function mirrorLatestReply(
       `mirrorLatestReply: skip (already posted via ${alreadyPostedByTool ? 'tool' : 'content-hash'}) ` +
         `last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…`,
     )
+    logRemoteControlStory({
+      phase: 'mirror_decision',
+      outcome: 'skip',
+      connectionId: fresh.connectionId,
+      sessionId: fresh.sessionId,
+      agent: AGENT_NAME,
+      codename: fresh.codename,
+      tool: 'mirrorLatestReply',
+      reason: alreadyPostedByTool ? 'already_posted_tool' : 'already_posted_hash',
+      data: { message_id: last.info.id },
+    })
     alreadyMirrored.add(last.info.id)
     patchState(directory, {
       lastMirroredMessageId: last.info.id,
@@ -1768,6 +1879,17 @@ async function mirrorLatestReply(
   }
 
   logPoll(`mirrorLatestReply: posted last.id=${last.info.id} via connection_id`)
+  logRemoteControlStory({
+    phase: 'mirror_post',
+    outcome: 'posted',
+    connectionId: fresh.connectionId,
+    sessionId: fresh.sessionId,
+    agent: AGENT_NAME,
+    codename: fresh.codename,
+    tool: 'post_session_message',
+    reason: 'plugin_mirror',
+    data: { message_id: last.info.id },
+  })
 
   // Real bug found live-testing: `session.idle` — the event the busy:false
   // transition was gated on — never fires even once in practice (confirmed
