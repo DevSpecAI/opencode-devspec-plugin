@@ -45,6 +45,7 @@ import {
   resolveServerAttachment,
   shouldAdvanceMessageCursor,
   unansweredCommands,
+  adoptRequiresNullCursorRepoll,
   type AdvisoryMessage,
   type CarriedContext,
 } from './poll-turn.js'
@@ -76,6 +77,7 @@ export {
   resolveServerAttachment,
   shouldAdvanceMessageCursor,
   holdFor,
+  adoptRequiresNullCursorRepoll,
 } from './poll-turn.js'
 
 /**
@@ -1184,17 +1186,23 @@ export async function pollAndDeliver(
         lastDeliveredMessageId: null,
       }) ?? { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
     // Fresh room: drop the cursor and any carried context from the old one, and treat
-    // this / the next window as a seed (history + unanswered live commands).
+    // the NEXT poll (cursor:null + catch_up) as the seed. Never consume this hold's
+    // package as a completed seed — it was opened under the previous room's cursor,
+    // so packaging is a delta against the wrong clock. Fall-through + advisory-only
+    // advance locked lastDelivered past a cold-launch dispatch that landed moments
+    // later with a backdated paint timestamp (session 23da0643 / item 2411dd5a).
+    // Session 1383cbb8 needed the pending command delivered; a null-cursor re-poll
+    // gets the catch-up window and does that correctly without the race.
     pump.cursor = null
     pump.carry.reset()
     pump.needsSeed = true
-    // Do NOT return early when this hold already packaged a turn for the new room —
-    // discarding it permanently skips the owner's pending command (session 1383cbb8).
-    if (res?.changed !== true) {
-      // Attachment moved but no packaged turn yet — keep needsSeed for catch-up.
+    if (adoptRequiresNullCursorRepoll()) {
+      logPoll(
+        `adopt → re-poll with cursor:null + catch_up (discarding pre-adopt package; ` +
+          `changed=${res?.changed === true})`,
+      )
       return { delayMs: 0, stop: false }
     }
-    // Fall through and consume the packaged turn as the seed window.
   } else if (res?.changed !== true) {
     // The hold ran its course with nothing new. No sleep: holding IS the wait.
     pump.needsSeed = false

@@ -305,6 +305,22 @@ export function unansweredCommands(
 }
 
 /**
+ * After a server attachment change, must the poller discard this response's
+ * packaged turn and re-issue with cursor:null + catch_up?
+ *
+ * Always yes. The hold was opened under the previous room's cursor, so any
+ * package here is a delta against the wrong clock. Consuming it as a "seed"
+ * (especially advisory-only join markers) advances lastDelivered and permanently
+ * skips a cold-launch owner dispatch that lands moments later — often with a
+ * backdated paint timestamp (session 23da0643 / item 2411dd5a). Session 1383cbb8
+ * needed the pending command delivered; a null-cursor re-poll gets the catch-up
+ * window and does that without the race. Do not fall through.
+ */
+export function adoptRequiresNullCursorRepoll(): boolean {
+  return true
+}
+
+/**
  * Whether to persist / apply the server's message cursor after a changed poll.
  *
  * Advance when the packaged turn was fully consumed — injected, true advisory-only,
