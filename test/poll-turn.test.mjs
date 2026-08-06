@@ -405,6 +405,54 @@ describe('unansweredCommands (cold-launch / reattach window)', () => {
     const cmds = [{ id: 'a', created_at: '2026-07-25T10:00:00.000Z' }]
     assert.deepEqual(unansweredCommands(cmds, []).map((c) => c.id), ['a'])
   })
+
+  // Session 5546c769 / command c117ffae: Cursor's later bubble must not settle
+  // an OpenCode-targeted dispatch that never mirrored.
+  it('does not let a sibling agent reply settle this agent\'s unanswered dispatch (5546c769)', () => {
+    const cmds = [{ id: 'c117ffae', created_at: '2026-08-06T16:28:31.117Z' }]
+    const room = [
+      {
+        id: 'cursor-later',
+        message_type: 'external_agent',
+        created_at: '2026-08-06T16:33:26.758Z',
+        content: 'I rebuilt dist — please retest.',
+        author: {
+          kind: 'external_agent',
+          name: 'Cursor · Rapid Kestrel (Brandon Caddow Young)',
+          agent_tool: 'Cursor · Rapid Kestrel',
+        },
+      },
+    ]
+    assert.deepEqual(
+      unansweredCommands(cmds, room, { agentName: 'OpenCode' }).map((c) => c.id),
+      ['c117ffae'],
+    )
+  })
+
+  it('still settles when THIS agent mirrored a real reply after the dispatch', () => {
+    const cmds = [{ id: 'math', created_at: '2026-08-06T16:28:31.117Z' }]
+    const room = [
+      {
+        id: 'opencode-answer',
+        message_type: 'external_agent',
+        created_at: '2026-08-06T16:29:00.000Z',
+        content: '2',
+        author: {
+          kind: 'external_agent',
+          name: 'OpenCode · Fierce Eagle (Brandon Caddow Young)',
+          agent_tool: 'OpenCode · Fierce Eagle',
+        },
+        connection_id: '5aa9129e-aa63-4b80-a2ad-ad8c5e336bde',
+      },
+    ]
+    assert.deepEqual(
+      unansweredCommands(cmds, room, {
+        agentName: 'OpenCode',
+        connectionId: '5aa9129e-aa63-4b80-a2ad-ad8c5e336bde',
+      }),
+      [],
+    )
+  })
 })
 
 describe('shouldAdvanceMessageCursor — never skip uninjected deliverables', () => {

@@ -92,7 +92,9 @@ export interface AdvisoryMessage {
   content?: string
   created_at?: string
   message_type?: string
-  author?: { kind?: string; name?: string; user_id?: string }
+  /** Present when the room row is attributed to a specific connection. */
+  connection_id?: string
+  author?: { kind?: string; name?: string; user_id?: string; agent_tool?: string }
   is_voice_input?: boolean
   note?: string
 }
@@ -286,22 +288,62 @@ export function errorBackoffMs(
  * (session 0ffe97cb): a leaked status-fence leftover would otherwise permanently
  * suppress the owner's still-unanswered dispatch. When content is missing from the
  * room row, fail open and keep the old timestamp behaviour.
+ *
+ * Multi-agent rooms (session 5546c769 / command c117ffae): only THIS agent's
+ * external_agent bubbles settle. A sibling Cursor reply after an OpenCode-targeted
+ * dispatch must not mark that dispatch already_answered on reconnect.
  */
 export function unansweredCommands(
   commands: Array<{ created_at?: string }> | null | undefined,
   roomContext: AdvisoryMessage[] | null | undefined,
+  opts?: { agentName?: string | null; connectionId?: string | null },
 ): Array<{ created_at?: string }> {
   const cmds = Array.isArray(commands) ? commands : []
   const room = Array.isArray(roomContext) ? roomContext : []
+  const agentName = typeof opts?.agentName === 'string' ? opts.agentName.trim() : ''
+  const connectionId =
+    typeof opts?.connectionId === 'string' && opts.connectionId.length >= 8 ? opts.connectionId : null
   let lastReplyAt: string | null = null
   for (const m of room) {
-    const isReply = m?.message_type === 'external_agent' || m?.author?.kind === 'external_agent'
-    if (!isReply || typeof m?.created_at !== 'string') continue
+    if (!isSettlingReplyForThisAgent(m, { agentName, connectionId })) continue
     if (typeof m.content === 'string' && prepareMirrorText(m.content) === null) continue
-    if (!lastReplyAt || m.created_at > lastReplyAt) lastReplyAt = m.created_at
+    if (!lastReplyAt || m.created_at! > lastReplyAt) lastReplyAt = m.created_at!
   }
   if (!lastReplyAt) return cmds
   return cmds.filter((c) => typeof c?.created_at === 'string' && c.created_at > lastReplyAt!)
+}
+
+/** True when a room row is a real reply from THIS agent (not a sibling). */
+export function isSettlingReplyForThisAgent(
+  m: AdvisoryMessage | null | undefined,
+  opts: { agentName?: string; connectionId?: string | null },
+): boolean {
+  if (!m || typeof m.created_at !== 'string') return false
+  const isReply = m.message_type === 'external_agent' || m.author?.kind === 'external_agent'
+  if (!isReply) return false
+
+  const connectionId = opts.connectionId ?? null
+  if (connectionId && typeof m.connection_id === 'string' && m.connection_id.length >= 8) {
+    return m.connection_id === connectionId
+  }
+
+  const agentName = (opts.agentName ?? '').trim()
+  if (agentName) {
+    const tool = typeof m.author?.agent_tool === 'string' ? m.author.agent_tool : ''
+    const name = typeof m.author?.name === 'string' ? m.author.name : ''
+    // Wire labels look like "OpenCode · Fierce Eagle" / "OpenCode · Fierce Eagle (Owner)".
+    return (
+      tool === agentName ||
+      tool.startsWith(`${agentName} ·`) ||
+      tool.startsWith(`${agentName} `) ||
+      name === agentName ||
+      name.startsWith(`${agentName} ·`) ||
+      name.startsWith(`${agentName} `)
+    )
+  }
+
+  // No identity to scope by — keep legacy "any external_agent settles" behaviour.
+  return true
 }
 
 /**

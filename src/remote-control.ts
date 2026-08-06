@@ -1277,7 +1277,10 @@ export async function pollAndDeliver(
   // On a seed window, filter out commands already answered before this process existed.
   const wasSeed = pump.needsSeed
   const liveRoomCommands = wasSeed
-    ? (unansweredCommands(roomCommands as any, roomContext) as any[])
+    ? (unansweredCommands(roomCommands as any, roomContext, {
+        agentName: AGENT_NAME,
+        connectionId: state.connectionId,
+      }) as any[])
     : roomCommands
   if (wasSeed && roomCommands.length > 0) {
     const keptIds = new Set(
