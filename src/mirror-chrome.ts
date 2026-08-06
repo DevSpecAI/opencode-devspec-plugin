@@ -120,6 +120,12 @@ export function isDevspecRemoteControlCommand(name: unknown): boolean {
  * dispatch that landed during attach. Skipping the connect skill turn (by
  * command.executed message id and/or a short post-handshake suppress) stops
  * that race without NLP-guessing narration or weakening the seed filter.
+ *
+ * Session 8a97effc / connection 4aab7fe0: OpenCode fired a late
+ * `command.executed` for `devspec.remote` against the *post-inject answer*
+ * message id. nonMirrorMessageIds then won over awaitingRemoteReply and the
+ * real reply was skip-claimed forever. When awaiting an inject reply, never
+ * skip — that flag is the mechanical "this turn is the owner's answer" signal.
  */
 export function shouldSkipConnectTurnMirror(opts: {
   messageId: string | null | undefined
@@ -127,6 +133,10 @@ export function shouldSkipConnectTurnMirror(opts: {
   connectMirrorSuppressed?: boolean | null
   awaitingRemoteReply?: boolean | null
 }): boolean {
+  // Post-inject remote replies always mirror — even if a late connect-skill
+  // command.executed wrongly tagged this message id (8a97effc).
+  if (opts.awaitingRemoteReply) return false
+
   const id = typeof opts.messageId === 'string' ? opts.messageId : ''
   if (id && opts.nonMirrorMessageIds) {
     for (const x of opts.nonMirrorMessageIds) {
@@ -134,8 +144,7 @@ export function shouldSkipConnectTurnMirror(opts: {
     }
   }
   // Handshake suppress covers the race where flushMirrorNow runs before
-  // command.executed records the skill message id. Never suppress a real
-  // post-inject remote reply.
-  if (opts.connectMirrorSuppressed && !opts.awaitingRemoteReply) return true
+  // command.executed records the skill message id.
+  if (opts.connectMirrorSuppressed) return true
   return false
 }

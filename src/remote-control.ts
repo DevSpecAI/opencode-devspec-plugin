@@ -789,6 +789,11 @@ export function recordConnectionEventFromTool(
 /**
  * Record an OpenCode `command.executed` for `/devspec.remote` /
  * `/devspec.remote-stop` so mirrorLatestReply never posts that assistant turn.
+ *
+ * While `awaitingRemoteReply` is set, ignore the event: OpenCode has been
+ * observed to fire a late `devspec.remote` command.executed against the
+ * *post-inject answer* message id (session 8a97effc). Recording that id would
+ * poison nonMirrorMessageIds and skip-mirror the real reply.
  */
 export function recordRemoteControlSkillCommand(
   directory: string,
@@ -800,6 +805,12 @@ export function recordRemoteControlSkillCommand(
   if (!messageId) return
   const existing = readState(directory)
   if (!existing) return
+  if (existing.awaitingRemoteReply) {
+    logPoll(
+      `recordRemoteControlSkillCommand: ignore id=${messageId} name=${props.name} (awaitingRemoteReply)`,
+    )
+    return
+  }
   const ids = new Set(existing.nonMirrorMessageIds ?? [])
   if (ids.has(messageId)) return
   ids.add(messageId)
@@ -1711,6 +1722,14 @@ async function mirrorLatestReply(
       awaitingRemoteReply: fresh.awaitingRemoteReply,
     })
   ) {
+    // Belt-and-suspenders (8a97effc): never claim a post-inject answer as
+    // mirrored via connect-skip — that permanently drops the owner's reply.
+    if (fresh.awaitingRemoteReply) {
+      logPoll(
+        `mirrorLatestReply: refuse connect-skip claim while awaiting last.id=${last.info.id}`,
+      )
+      return
+    }
     logPoll(
       `mirrorLatestReply: skip (connect skill / handshake suppress) last.id=${last.info.id} ` +
         `suppressed=${Boolean(fresh.connectMirrorSuppressed)} awaiting=${Boolean(fresh.awaitingRemoteReply)}`,
@@ -1731,7 +1750,7 @@ async function mirrorLatestReply(
       lastMirroredMessageId: last.info.id,
       mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
       connectMirrorSuppressed: false,
-      awaitingRemoteReply: false,
+      // Handshake skip only — awaitingRemoteReply is already false above.
       replyAfterOpenCodeMessageId: null,
       replyBaselineCaptured: undefined,
     })

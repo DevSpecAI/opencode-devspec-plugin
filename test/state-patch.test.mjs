@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it, after } from 'node:test'
-import { patchState, readState, writeState } from '../dist/remote-control.js'
+import { patchState, readState, writeState, recordRemoteControlSkillCommand } from '../dist/remote-control.js'
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-devspec-state-'))
@@ -122,5 +122,52 @@ describe('patchState vs stale writeState (mirror claim race)', () => {
     assert.deepEqual(fresh?.deliveredMessageIds, ['055522d7-2fe2-4c35-8dcd-f000b55dbf2f'])
     assert.equal(fresh?.replyAfterOpenCodeMessageId, 'msg_baseline')
     assert.equal(fresh?.awaitingRemoteReply, true)
+  })
+})
+
+describe('recordRemoteControlSkillCommand — late connect tag (8a97effc)', () => {
+  const dirs = []
+  after(() => {
+    for (const d of dirs) {
+      try {
+        fs.rmSync(d, { recursive: true, force: true })
+      } catch {
+        /* best-effort */
+      }
+    }
+  })
+
+  it('records the connect message id when not awaiting an inject reply', () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    writeState(dir, baseState({ awaitingRemoteReply: false, nonMirrorMessageIds: [] }))
+
+    recordRemoteControlSkillCommand(dir, {
+      name: 'devspec.remote',
+      messageID: 'msg_connect_turn',
+    })
+
+    const fresh = readState(dir)
+    assert.deepEqual(fresh?.nonMirrorMessageIds, ['msg_connect_turn'])
+  })
+
+  it('ignores command.executed while awaitingRemoteReply so the answer id is not poisoned', () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    writeState(
+      dir,
+      baseState({
+        awaitingRemoteReply: true,
+        nonMirrorMessageIds: ['msg_prior_connect'],
+      }),
+    )
+
+    recordRemoteControlSkillCommand(dir, {
+      name: 'devspec.remote',
+      messageID: 'msg_fd7a125e2001jMlrosBkXrxYbv',
+    })
+
+    const fresh = readState(dir)
+    assert.deepEqual(fresh?.nonMirrorMessageIds, ['msg_prior_connect'])
   })
 })

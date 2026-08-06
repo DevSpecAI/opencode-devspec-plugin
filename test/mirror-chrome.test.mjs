@@ -108,6 +108,21 @@ describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => 
     )
   })
 
+  // Session 8a97effc / connection 4aab7fe0: late command.executed tagged the
+  // inject answer with the connect-skill message id; nonMirrorMessageIds must
+  // not win over awaitingRemoteReply.
+  it('never skips while awaitingRemoteReply even if answer id is in nonMirrorMessageIds (8a97effc)', () => {
+    assert.equal(
+      shouldSkipConnectTurnMirror({
+        messageId: 'msg_fd7a125e2001jMlrosBkXrxYbv',
+        nonMirrorMessageIds: ['msg_fd7a125e2001jMlrosBkXrxYbv'],
+        connectMirrorSuppressed: false,
+        awaitingRemoteReply: true,
+      }),
+      false,
+    )
+  })
+
   it('recognises remote-control skill command names', () => {
     assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
