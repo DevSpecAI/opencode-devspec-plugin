@@ -605,23 +605,212 @@ function hashKey(raw: string): string {
  * Matches the key `devspec.remote.md` computes for `local_id` (see step 2
  * there) so the local state file and the server-side connection identity
  * stay in step: same folder+session in, same hash out, on both sides.
+ *
+ * `sessionKey` overrides the process-global bind for read/migrate paths:
+ * `null` = folder-only file; a string = that session id's scoped file.
  */
-function stateFile(directory: string): string {
+function stateFileForKey(directory: string, sessionKey: string | null): string {
   const base = path.resolve(directory)
-  const raw = boundSessionId ? `${base}:${boundSessionId}` : base
+  const raw = sessionKey ? `${base}:${sessionKey}` : base
   const key = hashKey(raw)
   const dir = path.join(os.homedir(), '.devspec', 'opencode-remote-control')
   fs.mkdirSync(dir, { recursive: true })
   return path.join(dir, `${key}.json`)
 }
 
-/** Exported for regression tests (item 67794386) — prefer patchState in production paths. */
-export function readState(directory: string): ConnectionState | null {
+function stateFile(directory: string): string {
+  return stateFileForKey(directory, boundSessionId)
+}
+
+function readStateAtKey(directory: string, sessionKey: string | null): ConnectionState | null {
   try {
-    return JSON.parse(fs.readFileSync(stateFile(directory), 'utf8'))
+    return JSON.parse(fs.readFileSync(stateFileForKey(directory, sessionKey), 'utf8'))
   } catch {
     return null
   }
+}
+
+function unlinkStateAtKey(directory: string, sessionKey: string | null): void {
+  try {
+    fs.unlinkSync(stateFileForKey(directory, sessionKey))
+  } catch {
+    /* already gone */
+  }
+}
+
+function unionIds(a?: string[] | null, b?: string[] | null): string[] | undefined {
+  if (!a?.length && !b?.length) return a ?? b ?? undefined
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const id of [...(a ?? []), ...(b ?? [])]) {
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+/**
+ * Merge two connection-state snapshots. `primary` wins on scalar conflicts;
+ * list fields are unioned. When either side is mid-inject (`awaitingRemoteReply`),
+ * that side's baseline fields win so a key flip cannot drop the inject cursor.
+ */
+export function mergeConnectionStates(
+  primary: ConnectionState | null | undefined,
+  secondary: ConnectionState | null | undefined,
+): ConnectionState | null {
+  if (!primary && !secondary) return null
+  if (!primary) return { ...secondary! }
+  if (!secondary) return { ...primary }
+  const awaiting = Boolean(primary.awaitingRemoteReply || secondary.awaitingRemoteReply)
+  const awaitingPrimary = primary.awaitingRemoteReply
+    ? primary
+    : secondary.awaitingRemoteReply
+      ? secondary
+      : primary
+  return {
+    ...secondary,
+    ...primary,
+    deliveredMessageIds: unionIds(secondary.deliveredMessageIds, primary.deliveredMessageIds),
+    deliveredAssignmentIds: unionIds(secondary.deliveredAssignmentIds, primary.deliveredAssignmentIds),
+    mirroredMessageIds: unionIds(secondary.mirroredMessageIds, primary.mirroredMessageIds),
+    recentPostedContentHashes: unionIds(
+      secondary.recentPostedContentHashes,
+      primary.recentPostedContentHashes,
+    ),
+    nonMirrorMessageIds: unionIds(secondary.nonMirrorMessageIds, primary.nonMirrorMessageIds),
+    awaitingRemoteReply: awaiting,
+    replyAfterOpenCodeMessageId: awaiting
+      ? awaitingPrimary.replyAfterOpenCodeMessageId
+      : (primary.replyAfterOpenCodeMessageId ?? secondary.replyAfterOpenCodeMessageId),
+    replyBaselineCaptured: awaiting
+      ? awaitingPrimary.replyBaselineCaptured
+      : (primary.replyBaselineCaptured ?? secondary.replyBaselineCaptured),
+    busy: Boolean(primary.busy || secondary.busy),
+    busySince: primary.busy
+      ? (primary.busySince ?? null)
+      : (primary.busySince ?? secondary.busySince ?? null),
+    stallWarnedAt: primary.stallWarnedAt ?? secondary.stallWarnedAt ?? null,
+    connectMirrorSuppressed: Boolean(
+      primary.connectMirrorSuppressed || secondary.connectMirrorSuppressed,
+    ),
+  }
+}
+
+function foldConnectionStates(states: Array<ConnectionState | null | undefined>): ConnectionState | null {
+  let acc: ConnectionState | null = null
+  for (const s of states) {
+    if (!s) continue
+    if (!acc) {
+      acc = { ...s }
+      continue
+    }
+    // Prefer the awaiting snapshot as primary so inject cursors survive bind.
+    acc =
+      s.awaitingRemoteReply && !acc.awaitingRemoteReply
+        ? mergeConnectionStates(s, acc)
+        : mergeConnectionStates(acc, s)
+  }
+  return acc
+}
+
+/**
+ * Flip `boundSessionId` to `sessionId` and migrate every prior key that may
+ * hold live remote-control state into the canonical session-scoped file.
+ *
+ * Live bug (d5efd533 / Fierce Eagle): seed inject wrote `awaitingRemoteReply`
+ * on the folder-only file; mid-turn `attach_connection` rebound to the full
+ * UUID file without migrating — mirror then connect-skip-claimed the answer.
+ * Comments already claimed this migration existed; it did not.
+ */
+export function bindSessionState(
+  directory: string,
+  sessionId: string,
+  patch: Partial<ConnectionState> = {},
+): ConnectionState {
+  const donorKeys = new Set<string | null>([boundSessionId])
+  // Always consider the folder-only scratch file (register + pre-bind inject).
+  donorKeys.add(null)
+  // Short 8-char prefix — `devspec.remote.md` / attach args often use this.
+  if (sessionId.length > 8) donorKeys.add(sessionId.slice(0, 8))
+  if (boundSessionId && boundSessionId.length > 8) {
+    donorKeys.add(boundSessionId.slice(0, 8))
+  }
+
+  const donors: Array<ConnectionState | null> = []
+  for (const key of donorKeys) {
+    donors.push(readStateAtKey(directory, key))
+  }
+
+  const destBefore = readStateAtKey(directory, sessionId)
+  const firstSessionBind = !destBefore?.sessionId
+  donors.push(destBefore)
+
+  const folded = foldConnectionStates(donors)
+  if (!folded && !patch.connectionId) {
+    throw new Error('bindSessionState: no connection state to migrate')
+  }
+
+  boundSessionId = sessionId
+  const connectionId = patch.connectionId ?? folded?.connectionId
+  if (!connectionId) {
+    throw new Error('bindSessionState: connectionId required')
+  }
+
+  const next: ConnectionState = {
+    ...(folded ?? { connectionId, sessionId: null, codename: null }),
+    ...patch,
+    connectionId,
+    sessionId,
+    codename:
+      patch.codename !== undefined
+        ? patch.codename
+        : (folded?.codename ?? null),
+    // Re-apply awaiting merge after patch so an identity-only patch cannot
+    // clobber an in-flight inject cursor carried from a donor key.
+    awaitingRemoteReply: Boolean(
+      patch.awaitingRemoteReply ?? folded?.awaitingRemoteReply,
+    ),
+    replyAfterOpenCodeMessageId:
+      folded?.awaitingRemoteReply || patch.awaitingRemoteReply
+        ? (patch.replyAfterOpenCodeMessageId ?? folded?.replyAfterOpenCodeMessageId)
+        : (patch.replyAfterOpenCodeMessageId !== undefined
+            ? patch.replyAfterOpenCodeMessageId
+            : folded?.replyAfterOpenCodeMessageId),
+    replyBaselineCaptured:
+      folded?.awaitingRemoteReply || patch.awaitingRemoteReply
+        ? (patch.replyBaselineCaptured ?? folded?.replyBaselineCaptured)
+        : (patch.replyBaselineCaptured !== undefined
+            ? patch.replyBaselineCaptured
+            : folded?.replyBaselineCaptured),
+    connectMirrorSuppressed: firstSessionBind
+      ? true
+      : (patch.connectMirrorSuppressed ?? folded?.connectMirrorSuppressed),
+  }
+
+  writeState(directory, next)
+
+  // Drop donor files that are no longer the canonical key so the next cold
+  // launch cannot resume a stale folder-only snapshot beside the real one.
+  for (const key of donorKeys) {
+    if (key === sessionId) continue
+    const donorPath = stateFileForKey(directory, key)
+    const destPath = stateFileForKey(directory, sessionId)
+    if (donorPath === destPath) continue
+    unlinkStateAtKey(directory, key)
+  }
+
+  return next
+}
+
+/** Test helper — reset the process-global session bind between cases. */
+export function resetBoundSessionIdForTests(): void {
+  boundSessionId = null
+}
+
+/** Exported for regression tests (item 67794386) — prefer patchState in production paths. */
+export function readState(directory: string): ConnectionState | null {
+  return readStateAtKey(directory, boundSessionId)
 }
 
 /**
@@ -657,11 +846,7 @@ export function patchState(directory: string, patch: Partial<ConnectionState>): 
 }
 
 function clearState(directory: string): void {
-  try {
-    fs.unlinkSync(stateFile(directory))
-  } catch {
-    /* already gone */
-  }
+  unlinkStateAtKey(directory, boundSessionId)
 }
 
 /**
@@ -719,70 +904,58 @@ export function recordConnectionEventFromTool(
   if (isRegister) {
     // boundSessionId isn't set yet at this point on a fresh process (attach,
     // below, is what sets it) — this read/write still lands in the
-    // folder-only file, same as a bare connection. That's fine: the attach
-    // branch below re-binds and migrates state into the session-scoped file
-    // moments later in the same command run, before any poll loop starts.
+    // folder-only file, same as a bare connection. Attach migrates the full
+    // snapshot into the session-scoped file via bindSessionState.
     const existing = readState(directory)
     const connectionId = typeof result?.connection_id === 'string' ? result.connection_id : existing?.connectionId
     if (!connectionId) return
-    writeState(directory, {
-      connectionId,
-      sessionId: existing?.sessionId ?? null,
-      codename: typeof result?.codename === 'string' ? result.codename : existing?.codename ?? null,
-      lastMirroredMessageId: existing?.lastMirroredMessageId,
-      lastDeliveredMessageId: existing?.lastDeliveredMessageId,
-      deliveredMessageIds: existing?.deliveredMessageIds,
-      mirroredMessageIds: existing?.mirroredMessageIds,
-      recentPostedContentHashes: existing?.recentPostedContentHashes,
-      nonMirrorMessageIds: existing?.nonMirrorMessageIds,
-      // Fresh register — suppress until the connect skill turn is claimed.
-      connectMirrorSuppressed: true,
-    })
+    if (existing) {
+      // Preserve awaiting/busy/baseline — a register that races an inject
+      // must not wipe the inject cursor (hand-picked writeState used to).
+      patchState(directory, {
+        connectionId,
+        codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
+        connectMirrorSuppressed: true,
+      })
+    } else {
+      writeState(directory, {
+        connectionId,
+        sessionId: null,
+        codename: typeof result?.codename === 'string' ? result.codename : null,
+        connectMirrorSuppressed: true,
+      })
+    }
     return
   }
 
   // Attach: connection_id/session_id may come back on the result, or only be
   // present on the call's own args (DevSpec's attach_connection echoes both,
-  // but don't assume — fall back to what the model was called with).
+  // but don't assume — fall back to what the model was called with). Prefer
+  // the server's full UUID over a short prefix in args (ce0dab86).
   const sessionId =
     typeof result?.session_id === 'string'
       ? result.session_id
       : typeof argsObj.session_id === 'string'
         ? (argsObj.session_id as string)
         : null
+  if (!sessionId) return
 
-  // Bind BEFORE reading `existing` — a reconnect to a session this process
-  // (or a prior run of it) already attached to must resume THAT session's
-  // own state file (cursors, dedup sets), not the transient pre-attach
-  // scratch state the register branch above just wrote to the folder-only
-  // file. See stateFile's doc for why this key flip is what keeps two
-  // concurrent `opencode serve` processes for one folder from sharing state.
-  if (sessionId) boundSessionId = sessionId
-  const existing = readState(directory)
-
-  const connectionId =
+  const connectionIdHint =
     typeof result?.connection_id === 'string'
       ? result.connection_id
       : typeof argsObj.connection_id === 'string'
         ? (argsObj.connection_id as string)
-        : existing?.connectionId
+        : undefined
+
+  // Migrate folder-only / short-prefix inject state into the canonical
+  // session-scoped file BEFORE any further mirror decision (d5efd533).
+  const prior = readState(directory)
+  const connectionId = connectionIdHint ?? prior?.connectionId
   if (!connectionId) return
 
-  // First bind into a session this state file has never held — suppress the
-  // connect turn. Re-attach when sessionId was already set must NOT suppress
-  // (would eat a normal TUI reply after a mid-session reattach).
-  const firstSessionBind = !existing?.sessionId
-  writeState(directory, {
+  bindSessionState(directory, sessionId, {
     connectionId,
-    sessionId: sessionId ?? existing?.sessionId ?? null,
-    codename: existing?.codename ?? null,
-    lastMirroredMessageId: existing?.lastMirroredMessageId,
-    lastDeliveredMessageId: existing?.lastDeliveredMessageId,
-    deliveredMessageIds: existing?.deliveredMessageIds,
-    mirroredMessageIds: existing?.mirroredMessageIds,
-    recentPostedContentHashes: existing?.recentPostedContentHashes,
-    nonMirrorMessageIds: existing?.nonMirrorMessageIds,
-    connectMirrorSuppressed: firstSessionBind ? true : existing?.connectMirrorSuppressed,
+    codename: prior?.codename ?? null,
   })
 }
 
@@ -836,7 +1009,25 @@ export async function ensureConnection(
     return { auth, state: null, error: auth.error }
   }
 
-  if (sessionId) boundSessionId = sessionId
+  if (sessionId && sessionId !== boundSessionId) {
+    const existingAnywhere =
+      readState(directory) ??
+      readStateAtKey(directory, null) ??
+      (sessionId.length > 8 ? readStateAtKey(directory, sessionId.slice(0, 8)) : null) ??
+      readStateAtKey(directory, sessionId)
+    if (existingAnywhere?.connectionId) {
+      return {
+        auth,
+        state: bindSessionState(directory, sessionId, {
+          connectionId: existingAnywhere.connectionId,
+          codename: existingAnywhere.codename,
+        }),
+      }
+    }
+    boundSessionId = sessionId
+  } else if (sessionId) {
+    boundSessionId = sessionId
+  }
   const existing = readState(directory)
   if (existing) return { auth, state: existing }
 
@@ -862,13 +1053,18 @@ export async function ensureConnection(
 export async function attachSession(directory: string, sessionId: string): Promise<void> {
   const { auth, state } = await ensureConnection(directory, sessionId)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) throw new Error(auth.error || 'DevSpec not configured')
-  await mcpToolsCall({
+  const result: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
     token: auth.token,
     name: 'attach_connection',
     arguments: { connection_id: state.connectionId, session_id: sessionId },
   })
-  writeState(directory, { ...state, sessionId })
+  const canonicalSessionId =
+    typeof result?.session_id === 'string' ? result.session_id : sessionId
+  bindSessionState(directory, canonicalSessionId, {
+    connectionId: state.connectionId,
+    codename: state.codename,
+  })
 }
 
 /** Detach + mark the connection offline — `/devspec.remote-stop`. */
