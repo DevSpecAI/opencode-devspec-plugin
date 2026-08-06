@@ -1739,6 +1739,61 @@ export async function pollAndDeliver(
 }
 
 /**
+ * Decide how to correlate assistants while awaiting a remote inject reply.
+ *
+ * Live (8d0f1726): a concrete baseline id that is *gone* from the current
+ * OpenCode session means the serve process rotated under an abandoned inject
+ * cursor — clear it instead of fail-closing forever. A failed snapshot at
+ * inject time (`baselineCaptured === false`) still fails closed.
+ */
+export type AwaitingBaselineDecision =
+  | { action: 'fail_closed_snapshot' }
+  | { action: 'clear_abandoned'; baseline: string }
+  | { action: 'wait'; baseline: string }
+  | { action: 'slice'; fromIndex: number }
+  | { action: 'all' }
+  | { action: 'fail_closed_legacy' }
+
+export function decideAwaitingBaseline(opts: {
+  baseline: string | null
+  baselineCaptured: boolean | undefined
+  assistantIds: string[]
+}): AwaitingBaselineDecision {
+  if (opts.baselineCaptured === false) return { action: 'fail_closed_snapshot' }
+  if (opts.baseline) {
+    const idx = opts.assistantIds.indexOf(opts.baseline)
+    if (idx < 0) return { action: 'clear_abandoned', baseline: opts.baseline }
+    if (idx === opts.assistantIds.length - 1) {
+      return { action: 'wait', baseline: opts.baseline }
+    }
+    return { action: 'slice', fromIndex: idx + 1 }
+  }
+  if (opts.baselineCaptured === true) return { action: 'all' }
+  return { action: 'fail_closed_legacy' }
+}
+
+/**
+ * Clear an abandoned inject cursor (vanished baseline after OpenCode session
+ * rotate). Returns true when state was cleared.
+ */
+export function clearAbandonedInjectCursor(
+  directory: string,
+  baseline: string,
+): boolean {
+  logPoll(
+    `mirrorLatestReply: clearing abandoned inject cursor — baseline ${baseline} not in current OpenCode session`,
+  )
+  const next = patchState(directory, {
+    awaitingRemoteReply: false,
+    replyAfterOpenCodeMessageId: null,
+    replyBaselineCaptured: undefined,
+    busy: false,
+    busySince: null,
+  })
+  return Boolean(next)
+}
+
+/**
  * Mirror a finished reply without polling — driven by OpenCode's OWN events.
  *
  * Why this exists: the interval version mirrored replies as a side-effect of its 8s
@@ -1862,34 +1917,35 @@ async function mirrorLatestReply(
   const baselineCaptured = fresh.replyBaselineCaptured
 
   // When awaiting a remote reply: correlate to pre-inject baseline. Fail closed
-  // if the baseline snapshot failed or the baseline id vanished from history.
+  // if the baseline snapshot failed; clear an abandoned cursor when the
+  // baseline id vanished (OpenCode session rotated — 8d0f1726).
   let candidates = assistantMessages
   if (fresh.awaitingRemoteReply) {
-    if (baselineCaptured === false) {
+    const decision = decideAwaitingBaseline({
+      baseline,
+      baselineCaptured,
+      assistantIds: assistantMessages.map((m) => m?.info?.id).filter(Boolean) as string[],
+    })
+    if (decision.action === 'fail_closed_snapshot') {
       logPoll(
         'mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline snapshot failed at inject',
       )
       return
     }
-    if (baseline) {
-      const idx = assistantMessages.findIndex((m) => m?.info?.id === baseline)
-      if (idx < 0) {
-        logPoll(
-          `mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline ${baseline} not in message list`,
-        )
-        return
-      }
-      candidates = assistantMessages.slice(idx + 1)
-      if (candidates.length === 0) {
-        logPoll(`mirrorLatestReply: still waiting for assistant after baseline ${baseline}`)
-        return
-      }
-    } else if (baselineCaptured === true) {
-      // Snapshot succeeded with no prior assistant — any assistant is new.
+    if (decision.action === 'clear_abandoned') {
+      clearAbandonedInjectCursor(directory, decision.baseline)
+      await setBusy(directory, false)
+      return
+    }
+    if (decision.action === 'wait') {
+      logPoll(`mirrorLatestReply: still waiting for assistant after baseline ${decision.baseline}`)
+      return
+    }
+    if (decision.action === 'slice') {
+      candidates = assistantMessages.slice(decision.fromIndex)
+    } else if (decision.action === 'all') {
       candidates = assistantMessages
     } else {
-      // Legacy state without replyBaselineCaptured + null baseline: fail closed
-      // rather than risk posting unrelated history.
       logPoll(
         'mirrorLatestReply: FAIL CLOSED — awaiting remote reply with null baseline and unknown capture status',
       )
