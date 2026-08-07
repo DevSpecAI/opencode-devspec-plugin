@@ -97,6 +97,53 @@ export interface AdvisoryMessage {
   author?: { kind?: string; name?: string; user_id?: string; agent_tool?: string }
   is_voice_input?: boolean
   note?: string
+  /** Parent quote when this message was a reply (MCP social metadata, item b6eff1a3). */
+  reply_to?: {
+    messageId?: string
+    content?: string
+    userName?: string
+    role?: string
+  } | null
+  /** Emoji reactions on this message. */
+  reactions?: Array<{ userId?: string; userName?: string; emoji?: string }> | null
+}
+
+/**
+ * Compact reply-parent + reaction line for injected / advisory text.
+ * Returns null when neither field is present so quiet messages stay quiet.
+ */
+export function formatSocialMeta(msg: {
+  reply_to?: unknown
+  reactions?: unknown
+}): string | null {
+  const bits: string[] = []
+  const reply = msg?.reply_to
+  if (reply && typeof reply === 'object' && !Array.isArray(reply)) {
+    const r = reply as Record<string, unknown>
+    const who = typeof r.userName === 'string' && r.userName.trim() ? r.userName.trim() : 'someone'
+    const content = typeof r.content === 'string' ? r.content.trim() : ''
+    const snippet = content.length > 120 ? `${content.slice(0, 117)}…` : content
+    bits.push(snippet ? `in reply to ${who}: “${snippet}”` : `in reply to ${who}`)
+  }
+  const reactions = msg?.reactions
+  if (Array.isArray(reactions) && reactions.length > 0) {
+    const grouped = new Map<string, number>()
+    for (const entry of reactions) {
+      const emoji =
+        entry && typeof entry === 'object' && typeof (entry as { emoji?: unknown }).emoji === 'string'
+          ? (entry as { emoji: string }).emoji
+          : null
+      if (!emoji) continue
+      grouped.set(emoji, (grouped.get(emoji) ?? 0) + 1)
+    }
+    if (grouped.size > 0) {
+      bits.push(
+        'reactions: ' +
+          [...grouped.entries()].map(([emoji, n]) => (n > 1 ? `${emoji}×${n}` : emoji)).join(' '),
+      )
+    }
+  }
+  return bits.length > 0 ? `(${bits.join('; ')})` : null
 }
 
 /**
@@ -438,8 +485,10 @@ function authorLabel(m: AdvisoryMessage): string {
 
 function renderAdvisoryLine(m: AdvisoryMessage): string {
   const body = typeof m?.content === 'string' ? m.content.trim() : ''
-  if (!body) return ''
-  return `- **${authorLabel(m)}:** ${body}`
+  const social = formatSocialMeta(m)
+  if (!body && !social) return ''
+  const text = social ? (body ? `${body} ${social}` : social) : body
+  return `- **${authorLabel(m)}:** ${text}`
 }
 
 /**
@@ -612,7 +661,13 @@ export function renderDeclinedAttachments(
 }
 
 export function renderInjectedTurn(input: {
-  commands: Array<{ content?: unknown; addressed_to?: { label?: string; connection_id?: string }; author?: { name?: string } }>
+  commands: Array<{
+    content?: unknown
+    addressed_to?: { label?: string; connection_id?: string }
+    author?: { name?: string }
+    reply_to?: unknown
+    reactions?: unknown
+  }>
   context?: CarriedContext | null
   deliveryContract?: string | null
   declinedAttachments?: Array<{ filename: string; reason: string }>
@@ -657,7 +712,9 @@ export function renderInjectedTurn(input: {
   commands.forEach((cmd, i) => {
     const body =
       typeof cmd?.content === 'string' ? cmd.content : JSON.stringify(cmd?.content ?? cmd)
-    parts.push(commands.length > 1 ? `### ${i + 1}.\n${body}` : body)
+    const social = formatSocialMeta(cmd)
+    const block = social ? `${body}\n${social}` : body
+    parts.push(commands.length > 1 ? `### ${i + 1}.\n${block}` : block)
   })
 
   // After the commands, so the model has read what was asked before learning that

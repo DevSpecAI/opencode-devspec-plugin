@@ -22,6 +22,7 @@ import {
   createCarryBuffer,
   emptyTurnBackoffMs,
   errorBackoffMs,
+  formatSocialMeta,
   holdFor,
   isDeliverableCommand,
   pollTerminalReason,
@@ -208,6 +209,63 @@ describe('renderInjectedTurn — multiple commands in one delta', () => {
     assert.match(text, /### 1\.\nFirst do this/)
     assert.match(text, /### 2\.\nThen do that/)
     assert.ok(text.indexOf('First do this') < text.indexOf('Then do that'))
+  })
+})
+
+/**
+ * SOCIAL METADATA (item b6eff1a3). MCP now ships reply_to + reactions; inject hosts
+ * must surface them in the text the model actually reads — not leave them on the wire.
+ */
+describe('formatSocialMeta + renderInjectedTurn — reply_to and reactions', () => {
+  it('formats a reply parent and grouped reactions', () => {
+    const line = formatSocialMeta({
+      reply_to: { userName: 'Ali', content: 'What is the capital?' },
+      reactions: [
+        { emoji: '👍', userName: 'Ali' },
+        { emoji: '👍', userName: 'Brandon' },
+        { emoji: '🎉', userName: 'Ali' },
+      ],
+    })
+    assert.match(line, /in reply to Ali: “What is the capital\?”/)
+    assert.match(line, /reactions: 👍×2 🎉/)
+  })
+
+  it('returns null when neither field is present', () => {
+    assert.equal(formatSocialMeta({}), null)
+    assert.equal(formatSocialMeta({ reply_to: null, reactions: [] }), null)
+  })
+
+  it('surfaces reply_to and reactions on the command body', () => {
+    const text = renderInjectedTurn({
+      commands: [
+        ownerCommand({
+          content: 'Ship the fix',
+          reply_to: { userName: 'Ali', content: 'Can you fix reply visibility?' },
+          reactions: [{ emoji: '👀', userName: 'Ali' }],
+        }),
+      ],
+      context: null,
+    })
+    assert.match(text, /Ship the fix/)
+    assert.match(text, /in reply to Ali: “Can you fix reply visibility\?”/)
+    assert.match(text, /reactions: 👀/)
+  })
+
+  it('surfaces social fields on advisory room lines', () => {
+    const text = renderInjectedTurn({
+      commands: [ownerCommand()],
+      context: {
+        owner_ambient: [
+          advisory('Noted', {
+            reply_to: { userName: 'Brandon', content: 'Capitals clarification' },
+            reactions: [{ emoji: '✅', userName: 'Ali' }],
+          }),
+        ],
+        room_context: [],
+        dropped: 0,
+      },
+    })
+    assert.match(text, /Noted \(in reply to Brandon: “Capitals clarification”; reactions: ✅\)/)
   })
 })
 
