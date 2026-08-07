@@ -145,89 +145,15 @@ export const OPENCODE_SESSION_API_TIMEOUT_MS = 5_000
  */
 export const PRESENCE_GAP_WARN_MS = 60_000
 
+/** Minimum spacing between `presence_gap` stories for one connection. */
+export const PRESENCE_GAP_WARN_COOLDOWN_MS = 30_000
+
 /**
  * How many consecutive `active_tool` slides on the SAME assistant id are allowed
  * before we treat the turn as stalled. Eternal "running" tool parts otherwise
  * reset `busySince` forever and keep hammering keepalive while poll never runs.
  */
 export const MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES = 2
-
-/**
- * Client ceiling for OpenCode's OWN session API (`client.session.messages`).
- *
- * The SDK call is a localhost HTTP request with no timeout of its own, and the
- * pump is serial: a hung `session.messages` — the stall check's, or the
- * pre-inject baseline snapshot's — used to sit between the pump and the next
- * `poll_connection` indefinitely (item 875d75b5, live: Gentle Weasel / Crimson
- * Osprey both went silent mid-conversation and were ended with `idle_timeout`).
- * Nothing that reads the session is allowed to outlive this.
- */
-export const OPENCODE_SESSION_API_TIMEOUT_MS = 5_000
-
-/**
- * The server's own liveness window (`REMOTE_AGENT_LIVE_MS`), mirrored here for
- * LOG CONTEXT only — never as a client-side deadline. `report_keepalive` does
- * NOT refresh `last_seen`; only a heartbeat or a `poll_connection` arrival
- * does, so this is the budget the pump has between polls before the bond is
- * ended as idle.
- */
-export const SERVER_LIVE_WINDOW_HINT_MS = 90_000
-
-/** How long an attended connection may go without reaching `poll_connection` before we say so. */
-export const PRESENCE_GAP_WARN_MS = 60_000
-
-/** Minimum spacing between `presence_gap` stories for one connection. */
-export const PRESENCE_GAP_WARN_COOLDOWN_MS = 60_000
-
-/**
- * Only narrate a successful poll when the gap before it was unusually long.
- * A healthy pump polls every 25–30s (the hold length); logging each one would
- * bury the interesting lines under thousands of routine ones.
- */
-export const PRESENCE_POLL_STORY_GAP_MS = 45_000
-
-/** Thrown when an OpenCode session API call exceeded OPENCODE_SESSION_API_TIMEOUT_MS. */
-export class SessionApiTimeoutError extends Error {
-  readonly timeoutMs: number
-  constructor(call: string, timeoutMs: number) {
-    super(`OpenCode ${call} exceeded its ${timeoutMs}ms client timeout`)
-    this.name = 'SessionApiTimeoutError'
-    this.timeoutMs = timeoutMs
-  }
-}
-
-/**
- * `client.session.messages` with a hard client ceiling, normalised to a plain
- * array. Every read of the OpenCode session goes through here — see
- * OPENCODE_SESSION_API_TIMEOUT_MS for the failure this closes.
- *
- * The SDK is raced rather than only aborted: the abort signal is passed through
- * best-effort (older client generations ignore the options argument), but the
- * race is what guarantees the caller gets control back on time.
- */
-export async function sessionMessagesWithTimeout(
-  client: Parameters<Plugin>[0]['client'],
-  sessionId: string,
-  timeoutMs: number = OPENCODE_SESSION_API_TIMEOUT_MS,
-): Promise<any[]> {
-  let timer: ReturnType<typeof setTimeout> | null = null
-  const controller = new AbortController()
-  try {
-    const res: any = await Promise.race([
-      (client as any).session.messages({ path: { id: sessionId } }, { signal: controller.signal }),
-      new Promise((_resolve, reject) => {
-        timer = setTimeout(() => {
-          controller.abort()
-          reject(new SessionApiTimeoutError('session.messages', timeoutMs))
-        }, timeoutMs)
-        timer.unref?.()
-      }),
-    ])
-    return Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
 
 /**
  * Race a promise against a wall-clock ceiling. Used for OpenCode session API
@@ -446,18 +372,6 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
       stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
       stallActiveToolSlides: busy ? 0 : null,
-    })
-    // The busy transition IS the pickup/complete moment for story readers — both
-    // ends of a turn come from here, so neither can be missed at a call site.
-    logRemoteControlStory({
-      phase: busy ? 'pickup' : 'complete_turn',
-      outcome: busy ? 'busy' : 'idle',
-      connectionId: state.connectionId,
-      sessionId: state.sessionId,
-      agent: AGENT_NAME,
-      codename: state.codename,
-      tool: 'heartbeat_connection',
-      reason: busy ? 'inject_scheduled' : 'turn_finished',
     })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
@@ -1449,7 +1363,6 @@ const pumpStates = new Map<string, PumpState>()
 const lastSuccessfulPollAt = new Map<string, number>()
 /** Cooldown so presence_gap stories do not spam every tick. */
 const lastPresenceGapWarnedAt = new Map<string, number>()
-const PRESENCE_GAP_WARN_COOLDOWN_MS = 30_000
 
 function pumpStateFor(
   connectionId: string,
