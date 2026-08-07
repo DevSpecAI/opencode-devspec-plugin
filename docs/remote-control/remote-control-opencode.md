@@ -82,19 +82,30 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 
 ## Running tests after a remote-control change
 
-From the plugin root (`opencode-devspec-plugin`):
+### For coding agents
+
+After any change under `src/remote-control.ts`, `src/poll-turn.ts`, `src/mirror-chrome.ts`, `src/plugin.ts` (remote pump path), or the related `test/*.test.mjs` files:
+
+1. `cd` to the **plugin root** (`opencode-devspec-plugin` — the package that contains `package.json` with the `test` script).
+2. Run:
 
 ```bash
 npm test
 ```
 
-That builds (`tsc`) then runs `node --test test/*.test.mjs`, including:
+That is the only required command. It builds (`tsc`) then runs `node --test test/*.test.mjs`. There is no separate `test:remote-control` script. Expect a full green suite (no phone / live DevSpec bond needed).
+
+Do **not** ship a remote-control change without that suite passing. Prefer also reading this primer’s logging section before diagnosing “OpenCode left after I replied.”
+
+### What `npm test` covers (remote-control subset)
 
 - `test/presence-pump.test.mjs` — session API timeout, presence gap / ended stories, inject must not block a follow-up poll tick
 - `test/mcp-short-timeout.test.mjs` — hung MCP abort on the pump path
 - `test/poll-turn.test.mjs` / `test/busy-stall.test.mjs` — hold tiers, stall policy
 
-No phone or live DevSpec bond is required for CI. After `npm test` passes, fully quit and relaunch OpenCode so it loads the new `dist/`, then smell-test: attach → three short dispatches 30–60s apart → confirm no idle_timeout leave marker.
+### Optional live smell-test (after ship)
+
+Unit green is necessary but not the whole story for presence. After installing / loading a new `dist/`: fully quit and relaunch OpenCode, attach → three short dispatches 30–60s apart → confirm no `idle_timeout` leave marker.
 
 ## Logging — reconstructing a connection story
 

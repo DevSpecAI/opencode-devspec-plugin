@@ -51,6 +51,16 @@ Start OpenCode in a DevSpec-tracked repo and ask it to list your DevSpec action 
 - **Autopilot** — unattended queue processing via OpenCode's plugin hooks.
 - **Remote control** — attach this OpenCode session to a DevSpec session for phone/web control, delivered via OpenCode's own session-message API rather than a file-based workaround.
 
+## Developing this plugin (coding agents)
+
+Working on remote-control / presence / poll code in this repo? From the plugin root run:
+
+```bash
+npm test
+```
+
+That builds then runs the full unit suite (including presence-pump). Canonical detail — when to run it, what it covers, and the optional live smell-test — lives in [docs/remote-control/remote-control-opencode.md](docs/remote-control/remote-control-opencode.md#running-tests-after-a-remote-control-change).
+
 ## Status
 
 This package is under active development — see the parent DevSpec brief for the full list of in-progress pieces.
