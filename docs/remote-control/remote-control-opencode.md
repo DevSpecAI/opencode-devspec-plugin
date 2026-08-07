@@ -52,10 +52,17 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Cold-launch paint timestamp reused as server `created_at` for `local_agent_dispatch` — wire order must be insertion time (DevSpecV2 chat route); optimistic UI may keep paint time locally.
 - Mirroring the `/devspec.remote` connect turn (or NLP-guessing its narration as chrome) — connect skill replies are terminal-only; skipping them is by `command.executed` message id + handshake suppress (`shouldSkipConnectTurnMirror`), not by widening `isOperationalChrome`.
 
+## Presence vs Cursor (why OpenCode used to drop mid-conversation)
+
+Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbeats while the LLM works. OpenCode’s pump is **in-process** and used to `await` inject baseline (`session.messages`) + kickoff before returning to `poll_connection`. When that await hung or ran long, `last_seen` went stale and the server stamped `idle_timeout` (~90s) even though the bond still looked attached.
+
+**Fix (item 875d75b5):** after claiming delivery ids and `setBusy(true)`, inject runs via fire-and-forget `deliverInjectedTurn` so the presence loop re-enters `poll_connection` immediately. `checkBusyStall` is also off the critical path (async) and `session.messages` calls use `OPENCODE_SESSION_API_TIMEOUT_MS` (5s). Do **not** reintroduce awaiting inject before the next poll; do **not** treat `report_keepalive` as a substitute for `last_seen`.
+
 ## Failure modes
 
 - Double reply: mirror + model both post the same answer.
 - Stall: busy with **no observable progress** for the stall timeout (empty reply text *and* no new assistant step *and* no in-flight tool). Active tool loops slide the timer — text-only emptiness is not enough to stall (Tembo / Racing Heron false positives). See `decideBusyStall` / `checkBusyStall` and `poll.log`.
+- **Presence starve → idle_timeout** (sessions Gentle Weasel / Crimson Osprey, 2026-08-07): poll never reached within ~90s after pickup or after a healthy turn. Look for client story `pickup` → silence → `ended`/`idle_timeout` with large `last_poll_age_ms`, or `poll_error`/`presence_gap`. Guard: fire-and-forget inject + non-blocking stall + session API timeouts.
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
 - Connect + attach lands, status banner prints, owner command never injects: pre-adopt package consumed as seed / cursor advanced past unanswered commands (sessions `1383cbb8`, `23da0643`). **Guard:** after `adopt.changed`, always re-poll with `cursor:null` + `catch_up` (`adoptRequiresNullCursorRepoll`); never fall through. Server: do not backdate `local_agent_dispatch` `created_at` to the optimistic paint time; honour `catch_up` in packaging.
@@ -65,13 +72,29 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 
 ## Key files
 
-- `src/remote-control.ts` — poll loop, inject, mirror, busy; `recordRemoteControlSkillCommand`
+- `src/remote-control.ts` — poll loop, inject, mirror, busy; `recordRemoteControlSkillCommand`; `deliverInjectedTurn`; presence gap / ended stories
 - `src/poll-turn.ts` — pure command gate + `renderInjectedTurn` + `unansweredCommands` + `shouldAdvanceMessageCursor`
 - `src/mirror-chrome.ts` — fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` (shared by mirror + seed-window filtering)
 - `src/plugin.ts` — long-poll pump + `command.executed` → skip-mirror ids
 - `src/agent-identity.ts` — `AGENT_NAME = 'OpenCode'`
 - `commands/devspec.remote.md`
 - `~/.devspec/opencode-remote-control/poll.log` — local diagnostics (human lines + structured `story {…}` JSON)
+
+## Running tests after a remote-control change
+
+From the plugin root (`opencode-devspec-plugin`):
+
+```bash
+npm test
+```
+
+That builds (`tsc`) then runs `node --test test/*.test.mjs`, including:
+
+- `test/presence-pump.test.mjs` — session API timeout, presence gap / ended stories, inject must not block a follow-up poll tick
+- `test/mcp-short-timeout.test.mjs` — hung MCP abort on the pump path
+- `test/poll-turn.test.mjs` / `test/busy-stall.test.mjs` — hold tiers, stall policy
+
+No phone or live DevSpec bond is required for CI. After `npm test` passes, fully quit and relaunch OpenCode so it loads the new `dist/`, then smell-test: attach → three short dispatches 30–60s apart → confirm no idle_timeout leave marker.
 
 ## Logging — reconstructing a connection story
 
@@ -84,9 +107,37 @@ Fragile remote sessions are debugged from two places that share one phase vocabu
 
 **Shared phases:** `register` · `attach` · `seed_filter` · `inject` · `wake` · `mirror_decision` · `mirror_post` · `complete_turn` · `pickup` · `done` · `poll_error` · `stall` · `ended`
 
-OpenCode emits client-side stories at seed filter, inject, advisory wake, mirror skip/post, poll errors, and stall timeout. The server emits the same vocabulary from MCP tools after staging deploy of the breadcrumbs change.
+OpenCode client stories also cover: `inject`/`queued` then `inject`/`kicked`, `pickup`/`started`, `complete_turn`/`cleared`, `poll_error`/`presence_gap` (starve warning), and `ended` with `last_poll_age_ms` + `end_reason` class (`idle_timeout` vs `ui` / `local_stop`).
 
-**Axiom recipe** (dataset `devspec`):
+### “OpenCode left right after I replied” — Axiom recipe
+
+```
+['devspec']
+| where _time > ago(2h)
+| where connectionId == "<connection-uuid>"
+| where msg == "Remote-control story" or ['message'] contains "Remote-control story" or isnotnull(reason)
+| sort by _time asc
+| project _time, reason, ['message'], data, sessionId
+```
+
+Or filter local `poll.log`:
+
+```
+story {"phase":"pickup"...}
+story {"phase":"inject","outcome":"queued"...}
+story {"phase":"inject","outcome":"kicked"...}
+story {"outcome":"presence_gap"...}   # starve before server idle_timeout
+story {"phase":"ended","reason":"idle_timeout","last_poll_age_ms":...}
+```
+
+| Pattern | Meaning |
+|---|---|
+| `pickup` then long silence then `ended`/`idle_timeout` + large `last_poll_age_ms` | Presence starved after hearing the command |
+| Continuous polls, then `ended`/`ui` | Real detach / UI End |
+| `inject`/`queued` never `kicked` | Inject never reached OpenCode `promptAsync` |
+| No inject row for a dispatch | Poll already dead before the message landed |
+
+**Axiom recipe** (dataset `devspec`) for a full connection timeline:
 
 ```
 ['devspec']

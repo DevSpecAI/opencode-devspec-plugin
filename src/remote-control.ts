@@ -132,11 +132,129 @@ export const MCP_SHORT_CALL_TIMEOUT_MS = 10_000
 export const MCP_HEARTBEAT_TIMEOUT_MS = 5_000
 
 /**
+ * Ceiling for OpenCode `session.messages` on the pump / stall / inject-baseline
+ * paths. A hung SDK call ahead of the next `poll_connection` freezes `last_seen`
+ * the same way hung MCP did (item 875d75b5 — Crimson Osprey / Gentle Weasel).
+ */
+export const OPENCODE_SESSION_API_TIMEOUT_MS = 5_000
+
+/**
+ * Warn (story `presence_gap`) when this many ms pass without a successful
+ * `poll_connection` while the bond is still supposed to look live. Server
+ * attached liveness is ~90s — warn before that so Axiom shows the starve.
+ */
+export const PRESENCE_GAP_WARN_MS = 60_000
+
+/**
  * How many consecutive `active_tool` slides on the SAME assistant id are allowed
  * before we treat the turn as stalled. Eternal "running" tool parts otherwise
  * reset `busySince` forever and keep hammering keepalive while poll never runs.
  */
 export const MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES = 2
+
+/**
+ * Client ceiling for OpenCode's OWN session API (`client.session.messages`).
+ *
+ * The SDK call is a localhost HTTP request with no timeout of its own, and the
+ * pump is serial: a hung `session.messages` — the stall check's, or the
+ * pre-inject baseline snapshot's — used to sit between the pump and the next
+ * `poll_connection` indefinitely (item 875d75b5, live: Gentle Weasel / Crimson
+ * Osprey both went silent mid-conversation and were ended with `idle_timeout`).
+ * Nothing that reads the session is allowed to outlive this.
+ */
+export const OPENCODE_SESSION_API_TIMEOUT_MS = 5_000
+
+/**
+ * The server's own liveness window (`REMOTE_AGENT_LIVE_MS`), mirrored here for
+ * LOG CONTEXT only — never as a client-side deadline. `report_keepalive` does
+ * NOT refresh `last_seen`; only a heartbeat or a `poll_connection` arrival
+ * does, so this is the budget the pump has between polls before the bond is
+ * ended as idle.
+ */
+export const SERVER_LIVE_WINDOW_HINT_MS = 90_000
+
+/** How long an attended connection may go without reaching `poll_connection` before we say so. */
+export const PRESENCE_GAP_WARN_MS = 60_000
+
+/** Minimum spacing between `presence_gap` stories for one connection. */
+export const PRESENCE_GAP_WARN_COOLDOWN_MS = 60_000
+
+/**
+ * Only narrate a successful poll when the gap before it was unusually long.
+ * A healthy pump polls every 25–30s (the hold length); logging each one would
+ * bury the interesting lines under thousands of routine ones.
+ */
+export const PRESENCE_POLL_STORY_GAP_MS = 45_000
+
+/** Thrown when an OpenCode session API call exceeded OPENCODE_SESSION_API_TIMEOUT_MS. */
+export class SessionApiTimeoutError extends Error {
+  readonly timeoutMs: number
+  constructor(call: string, timeoutMs: number) {
+    super(`OpenCode ${call} exceeded its ${timeoutMs}ms client timeout`)
+    this.name = 'SessionApiTimeoutError'
+    this.timeoutMs = timeoutMs
+  }
+}
+
+/**
+ * `client.session.messages` with a hard client ceiling, normalised to a plain
+ * array. Every read of the OpenCode session goes through here — see
+ * OPENCODE_SESSION_API_TIMEOUT_MS for the failure this closes.
+ *
+ * The SDK is raced rather than only aborted: the abort signal is passed through
+ * best-effort (older client generations ignore the options argument), but the
+ * race is what guarantees the caller gets control back on time.
+ */
+export async function sessionMessagesWithTimeout(
+  client: Parameters<Plugin>[0]['client'],
+  sessionId: string,
+  timeoutMs: number = OPENCODE_SESSION_API_TIMEOUT_MS,
+): Promise<any[]> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const controller = new AbortController()
+  try {
+    const res: any = await Promise.race([
+      (client as any).session.messages({ path: { id: sessionId } }, { signal: controller.signal }),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => {
+          controller.abort()
+          reject(new SessionApiTimeoutError('session.messages', timeoutMs))
+        }, timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+    return Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
+ * Race a promise against a wall-clock ceiling. Used for OpenCode session API
+ * calls that have no built-in timeout.
+ */
+export function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    t.unref?.()
+    promise.then(
+      (v) => {
+        clearTimeout(t)
+        resolve(v)
+      },
+      (err) => {
+        clearTimeout(t)
+        reject(err)
+      },
+    )
+  })
+}
 
 interface ConnectionState {
   connectionId: string
@@ -329,12 +447,39 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
       stallActiveToolSlides: busy ? 0 : null,
     })
+    // The busy transition IS the pickup/complete moment for story readers — both
+    // ends of a turn come from here, so neither can be missed at a call site.
+    logRemoteControlStory({
+      phase: busy ? 'pickup' : 'complete_turn',
+      outcome: busy ? 'busy' : 'idle',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'heartbeat_connection',
+      reason: busy ? 'inject_scheduled' : 'turn_finished',
+    })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
     logPoll(`setBusy(${busy}) heartbeat_connection call failed: ${err}`)
     return
   }
   await reportActivity(directory, busy ? 'pickup' : 'complete')
+  if (!busy) {
+    const after = readState(directory)
+    if (after) {
+      logRemoteControlStory({
+        phase: 'complete_turn',
+        outcome: 'cleared',
+        connectionId: after.connectionId,
+        sessionId: after.sessionId,
+        agent: AGENT_NAME,
+        codename: after.codename,
+        tool: 'setBusy',
+        reason: 'busy_false',
+      })
+    }
+  }
 }
 
 export function assistantTextFromMessage(message: { parts?: unknown } | null | undefined): string {
@@ -593,7 +738,11 @@ export async function checkBusyStall(
 
   let messages: any[]
   try {
-    const res: any = await (client as any).session.messages({ path: { id: sessionId } })
+    const res: any = await withTimeout(
+      (client as any).session.messages({ path: { id: sessionId } }),
+      OPENCODE_SESSION_API_TIMEOUT_MS,
+      'session.messages(stall)',
+    )
     messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
   } catch (err) {
     logPoll(`stall check: client.session.messages failed: ${err}`)
@@ -1296,6 +1445,12 @@ interface PumpState {
 
 const pumpStates = new Map<string, PumpState>()
 
+/** Epoch ms of last successful `poll_connection` per connection (presence breadcrumb). */
+const lastSuccessfulPollAt = new Map<string, number>()
+/** Cooldown so presence_gap stories do not spam every tick. */
+const lastPresenceGapWarnedAt = new Map<string, number>()
+const PRESENCE_GAP_WARN_COOLDOWN_MS = 30_000
+
 function pumpStateFor(
   connectionId: string,
   persisted: { cursor: string | null; dispatchIds: string[] },
@@ -1325,6 +1480,85 @@ function pumpStateFor(
 /** Drop pump state for a connection (teardown / stop). */
 export function forgetPumpState(connectionId: string): void {
   pumpStates.delete(connectionId)
+  lastSuccessfulPollAt.delete(connectionId)
+  lastPresenceGapWarnedAt.delete(connectionId)
+}
+
+/** Test/helpers: last successful poll timestamp for a connection, or null. */
+export function getLastSuccessfulPollAt(connectionId: string): number | null {
+  return lastSuccessfulPollAt.get(connectionId) ?? null
+}
+
+export function recordSuccessfulPoll(connectionId: string, at: number = Date.now()): void {
+  lastSuccessfulPollAt.set(connectionId, at)
+}
+
+/**
+ * Emit a presence_gap story when the pump has gone too long without a successful
+ * poll while the bond should still look live. Returns true if a warning was logged.
+ */
+export function maybeWarnPresenceGap(input: {
+  connectionId: string
+  sessionId?: string | null
+  codename?: string | null
+  busy?: boolean
+  now?: number
+  gapWarnMs?: number
+}): boolean {
+  const now = input.now ?? Date.now()
+  const last = lastSuccessfulPollAt.get(input.connectionId)
+  if (last == null) return false
+  const age = now - last
+  const gapMs = input.gapWarnMs ?? PRESENCE_GAP_WARN_MS
+  if (age < gapMs) return false
+  const prevWarn = lastPresenceGapWarnedAt.get(input.connectionId) ?? 0
+  if (now - prevWarn < PRESENCE_GAP_WARN_COOLDOWN_MS) return false
+  lastPresenceGapWarnedAt.set(input.connectionId, now)
+  logRemoteControlStory({
+    phase: 'poll_error',
+    outcome: 'presence_gap',
+    reason: input.busy ? 'no_poll_since_pickup' : 'no_poll_while_attached',
+    connectionId: input.connectionId,
+    sessionId: input.sessionId ?? null,
+    agent: AGENT_NAME,
+    codename: input.codename ?? null,
+    tool: 'poll_connection',
+    data: {
+      last_poll_age_ms: age,
+      busy: input.busy === true,
+      gap_warn_ms: gapMs,
+    },
+  })
+  return true
+}
+
+export function logConnectionEndedStory(input: {
+  connectionId: string
+  sessionId?: string | null
+  codename?: string | null
+  endReason: string
+  via: string
+  busy?: boolean
+  now?: number
+}): void {
+  const now = input.now ?? Date.now()
+  const last = lastSuccessfulPollAt.get(input.connectionId)
+  const lastPollAgeMs = last != null ? now - last : null
+  logRemoteControlStory({
+    phase: 'ended',
+    outcome: 'server_ended',
+    reason: input.endReason,
+    connectionId: input.connectionId,
+    sessionId: input.sessionId ?? null,
+    agent: AGENT_NAME,
+    codename: input.codename ?? null,
+    tool: 'poll_connection',
+    data: {
+      last_poll_age_ms: lastPollAgeMs,
+      busy: input.busy === true,
+      via: input.via,
+    },
+  })
 }
 
 /**
@@ -1418,13 +1652,28 @@ export async function pollAndDeliver(
   const turnActive = state.busy === true
   const hold = holdFor({ attached: !!state.sessionId, turnActive })
 
-  // While a turn genuinely runs, keep the activity lease alive and let the stall
-  // detector clear a hung turn. Unchanged from the interval version, except the cadence
-  // is now the hold length rather than 8s.
+  // While a turn genuinely runs, keep the activity lease alive. Stall detection
+  // must NOT sit on the critical path ahead of poll_connection — a hung
+  // session.messages call there freezes last_seen until idle_timeout (875d75b5).
   if (turnActive) {
     await reportActivity(directory, 'keepalive')
-    await checkBusyStall(client, directory, sessionId)
+    void checkBusyStall(client, directory, sessionId).catch((err) => {
+      logPoll(`checkBusyStall (async) failed: ${err}`)
+    })
+    maybeWarnPresenceGap({
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      codename: state.codename,
+      busy: true,
+    })
     state = readState(directory) ?? state
+  } else if (state.sessionId) {
+    maybeWarnPresenceGap({
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      codename: state.codename,
+      busy: false,
+    })
   }
 
   let res: any
@@ -1449,6 +1698,7 @@ export async function pollAndDeliver(
       signal: opts.signal,
     })
     pump.consecutiveErrors = 0
+    recordSuccessfulPoll(state.connectionId)
   } catch (err) {
     if (err instanceof McpTimeoutError) {
       // The hold outlived its client ceiling. That is not an error — it means nothing
@@ -1503,6 +1753,14 @@ export async function pollAndDeliver(
       `${terminal.status} (${label}) — still gone after ${RECOVERABLE_TERMINAL_MAX} tries; ` +
         `stopping the pump. This was NOT a UI end — re-register the same bond to resume.`,
     )
+    logConnectionEndedStory({
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      codename: state.codename,
+      endReason: label,
+      via: 'recoverable_exhausted',
+      busy: state.busy === true,
+    })
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
     return { delayMs: 0, stop: true, reason: terminal.reason ?? 'server_ended' }
@@ -1511,6 +1769,14 @@ export async function pollAndDeliver(
     // A deliberate human end ('ui' / 'local_stop'). This one must stick.
     const reason = terminal.reason ?? 'ended_from_ui'
     logPoll(`connection ended (${reason}) — stopping the pump; do not restart`)
+    logConnectionEndedStory({
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      codename: state.codename,
+      endReason: reason,
+      via: 'deliberate_end',
+      busy: state.busy === true,
+    })
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
     return { delayMs: 0, stop: true, reason }
@@ -1780,7 +2046,7 @@ export async function pollAndDeliver(
   )
   logRemoteControlStory({
     phase: 'inject',
-    outcome: 'injected',
+    outcome: 'queued',
     connectionId: state.connectionId,
     sessionId: state.sessionId,
     agent: AGENT_NAME,
@@ -1802,9 +2068,52 @@ export async function pollAndDeliver(
       ? { providerID: rawModel.providerID, modelID: rawModel.modelID }
       : undefined
 
+  // Assert busy BEFORE returning to the pump so the next poll_connection re-asserts
+  // busy:true. Inject (baseline + promptAsync + mirror) must NOT block presence —
+  // awaiting session.messages / kickoff here was starving last_seen (875d75b5).
   await setBusy(directory, true)
-  // setBusy already patchState'd busy — re-read so we don't spread a pre-await snapshot later.
-  state = readState(directory) ?? { ...state, busy: true }
+  logRemoteControlStory({
+    phase: 'pickup',
+    outcome: 'started',
+    connectionId: state.connectionId,
+    sessionId: state.sessionId,
+    agent: AGENT_NAME,
+    codename: state.codename,
+    tool: 'setBusy',
+    reason: 'inject_turn',
+  })
+
+  void deliverInjectedTurn({
+    client,
+    directory,
+    sessionId,
+    auth,
+    text,
+    fileParts,
+    model,
+  }).catch((err) => {
+    logPoll(`deliverInjectedTurn failed: ${err}`)
+  })
+
+  return { delayMs: 0, stop: false }
+}
+
+/**
+ * Kick off an injected owner turn without blocking the presence pump.
+ * Presence (`poll_connection`) must keep updating `last_seen` while this runs.
+ */
+export async function deliverInjectedTurn(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  sessionId: string
+  auth: { ok: boolean; token?: string; mcp_url?: string }
+  text: string
+  fileParts: unknown[]
+  model?: { providerID: string; modelID: string }
+}): Promise<void> {
+  const { client, directory, sessionId, auth, text, fileParts, model } = input
+  let state = readState(directory)
+  if (!state) return
 
   try {
     // Baseline: only mirror assistant messages that appear AFTER the last one present at
@@ -1813,7 +2122,11 @@ export async function pollAndDeliver(
     let replyAfter: string | null = null
     let baselineCaptured = false
     try {
-      const snap: any = await (client as any).session.messages({ path: { id: sessionId } })
+      const snap: any = await withTimeout(
+        (client as any).session.messages({ path: { id: sessionId } }),
+        OPENCODE_SESSION_API_TIMEOUT_MS,
+        'session.messages(inject-baseline)',
+      )
       const msgs = Array.isArray(snap?.data) ? snap.data : Array.isArray(snap) ? snap : []
       const assistants = msgs.filter((m: any) => m?.info?.role === 'assistant')
       replyAfter = assistants[assistants.length - 1]?.info?.id ?? null
@@ -1841,10 +2154,20 @@ export async function pollAndDeliver(
         ...(model ? { model } : {}),
       },
     })
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'kicked',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'promptAsync',
+      reason: 'owner_commands',
+    })
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     const freshForNotice = readState(directory) ?? state
-    if (freshForNotice.sessionId) {
+    if (freshForNotice.sessionId && auth.ok && auth.token && auth.mcp_url) {
       await mcpToolsCall({
         mcpUrl: auth.mcp_url,
         token: auth.token,
@@ -1863,18 +2186,17 @@ export async function pollAndDeliver(
     }
     // No turn is actually running, so clear the busy we just asserted.
     await setBusy(directory, false)
-    state =
-      patchState(directory, {
-        awaitingRemoteReply: false,
-        replyAfterOpenCodeMessageId: null,
-        replyBaselineCaptured: undefined,
-      }) ?? state
+    patchState(directory, {
+      awaitingRemoteReply: false,
+      replyAfterOpenCodeMessageId: null,
+      replyBaselineCaptured: undefined,
+    })
+    return
   }
 
   // Prefer the guarded path — session.idle / message.updated own the real flush;
   // this is a best-effort nudge that must not race a bare concurrent mirror.
   await mirrorNow(client, directory, sessionId)
-  return { delayMs: 0, stop: false }
 }
 
 /**
