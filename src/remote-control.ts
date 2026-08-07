@@ -106,11 +106,11 @@ export function logPoll(line: string): void {
 }
 
 /**
- * How long a turn may stay `busy` with an empty (no-text) latest assistant
- * message before we treat it as stalled. Real gap found live-testing: a
- * turn reported pickup, stayed busy for minutes with `has no text yet`,
- * then reported complete without ever mirroring a reply — owners saw
- * "working…" forever and had to dig into poll.log. Override via
+ * How long a turn may stay `busy` with no observable progress before we
+ * treat it as stalled. Progress means reply text, a new assistant message,
+ * or an in-flight tool on the latest assistant — not merely "busy wall-clock
+ * with empty text" (Tembo / Racing Heron false stalls: MiniMax tool loops
+ * spent minutes with no mirrorable text while still working). Override via
  * DEVSPEC_OPENCODE_STALL_MS (milliseconds).
  */
 export const STALL_TIMEOUT_MS = (() => {
@@ -191,6 +191,13 @@ interface ConnectionState {
    * busy somehow fails.
    */
   stallWarnedAt?: number | null
+  /**
+   * Latest OpenCode assistant message id observed while evaluating stall
+   * progress. When a newer assistant appears (even tool-only / empty text),
+   * checkBusyStall slides `busySince` forward so a healthy multi-step turn
+   * does not trip on wall-clock alone.
+   */
+  stallProgressAssistantId?: string | null
   /**
    * Bounded list of OpenCode assistant message ids already mirrored to
    * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
@@ -293,6 +300,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       busy,
       busySince: busy ? Date.now() : null,
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
+      stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
     })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
@@ -302,13 +310,70 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
   await reportActivity(directory, busy ? 'pickup' : 'complete')
 }
 
-function assistantTextFromMessage(message: { parts?: unknown } | null | undefined): string {
+export function assistantTextFromMessage(message: { parts?: unknown } | null | undefined): string {
   const parts = Array.isArray(message?.parts) ? message.parts : []
   return parts
     .filter((p: any) => p?.type === 'text' && typeof p.text === 'string')
     .map((p: any) => p.text)
     .join('\n')
     .trim()
+}
+
+/**
+ * True when the latest assistant message still has an in-flight tool
+ * (pending / running). Completed tools alone are not progress — the turn
+ * may be wedged between steps with an empty completed tool message.
+ */
+export function messageHasActiveToolWork(message: { parts?: unknown } | null | undefined): boolean {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue
+    const part = p as Record<string, unknown>
+    if (part.type !== 'tool') continue
+    const state = part.state
+    if (!state || typeof state !== 'object') continue
+    const status = String((state as Record<string, unknown>).status ?? '').toLowerCase()
+    if (status === 'pending' || status === 'running') return true
+  }
+  return false
+}
+
+export type BusyStallDecision =
+  | { action: 'under_timeout' }
+  | { action: 'has_text' }
+  | { action: 'slide'; reason: 'active_tool' | 'new_assistant'; assistantId: string | null }
+  | { action: 'stall'; assistantId: string | null }
+
+/**
+ * Pure stall policy (unit-tested). Call only after `elapsedMs >= timeoutMs`
+ * except the early `under_timeout` branch used by callers that still gate
+ * on wall-clock first.
+ */
+export function decideBusyStall(input: {
+  elapsedMs: number
+  timeoutMs: number
+  lastAssistant: { info?: { id?: string }; parts?: unknown } | null | undefined
+  previousProgressAssistantId?: string | null
+}): BusyStallDecision {
+  if (input.elapsedMs < input.timeoutMs) return { action: 'under_timeout' }
+
+  const lastId =
+    typeof input.lastAssistant?.info?.id === 'string' && input.lastAssistant.info.id.length > 0
+      ? input.lastAssistant.info.id
+      : null
+
+  if (assistantTextFromMessage(input.lastAssistant)) return { action: 'has_text' }
+
+  if (messageHasActiveToolWork(input.lastAssistant)) {
+    return { action: 'slide', reason: 'active_tool', assistantId: lastId }
+  }
+
+  const prev = input.previousProgressAssistantId ?? null
+  if (lastId && lastId !== prev) {
+    return { action: 'slide', reason: 'new_assistant', assistantId: lastId }
+  }
+
+  return { action: 'stall', assistantId: lastId }
 }
 
 /** Normalize reply text before hashing so trivial whitespace drift cannot bypass dedup. */
@@ -459,9 +524,10 @@ async function postSessionNotice(
 }
 
 /**
- * If we've been busy longer than STALL_TIMEOUT_MS and the latest OpenCode
- * assistant message still has no text, clear busy and warn in the DevSpec
- * session. Called every poll while busy — cheap when under the timeout.
+ * If we've been busy longer than STALL_TIMEOUT_MS with no observable progress
+ * (no reply text, no new assistant step, no in-flight tool), clear busy and
+ * warn in the DevSpec session. Healthy tool-heavy turns slide `busySince`
+ * instead of false-stalling. Called every poll while busy.
  */
 export async function checkBusyStall(
   client: Parameters<Plugin>[0]['client'],
@@ -497,13 +563,33 @@ export async function checkBusyStall(
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
   const last = assistantMessages[assistantMessages.length - 1]
-  const text = assistantTextFromMessage(last)
-  if (text) {
+  const decision = decideBusyStall({
+    elapsedMs: elapsed,
+    timeoutMs: STALL_TIMEOUT_MS,
+    lastAssistant: last,
+    previousProgressAssistantId: state.stallProgressAssistantId,
+  })
+
+  if (decision.action === 'has_text') {
     logPoll(
       `stall check: busy ${elapsed}ms but last assistant (${last?.info?.id}) has text — not a stall`,
     )
     return
   }
+
+  if (decision.action === 'slide') {
+    const now = Date.now()
+    patchState(directory, {
+      busySince: now,
+      stallProgressAssistantId: decision.assistantId,
+    })
+    logPoll(
+      `stall check: progress (${decision.reason}) on ${decision.assistantId ?? 'none'} — slid busySince after ${elapsed}ms`,
+    )
+    return
+  }
+
+  if (decision.action !== 'stall') return
 
   if (state.stallWarnedAt === state.busySince) {
     logPoll(`stall check: already warned for busySince=${state.busySince} — clearing busy again`)
@@ -511,9 +597,9 @@ export async function checkBusyStall(
     return
   }
 
-  const lastId = last?.info?.id ?? 'none'
+  const lastId = decision.assistantId ?? 'none'
   logPoll(
-    `STALL: busy ${elapsed}ms with empty assistant text (last.id=${lastId}) — clearing busy and posting warning`,
+    `STALL: busy ${elapsed}ms with no progress (last.id=${lastId}) — clearing busy and posting warning`,
   )
   logRemoteControlStory({
     phase: 'stall',
