@@ -121,4 +121,44 @@ describe('decideBusyStall', () => {
     assert.equal(d.action, 'stall')
     assert.equal(d.assistantId, null)
   })
+
+  it('still slides active_tool on the same assistant before the slide cap', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [{ type: 'tool', state: { status: 'running' } }]),
+      previousProgressAssistantId: 'm1',
+      sameAssistantActiveToolSlides: 1,
+      maxActiveToolSlides: 2,
+    })
+    assert.equal(d.action, 'slide')
+    assert.equal(d.reason, 'active_tool')
+  })
+
+  it('stalls when the same assistant active_tool has already slid to the cap', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [{ type: 'tool', state: { status: 'running' } }]),
+      previousProgressAssistantId: 'm1',
+      sameAssistantActiveToolSlides: 2,
+      maxActiveToolSlides: 2,
+    })
+    assert.equal(d.action, 'stall')
+    assert.equal(d.assistantId, 'm1')
+  })
+
+  it('resets the active_tool slide budget when the assistant id changes', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m2', [{ type: 'tool', state: { status: 'running' } }]),
+      previousProgressAssistantId: 'm1',
+      sameAssistantActiveToolSlides: 2,
+      maxActiveToolSlides: 2,
+    })
+    assert.equal(d.action, 'slide')
+    assert.equal(d.reason, 'active_tool')
+    assert.equal(d.assistantId, 'm2')
+  })
 })

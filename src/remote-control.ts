@@ -119,6 +119,25 @@ export const STALL_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 120_000
 })()
 
+/**
+ * Client ceiling for ordinary (non-long-poll) MCP calls on the pump path.
+ * `fetch` has no default timeout — a hung keepalive / heartbeat / notice ahead
+ * of the next `poll_connection` freezes `last_seen` while the connection still
+ * looks attached, and the server eventually ends it with `idle_timeout`
+ * (Climbing Koala / Steady Wolf). Matches Claude poller's activity-verb ceiling.
+ */
+export const MCP_SHORT_CALL_TIMEOUT_MS = 10_000
+
+/** Tighter ceiling for heartbeat_connection / detach — same as Claude's teardown heartbeats. */
+export const MCP_HEARTBEAT_TIMEOUT_MS = 5_000
+
+/**
+ * How many consecutive `active_tool` slides on the SAME assistant id are allowed
+ * before we treat the turn as stalled. Eternal "running" tool parts otherwise
+ * reset `busySince` forever and keep hammering keepalive while poll never runs.
+ */
+export const MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES = 2
+
 interface ConnectionState {
   connectionId: string
   sessionId: string | null
@@ -199,6 +218,11 @@ interface ConnectionState {
    */
   stallProgressAssistantId?: string | null
   /**
+   * Consecutive `active_tool` slides already granted for `stallProgressAssistantId`.
+   * Reset when busy clears or progress is a new assistant / different reason.
+   */
+  stallActiveToolSlides?: number | null
+  /**
    * Bounded list of OpenCode assistant message ids already mirrored to
    * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
    * pointer only stops re-posting the SAME message twice in a row). Real
@@ -260,9 +284,10 @@ async function reportActivity(directory: string, verb: 'pickup' | 'keepalive' | 
       token: auth.token,
       name: tool,
       arguments: { connection_id: state.connectionId },
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
   } catch (err) {
-    // Best-effort — never break the poll loop over this.
+    // Best-effort — never break the poll loop over this (incl. client timeout).
     logPoll(`reportActivity(${verb}) failed: ${err}`)
   }
 }
@@ -293,6 +318,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       // Re-assert the fixed agent identity on every heartbeat, like the Claude
       // poller — the connection can never mislabel itself from a stale state file.
       arguments: { connection_id: state.connectionId, agent_name: AGENT_NAME, status: 'live', busy },
+      timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
     })
     // patchState re-reads disk — never spread a stale snapshot here (see
     // patchState's doc: that lost-update duplicated mirrored replies).
@@ -301,6 +327,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       busySince: busy ? Date.now() : null,
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
       stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
+      stallActiveToolSlides: busy ? 0 : null,
     })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
@@ -354,6 +381,9 @@ export function decideBusyStall(input: {
   timeoutMs: number
   lastAssistant: { info?: { id?: string }; parts?: unknown } | null | undefined
   previousProgressAssistantId?: string | null
+  /** Slides already granted for the current `previousProgressAssistantId` via active_tool. */
+  sameAssistantActiveToolSlides?: number
+  maxActiveToolSlides?: number
 }): BusyStallDecision {
   if (input.elapsedMs < input.timeoutMs) return { action: 'under_timeout' }
 
@@ -365,6 +395,14 @@ export function decideBusyStall(input: {
   if (assistantTextFromMessage(input.lastAssistant)) return { action: 'has_text' }
 
   if (messageHasActiveToolWork(input.lastAssistant)) {
+    const prev = input.previousProgressAssistantId ?? null
+    const slides = input.sameAssistantActiveToolSlides ?? 0
+    const max = input.maxActiveToolSlides ?? MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES
+    // Same stuck "running" tool forever is not progress — cap slides so keepalive
+    // cannot starve poll_connection until the server idle_timeouts the bond.
+    if (lastId && lastId === prev && slides >= max) {
+      return { action: 'stall', assistantId: lastId }
+    }
     return { action: 'slide', reason: 'active_tool', assistantId: lastId }
   }
 
@@ -517,6 +555,7 @@ async function postSessionNotice(
       token: auth.token,
       name: 'post_session_message',
       arguments: postMessageArgs(state, message, { turn_kind: 'agent' }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
   } catch (err) {
     logPoll(`postSessionNotice failed: ${err}`)
@@ -568,6 +607,8 @@ export async function checkBusyStall(
     timeoutMs: STALL_TIMEOUT_MS,
     lastAssistant: last,
     previousProgressAssistantId: state.stallProgressAssistantId,
+    sameAssistantActiveToolSlides: state.stallActiveToolSlides ?? 0,
+    maxActiveToolSlides: MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES,
   })
 
   if (decision.action === 'has_text') {
@@ -579,12 +620,19 @@ export async function checkBusyStall(
 
   if (decision.action === 'slide') {
     const now = Date.now()
+    const sameAssistant =
+      decision.reason === 'active_tool' &&
+      decision.assistantId != null &&
+      decision.assistantId === (state.stallProgressAssistantId ?? null)
+    const nextSlides = decision.reason === 'active_tool' ? (sameAssistant ? (state.stallActiveToolSlides ?? 0) + 1 : 1) : 0
     patchState(directory, {
       busySince: now,
       stallProgressAssistantId: decision.assistantId,
+      stallActiveToolSlides: nextSlides,
     })
     logPoll(
-      `stall check: progress (${decision.reason}) on ${decision.assistantId ?? 'none'} — slid busySince after ${elapsed}ms`,
+      `stall check: progress (${decision.reason}) on ${decision.assistantId ?? 'none'} — slid busySince after ${elapsed}ms` +
+        (decision.reason === 'active_tool' ? ` (active_tool slides=${nextSlides})` : ''),
     )
     return
   }
@@ -1124,6 +1172,7 @@ export async function ensureConnection(
     token: auth.token,
     name: 'register_connection',
     arguments: { local_id: localId, agent_name: AGENT_NAME, cwd: directory },
+    timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
   })
 
   const state: ConnectionState = {
@@ -1144,6 +1193,7 @@ export async function attachSession(directory: string, sessionId: string): Promi
     token: auth.token,
     name: 'attach_connection',
     arguments: { connection_id: state.connectionId, session_id: sessionId },
+    timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
   })
   const canonicalSessionId =
     typeof result?.session_id === 'string' ? result.session_id : sessionId
@@ -1168,6 +1218,7 @@ export async function stopConnection(directory: string): Promise<void> {
       token: auth.token,
       name: 'detach_connection',
       arguments: { connection_id: state.connectionId },
+      timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
     })
   } finally {
     clearState(directory)
@@ -1214,6 +1265,7 @@ async function reportPollError(
     arguments: postMessageArgs(state, `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`, {
       turn_kind: 'agent',
     }),
+    timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
   }).catch(() => {
     // Best-effort — a failed error-report must never crash the poll loop.
   })
@@ -1804,6 +1856,7 @@ export async function pollAndDeliver(
             : `⚠️ Could not deliver this message: ${reason}`,
           { turn_kind: 'agent' },
         ),
+        timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
       }).catch(() => {})
     } else {
       logPoll(`promptAsync failed (sessionless): ${reason}`)
@@ -2229,6 +2282,7 @@ async function mirrorLatestReply(
       token: auth.token,
       name: 'post_session_message',
       arguments: postMessageArgs(fresh, preparedText, { turn_kind: 'agent', model }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.

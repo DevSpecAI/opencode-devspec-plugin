@@ -11,11 +11,12 @@ export interface McpToolCallArgs {
   name: string
   arguments?: Record<string, unknown>
   /**
-   * Client-side ceiling in ms. REQUIRED in spirit for `poll_connection`: that call is a
-   * LONG-POLL the server holds open, and `fetch` has no default timeout, so a silently
-   * dropped TCP connection would leave the pump awaiting a response that never comes —
-   * no heartbeat, no delivery, and indistinguishable from "the owner sent nothing".
-   * Omit for ordinary short calls.
+   * Client-side ceiling in ms. REQUIRED for `poll_connection` (long-poll) and for
+   * every short call on the pump path (`report_*`, `heartbeat_connection`, notices):
+   * `fetch` has no default timeout, so a silently hung TCP connection would block
+   * the serial pump forever — no further poll, no heartbeat, then server
+   * `idle_timeout`. Prefer `MCP_SHORT_CALL_TIMEOUT_MS` / `MCP_HEARTBEAT_TIMEOUT_MS`
+   * from remote-control for ordinary calls; hold+grace for poll.
    */
   timeoutMs?: number
   /** Abort the request from outside (plugin `dispose`, so a held poll cannot outlive the host). */
