@@ -1,8 +1,73 @@
 # Remote control — OpenCode (LLM primer)
 
+**Audience:** coding agents changing OpenCode remote-control behaviour.  
 **Family:** native runtime (not local-poller).  
 **Read first:** `docs/remote-control/remote-control-overview.md`.  
-**Plugin repo:** `opencode-devspec-plugin` (`src/remote-control.ts`, `src/poll-turn.ts`, `src/mirror-chrome.ts`).
+**Plugin repo:** `opencode-devspec-plugin`.
+
+## Agent gotchas (read before editing)
+
+1. **Presence is the bond.** Server attached liveness is ~90s. `last_seen` updates only when a `poll_connection` (or equivalent heartbeat) succeeds — **not** when `report_keepalive` runs alone. Anything that blocks the next successful poll for ~90s ends the connection with `idle_timeout` while the UI can still look attached.
+2. **OpenCode’s pump is in-process** (`src/plugin.ts` → `pollAndDeliver`). Cursor keeps a **detached** Node poller. Do not “fix” OpenCode by copying Cursor’s wait/inbox scripts, and do not await inject / stall / hung `session.messages` on the path back to `poll_connection`.
+3. **Critical path after claiming delivery:** `setBusy(true)` then fire-and-forget `deliverInjectedTurn` (baseline → `promptAsync` → mirror). Return `{ delayMs: 0 }` so the pump re-enters the hold immediately. `checkBusyStall` is also `void`’d, not awaited.
+4. **After changing `dist/`:** fully quit and relaunch OpenCode (or reinstall the local package). Partial reloads leave a stale pump in memory.
+5. **Verify with** `npm test` from the plugin root (see [Running tests](#running-tests-after-a-remote-control-change)). Unit suite uses harness doubles — it does not launch a live TUI bond.
+
+## Architecture (how it works today)
+
+```
+OpenCode process
+  plugin.ts  ──self-scheduling loop──►  pollAndDeliver (remote-control.ts)
+                                            │
+                                            ├─ busy? report_keepalive + void checkBusyStall
+                                            ├─ maybeWarnPresenceGap
+                                            ├─ held poll_connection (25s attended / 30s idle + 15s HTTP grace)
+                                            ├─ commands → renderInjectedTurn → setBusy(true)
+                                            │                 └─ void deliverInjectedTurn
+                                            │                        ├─ session.messages (5s timeout) baseline
+                                            │                        ├─ session.promptAsync
+                                            │                        └─ mirror → post_session_message
+                                            └─ delayMs 0 → loop again (hold IS the wait)
+```
+
+There is **no** separate inbox wait process and **no** “re-arm the wait” step (unlike Claude/Cursor local-poller family).
+
+### Holds and presence constants (`poll-turn.ts` / `remote-control.ts`)
+
+| Constant | Value | Role |
+|---|---|---|
+| `ATTENDED_HOLD_MS` | 25s | Server hold when attached or mid-turn |
+| `IDLE_HOLD_MS` | 30s | Server hold when sessionless / idle |
+| `HOLD_HTTP_GRACE_MS` | 15s | Client fetch ceiling on top of hold |
+| Server idle window | ~90s | Bond ends → `end_reason: idle_timeout` |
+| `PRESENCE_GAP_WARN_MS` | 60s | Client story `presence_gap` before server idle |
+| `PRESENCE_GAP_WARN_COOLDOWN_MS` | 30s | Min spacing between gap warnings |
+| `OPENCODE_SESSION_API_TIMEOUT_MS` | 5s | Ceiling on `session.messages` (stall + inject baseline) |
+| `MCP_SHORT_CALL_TIMEOUT_MS` | 10s | Ordinary MCP on pump path |
+| `MCP_HEARTBEAT_TIMEOUT_MS` | 5s | Heartbeat / detach |
+| `STALL_TIMEOUT_MS` | 120s (override `DEVSPEC_OPENCODE_STALL_MS`) | Busy with no observable progress |
+| `MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES` | 2 | Cap keepalive slides on the same “running” tool id |
+| `IDLE_RECHECK_MS` (plugin) | 5s | Sleep only when **not connected** yet or after errors — not a poll cadence |
+
+`poll_connection` heartbeats server-side at the **start** of each hold. A completed hold with nothing to deliver is normal — re-issue immediately (`delayMs: 0`). A client ceiling timeout on the hold is also normal (nothing arrived) — re-issue, do not back off as if the bond died.
+
+### What may sit ahead of the next `poll_connection`
+
+**Allowed (short):** `report_keepalive` while `busy`, `maybeWarnPresenceGap`, reading local state, building the next MCP args.
+
+**Forbidden (regresses idle_timeout):** awaiting `deliverInjectedTurn`, awaiting `checkBusyStall`, awaiting unbounded `session.messages` / MCP on the pump tick. Hung MCP without a timeout was Climbing Koala / Steady Wolf; hung session API + await-inject was Gentle Weasel / Crimson Osprey (2026-08-07).
+
+**Watch-out (off pump path today):** `mirrorLatestReply` still calls `session.messages` **without** `withTimeout`. That runs inside fire-and-forget deliver / event-driven mirror, so it should not starve the pump — but do not move an untimed `session.messages` back onto the critical path, and prefer wrapping new session-API calls with `OPENCODE_SESSION_API_TIMEOUT_MS`.
+
+### Local state on disk
+
+Under `~/.devspec/opencode-remote-control/`:
+
+- `poll.log` — human lines + `story {…}` JSON
+- connection state JSON (keyed by directory + bound session) — busy, cursors, mirrored ids, baselines
+- `attachments/` — spilled oversize files
+
+Do not clobber state with a full `writeState({ ...stale })` while another path patches (double bubbles / lost delivery bookkeeping). Prefer `patchState`.
 
 ## Local serve password (rocket launches)
 
@@ -17,14 +82,13 @@ Do not “fix” an unsecured-server warning by putting a password into project 
 ## How a message reaches OpenCode
 
 1. Owner dispatches to this connection in DevSpec.
-2. Plugin (inside the OpenCode process) calls held `poll_connection`.
+2. Plugin (inside the OpenCode process) long-polls via held `poll_connection`.
 3. On deliverable commands, plugin builds a turn via `renderInjectedTurn` (context labelled advisory; commands last).
-4. Plugin calls `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door.
-5. OpenCode model runs a normal turn in that session.
-6. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts). **Exception:** the `/devspec.remote` / `/devspec.remote-stop` skill turn itself is never mirrored (`shouldSkipConnectTurnMirror` / `command.executed` message id) — that turn is terminal-only status.
-7. Activity: pickup / keepalive / complete around the injected turn.
-
-There is **no** separate inbox wait process and **no** “re-arm the wait” step.
+4. Plugin asserts `setBusy(true)`, then **kicks** `deliverInjectedTurn` without awaiting it.
+5. Inside deliver: timed `session.messages` baseline → `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door.
+6. OpenCode model runs a normal turn in that session.
+7. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts). **Exception:** the `/devspec.remote` / `/devspec.remote-stop` skill turn itself is never mirrored (`shouldSkipConnectTurnMirror` / `command.executed` message id) — that turn is terminal-only status.
+8. Activity: pickup at inject kickoff; keepalive on later polls while busy; complete when mirror clears busy / idle path.
 
 ## Two input doors (critical)
 
@@ -45,6 +109,7 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Injecting slash-looking text expecting host commands.
 - Dropping mirror dedup while also letting the model `post_session_message`.
 - Reintroducing a detached wait “for consistency” with Claude.
+- **Awaiting inject or stall before the next `poll_connection`** — presence starve → `idle_timeout`.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
 - Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
 - Returning early on `adopt.changed` without a follow-up null-cursor seed — fixed by always re-polling with `cursor:null` + `catch_up` after adopt (session `23da0643` / item `2411dd5a`). Do **not** fall through and consume the pre-adopt package: it was opened under the previous room's cursor, and advisory-only advance permanently skips a cold-launch dispatch that lands moments later (often with a backdated paint timestamp).
@@ -56,12 +121,12 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 
 Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbeats while the LLM works. OpenCode’s pump is **in-process** and used to `await` inject baseline (`session.messages`) + kickoff before returning to `poll_connection`. When that await hung or ran long, `last_seen` went stale and the server stamped `idle_timeout` (~90s) even though the bond still looked attached.
 
-**Fix (item 875d75b5):** after claiming delivery ids and `setBusy(true)`, inject runs via fire-and-forget `deliverInjectedTurn` so the presence loop re-enters `poll_connection` immediately. `checkBusyStall` is also off the critical path (async) and `session.messages` calls use `OPENCODE_SESSION_API_TIMEOUT_MS` (5s). Do **not** reintroduce awaiting inject before the next poll; do **not** treat `report_keepalive` as a substitute for `last_seen`.
+**Fix (item 875d75b5):** after claiming delivery ids and `setBusy(true)`, inject runs via fire-and-forget `deliverInjectedTurn` so the presence loop re-enters `poll_connection` immediately. `checkBusyStall` is also off the critical path (async) and `session.messages` on stall + inject baseline use `OPENCODE_SESSION_API_TIMEOUT_MS` (5s). Stories: `inject`/`queued` → `inject`/`kicked`, `pickup`/`started`, `presence_gap`, `ended` with `last_poll_age_ms`. Do **not** reintroduce awaiting inject before the next poll; do **not** treat `report_keepalive` as a substitute for `last_seen`.
 
 ## Failure modes
 
 - Double reply: mirror + model both post the same answer.
-- Stall: busy with **no observable progress** for the stall timeout (empty reply text *and* no new assistant step *and* no in-flight tool). Active tool loops slide the timer — text-only emptiness is not enough to stall (Tembo / Racing Heron false positives). See `decideBusyStall` / `checkBusyStall` and `poll.log`.
+- Stall: busy with **no observable progress** for the stall timeout (empty reply text *and* no new assistant step *and* no in-flight tool). Active tool loops slide the timer — text-only emptiness is not enough to stall (Tembo / Racing Heron false positives). See `decideBusyStall` / `checkBusyStall` and `poll.log`. Eternal “running” tool parts are capped by `MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES`.
 - **Presence starve → idle_timeout** (sessions Gentle Weasel / Crimson Osprey, 2026-08-07): poll never reached within ~90s after pickup or after a healthy turn. Look for client story `pickup` → silence → `ended`/`idle_timeout` with large `last_poll_age_ms`, or `poll_error`/`presence_gap`. Guard: fire-and-forget inject + non-blocking stall + session API timeouts.
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
@@ -72,13 +137,16 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 
 ## Key files
 
-- `src/remote-control.ts` — poll loop, inject, mirror, busy; `recordRemoteControlSkillCommand`; `deliverInjectedTurn`; presence gap / ended stories
-- `src/poll-turn.ts` — pure command gate + `renderInjectedTurn` + `unansweredCommands` + `shouldAdvanceMessageCursor`
-- `src/mirror-chrome.ts` — fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` (shared by mirror + seed-window filtering)
-- `src/plugin.ts` — long-poll pump + `command.executed` → skip-mirror ids
-- `src/agent-identity.ts` — `AGENT_NAME = 'OpenCode'`
-- `commands/devspec.remote.md`
-- `~/.devspec/opencode-remote-control/poll.log` — local diagnostics (human lines + structured `story {…}` JSON)
+| File | Responsibility |
+|---|---|
+| `src/plugin.ts` | Self-scheduling long-poll pump; `command.executed` → skip-mirror ids; dispose aborts in-flight hold |
+| `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state |
+| `src/poll-turn.ts` | Pure hold tiers, command gate, `renderInjectedTurn`, `unansweredCommands`, cursor advance rules |
+| `src/mirror-chrome.ts` | Fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` |
+| `src/agent-identity.ts` | `AGENT_NAME = 'OpenCode'` |
+| `src/devspec-client.ts` | MCP `tools/call` with timeouts |
+| `commands/devspec.remote.md` / `devspec.remote-stop.md` | Skill steps for register/attach (terminal-only chrome) |
+| `~/.devspec/opencode-remote-control/poll.log` | Local diagnostics |
 
 ## Running tests after a remote-control change
 
