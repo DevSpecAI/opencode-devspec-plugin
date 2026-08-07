@@ -55,7 +55,7 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 ## Failure modes
 
 - Double reply: mirror + model both post the same answer.
-- Stall: busy stuck with empty assistant text (see stall timeout / `poll.log`).
+- Stall: busy with **no observable progress** for the stall timeout (empty reply text *and* no new assistant step *and* no in-flight tool). Active tool loops slide the timer — text-only emptiness is not enough to stall (Tembo / Racing Heron false positives). See `decideBusyStall` / `checkBusyStall` and `poll.log`.
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
 - Connect + attach lands, status banner prints, owner command never injects: pre-adopt package consumed as seed / cursor advanced past unanswered commands (sessions `1383cbb8`, `23da0643`). **Guard:** after `adopt.changed`, always re-poll with `cursor:null` + `catch_up` (`adoptRequiresNullCursorRepoll`); never fall through. Server: do not backdate `local_agent_dispatch` `created_at` to the optimistic paint time; honour `catch_up` in packaging.
