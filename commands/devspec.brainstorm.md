@@ -107,6 +107,8 @@ Interactively brainstorm on an action item to sharpen its scope, surface edge ca
 
 7. **Persist durable conclusions.** If the brainstorm settled something durable about the *project itself* — a decision, convention, architecture fact, or risk that outlives this item — record it to DevSpec with `record_memory` (`decision`/`convention`/`architecture`/`risk`/`insight`). `search_memories` FIRST and `supersede_memory`/`retract_memory` the stale match instead of duplicating (`search_memories` returns a CARD (title, one-line summary, id) — `get_memory` the closest match and read it in full before superseding it, because a card is enough to choose WHICH memory you mean and not enough to justify replacing it.); record shared knowledge only, not transient or obvious details. DevSpec memory is the team's **shared** source of truth, so don't let a durable conclusion be lost or kept only in your own local notes (OpenCode's `AGENTS.md` / instructions file), where personal or machine-specific notes belong.
 
+**Memory or rule?** A separate question — a rule is durable and shared too, so the boundary above does not decide it. Go by what the thing IS: a decision or fact with a reason someone may revisit is a **memory**; a standing instruction to act on every time is a **rule** (`write_project_instruction_rule`). "We chose Broadcast over postgres_changes because RLS made client CDC undeliverable" is a memory; "never add client postgres_changes without documenting it" is a rule. A rule kept as a memory is one no agent ever acts on. After writing one, repeat its returned `outcome` exactly — `queued_for_review` means it is NOT in force until a maintainer accepts it.
+
 ## Rules
 
 - Do NOT output filler text before or after structured output
