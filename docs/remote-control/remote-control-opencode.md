@@ -15,7 +15,7 @@
 6. **Verify with** `npm test` from the plugin root (see [Running tests](#running-tests-after-a-remote-control-change)). Unit suite uses harness doubles — it does not launch a live TUI bond.
 7. **Act, don’t dump.** `commands/devspec.remote.md` must keep an **Act on owner commands** section (do the work in this repo / verify with tools) — parity with Cursor/Claude. Do not reintroduce “you do not need to go and read anything” / “grounded in the transcript” wording that licenses answering from the injected dump alone (Obsidian Gecko / Restless Ocelot, session `a2a262cd`).
 8. **Attach transcript is budgeted.** Skill attach uses `get_session_transcript` with `since_created_at` (~48h window), not an uncapped seed. Instruction tiers come from `attach_connection`. Do not tell the model to call uncapped `get_session_transcript` on every attach.
-9. **Model stamp is never silent.** `extractOpenCodeReplyModel` + `mirror_post`/`model_missing` (and inject `dispatch_model` rejects) must log a story with the raw shape snippet when `providerID`/`modelID` cannot be stamped — DevSpec otherwise has no record of which model answered.
+9. **Model stamp is never silent.** `resolveOpenCodeAssistantModel` (flat `info.providerID`/`modelID` first, then nested `info.model`, then legacy `metadata.assistant`) + `mirror_post`/`model_missing` (and inject `dispatch_model` rejects via `extractOpenCodeReplyModel`) must log a story with the raw shape snippet when `providerID`/`modelID` cannot be stamped — DevSpec otherwise has no record of which model answered. Assistant turns (e.g. MiniMax) store the stamp flat on `info`; reading only nested `info.model` falsely logs `model_missing`.
 
 ## Architecture (how it works today)
 
@@ -150,7 +150,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 | File | Responsibility |
 |---|---|
 | `src/plugin.ts` | Self-scheduling long-poll pump; `command.executed` → skip-mirror ids; dispose aborts in-flight hold |
-| `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state, `extractOpenCodeReplyModel` |
+| `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state, `extractOpenCodeReplyModel`, `resolveOpenCodeAssistantModel` |
 | `src/poll-turn.ts` | Pure hold tiers, command gate, `renderInjectedTurn`, `unansweredCommands`, cursor advance rules |
 | `src/mirror-chrome.ts` | Fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` |
 | `src/agent-identity.ts` | `AGENT_NAME = 'OpenCode'` |
@@ -181,7 +181,7 @@ Do **not** ship a remote-control change without that suite passing. Prefer also 
 - `test/multi-bond.test.mjs` — second remember keeps first bond; forget is per-bond; ALS state isolation
 - `test/mcp-short-timeout.test.mjs` — hung MCP abort on the pump path
 - `test/poll-turn.test.mjs` / `test/busy-stall.test.mjs` — hold tiers, stall policy
-- `test/model-stamp.test.mjs` — `extractOpenCodeReplyModel` aliases + loud `mirror_post`/`model_missing` story shape
+- `test/model-stamp.test.mjs` — `extractOpenCodeReplyModel` aliases, `resolveOpenCodeAssistantModel` (MiniMax flat + nested), loud `mirror_post`/`model_missing` story shape
 
 ### Optional live smell-test (after ship)
 
@@ -200,7 +200,7 @@ Fragile remote sessions are debugged from two places that share one phase vocabu
 
 OpenCode client stories also cover: `inject`/`queued` then `inject`/`kicked`, `pickup`/`started`, `complete_turn`/`cleared`, `mirror_post`/`posted` (and `done`/`mirrored`), `poll_error`/`presence_gap` (starve warning), and `ended` with `last_poll_age_ms` + `end_reason` class (`idle_timeout` vs `ui` / `local_stop`).
 
-**Model attribution (item f9e747bd).** Inject / pickup / mirror / done stories carry `connectionId`, `sessionId`, and — when known — `model` (`providerID/modelID`). When OpenCode’s `info.model` (or a command `dispatch_model`) fails the stamp guard, the plugin emits `mirror_post`/`model_missing` (or `inject`/`model_missing`) with `model_shape` (raw snippet) and `reason` — never a silent drop. Grep local `poll.log` or Axiom for `outcome == "model_missing"` when DevSpec shows a reply with no model.
+**Model attribution (items f9e747bd, a4789863).** Inject / pickup / mirror / done stories carry `connectionId`, `sessionId`, and — when known — `model` (`providerID/modelID`). Mirror resolution uses `resolveOpenCodeAssistantModel`: flat assistant `info.providerID`/`modelID` (MiniMax and peers), then nested `info.model` / Model.Ref (`providerID`+`id`), then legacy `info.metadata.assistant`. When that fails (or a command `dispatch_model` fails `extractOpenCodeReplyModel`), the plugin emits `mirror_post`/`model_missing` (or `inject`/`model_missing`) with `model_shape`, `reason`, and `source` — never a silent drop. Grep local `poll.log` or Axiom for `outcome == "model_missing"` when DevSpec shows a reply with no model.
 
 ### Skill contract (passivity vs routing)
 
@@ -209,7 +209,7 @@ OpenCode client stories also cover: `inject`/`queued` then `inject`/`kicked`, `p
 | Act-on-owner-commands (do work in repo / verify with tools) | `commands/devspec.remote.md` — “Act on owner commands” |
 | Budgeted attach transcript (`since_created_at` ~48h; skim newest ~40 if still large) | same skill, attach step |
 | Instruction tiers from `attach_connection` (not uncapped transcript seed) | same skill |
-| Loud model stamp failure | `extractOpenCodeReplyModel` + `logRemoteControlStory` in `src/remote-control.ts` |
+| Loud model stamp failure | `resolveOpenCodeAssistantModel` / `extractOpenCodeReplyModel` + `logRemoteControlStory` in `src/remote-control.ts` |
 
 ### “OpenCode left right after I replied” — Axiom recipe
 
