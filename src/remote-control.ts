@@ -1451,6 +1451,49 @@ const lastPollErrorReports = new Map<string, { message: string; at: number }>()
 const POLL_ERROR_REPORT_COOLDOWN_MS = 60_000
 
 /**
+ * How many consecutive poll failures before a recoverable gateway blip is posted
+ * into the room. A single MCP HTTP 502 during a Coolify swap is normal and the
+ * pump already retries — posting on attempt 1 made owners think the bond died
+ * (session b088b9a6 / Brave Osprey, 2026-08-08). Auth and other hard failures
+ * still report on the first hit.
+ */
+export const POLL_ERROR_REPORT_AFTER_TRANSIENT = 3
+
+/** True for gateway / redeploy-shaped MCP transport errors the pump already retries. */
+export function isTransientMcpGatewayError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /MCP HTTP 50[234]\b/i.test(message) || /\bBad Gateway\b/i.test(message)
+}
+
+/**
+ * Whether a poll failure should be mirrored into the DevSpec room.
+ * Transient 5xx waits until `POLL_ERROR_REPORT_AFTER_TRANSIENT` consecutive
+ * failures; everything else reports immediately (still cooldown-deduped).
+ */
+export function shouldReportPollErrorToRoom(
+  consecutiveErrors: number,
+  err: unknown,
+): boolean {
+  if (consecutiveErrors < 1) return false
+  if (isTransientMcpGatewayError(err)) {
+    return consecutiveErrors >= POLL_ERROR_REPORT_AFTER_TRANSIENT
+  }
+  return true
+}
+
+/** Room-facing copy for a poll failure (softer for recoverable gateway blips). */
+export function formatPollErrorRoomMessage(stage: string, err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  if (isTransientMcpGatewayError(err)) {
+    return (
+      `DevSpec briefly unreachable at \`${stage}\` (${message}). ` +
+      `Usually a redeploy — the bond is still retrying, not ended.`
+    )
+  }
+  return `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`
+}
+
+/**
  * Post a poll failure back into the DevSpec session so it's diagnosable from
  * the owner's side, not just the machine's own (usually inaccessible) logs.
  *
@@ -1459,6 +1502,9 @@ const POLL_ERROR_REPORT_COOLDOWN_MS = 60_000
  * message could sit as "waiting for pickup" forever with no way for the
  * owner (or anyone debugging remotely) to tell whether delivery was merely
  * slow or the whole poll loop was silently broken.
+ *
+ * Transient MCP 502/503/504 blips (Coolify swap) must NOT scream into the room
+ * on the first recovered attempt — see `shouldReportPollErrorToRoom`.
  */
 async function reportPollError(
   auth: ReturnType<typeof resolveDevspecAuth>,
@@ -1466,8 +1512,10 @@ async function reportPollError(
   state: ConnectionState | null,
   stage: string,
   err: unknown,
+  consecutiveErrors: number,
 ): Promise<void> {
   if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId) return
+  if (!shouldReportPollErrorToRoom(consecutiveErrors, err)) return
   const message = err instanceof Error ? err.message : String(err)
   const key = `${directory}:${stage}`
   const prior = lastPollErrorReports.get(key)
@@ -1478,7 +1526,7 @@ async function reportPollError(
     mcpUrl: auth.mcp_url,
     token: auth.token,
     name: 'post_session_message',
-    arguments: postMessageArgs(state, `⚠️ Remote-control poll failed at \`${stage}\`: ${message}`, {
+    arguments: postMessageArgs(state, formatPollErrorRoomMessage(stage, err), {
       turn_kind: 'agent',
     }),
     timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
@@ -1779,7 +1827,7 @@ export async function pollAndDeliver(
     // Surface it into the room too: a persistently failing poll means nothing below this
     // line ever runs, which from the owner's side is indistinguishable from "delivered,
     // just slow".
-    await reportPollError(auth, directory, state, 'poll_connection', err)
+    await reportPollError(auth, directory, state, 'poll_connection', err, pump.consecutiveErrors)
     logPoll(`poll_connection failed (${pump.consecutiveErrors}) — retrying in ${backoff}ms: ${err}`)
     logRemoteControlStory({
       phase: 'poll_error',
