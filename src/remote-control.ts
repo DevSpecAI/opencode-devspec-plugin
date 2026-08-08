@@ -53,6 +53,7 @@ import {
 import {
   isDevspecRemoteControlCommand,
   prepareMirrorText,
+  shouldClaimConnectTurnSuppress,
   shouldSkipConnectTurnMirror,
 } from './mirror-chrome.js'
 import { logRemoteControlStory } from './remote-control-story.js'
@@ -63,6 +64,7 @@ export {
   isDevspecRemoteControlCommand,
   isOperationalChrome,
   prepareMirrorText,
+  shouldClaimConnectTurnSuppress,
   shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
@@ -2206,6 +2208,10 @@ export async function pollAndDeliver(
   // busy:true. Inject (baseline + promptAsync + mirror) must NOT block presence —
   // awaiting session.messages / kickoff here was starving last_seen (875d75b5).
   await setBusy(directory, true)
+  // Mark awaiting BEFORE fire-and-forget deliverInjectedTurn. Baseline capture
+  // used to set this only after session.messages — during that window a late
+  // command.executed / connect suppress could poison the answer id (b156e680).
+  patchState(directory, { awaitingRemoteReply: true })
   logRemoteControlStory({
     phase: 'pickup',
     outcome: 'started',
@@ -2597,40 +2603,65 @@ async function mirrorLatestReply(
       awaitingRemoteReply: fresh.awaitingRemoteReply,
     })
   ) {
-    // Belt-and-suspenders (8a97effc): never claim a post-inject answer as
-    // mirrored via connect-skip — that permanently drops the owner's reply.
-    if (fresh.awaitingRemoteReply) {
+    // Peek at postable text before claiming. A late connect-skill tag on a
+    // real answer (banner + "-1") must fall through and post (b156e680).
+    const suppressText = assistantTextFromMessage(last)
+    const suppressPrepared = suppressText ? prepareMirrorText(suppressText) : null
+    if (
+      !shouldClaimConnectTurnSuppress({
+        awaitingRemoteReply: fresh.awaitingRemoteReply,
+        preparedText: suppressPrepared,
+      })
+    ) {
+      if (fresh.awaitingRemoteReply) {
+        logPoll(
+          `mirrorLatestReply: refuse connect-skip claim while awaiting last.id=${last.info.id}`,
+        )
+        return
+      }
       logPoll(
-        `mirrorLatestReply: refuse connect-skip claim while awaiting last.id=${last.info.id}`,
+        `mirrorLatestReply: connect-skip overridden — real answer text last.id=${last.info.id}`,
       )
+      logRemoteControlStory({
+        phase: 'mirror_decision',
+        outcome: 'continue',
+        connectionId: fresh.connectionId,
+        sessionId: fresh.sessionId,
+        agent: AGENT_NAME,
+        codename: fresh.codename,
+        tool: 'mirrorLatestReply',
+        reason: 'connect_suppress_real_answer',
+        data: { message_id: last.info.id },
+      })
+      // Fall through to the normal prepare/post path below.
+    } else {
+      logPoll(
+        `mirrorLatestReply: skip (connect skill / handshake suppress) last.id=${last.info.id} ` +
+          `suppressed=${Boolean(fresh.connectMirrorSuppressed)} awaiting=${Boolean(fresh.awaitingRemoteReply)}`,
+      )
+      logRemoteControlStory({
+        phase: 'mirror_decision',
+        outcome: 'skip',
+        connectionId: fresh.connectionId,
+        sessionId: fresh.sessionId,
+        agent: AGENT_NAME,
+        codename: fresh.codename,
+        tool: 'mirrorLatestReply',
+        reason: 'connect_turn_suppress',
+        data: { message_id: last.info.id },
+      })
+      alreadyMirrored.add(last.info.id)
+      patchState(directory, {
+        lastMirroredMessageId: last.info.id,
+        mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+        connectMirrorSuppressed: false,
+        // Handshake skip only — awaitingRemoteReply is already false above.
+        replyAfterOpenCodeMessageId: null,
+        replyBaselineCaptured: undefined,
+      })
+      await setBusy(directory, false)
       return
     }
-    logPoll(
-      `mirrorLatestReply: skip (connect skill / handshake suppress) last.id=${last.info.id} ` +
-        `suppressed=${Boolean(fresh.connectMirrorSuppressed)} awaiting=${Boolean(fresh.awaitingRemoteReply)}`,
-    )
-    logRemoteControlStory({
-      phase: 'mirror_decision',
-      outcome: 'skip',
-      connectionId: fresh.connectionId,
-      sessionId: fresh.sessionId,
-      agent: AGENT_NAME,
-      codename: fresh.codename,
-      tool: 'mirrorLatestReply',
-      reason: 'connect_turn_suppress',
-      data: { message_id: last.info.id },
-    })
-    alreadyMirrored.add(last.info.id)
-    patchState(directory, {
-      lastMirroredMessageId: last.info.id,
-      mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-      connectMirrorSuppressed: false,
-      // Handshake skip only — awaitingRemoteReply is already false above.
-      replyAfterOpenCodeMessageId: null,
-      replyBaselineCaptured: undefined,
-    })
-    await setBusy(directory, false)
-    return
   }
 
   const text = assistantTextFromMessage(last)

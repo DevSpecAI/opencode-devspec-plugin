@@ -148,3 +148,23 @@ export function shouldSkipConnectTurnMirror(opts: {
   if (opts.connectMirrorSuppressed) return true
   return false
 }
+
+/**
+ * Whether a connect-skill skip may permanently claim `lastMirroredMessageId`.
+ *
+ * Claiming without posting drops the bubble forever. That is correct for a
+ * pure connect status turn, but wrong when:
+ * - we are still awaiting an inject reply (8a97effc), or
+ * - the tagged message still has real answer text after chrome strip
+ *   (b156e680 / Brave Osprey: late `devspec.remote` command.executed on the
+ *   same id as “-1”, then skip-claim → answer only in the terminal).
+ */
+export function shouldClaimConnectTurnSuppress(opts: {
+  awaitingRemoteReply?: boolean | null
+  /** Result of `prepareMirrorText` on the candidate — null means pure chrome. */
+  preparedText: string | null
+}): boolean {
+  if (opts.awaitingRemoteReply) return false
+  if (opts.preparedText) return false
+  return true
+}

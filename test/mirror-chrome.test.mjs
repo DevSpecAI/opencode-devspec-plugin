@@ -9,6 +9,7 @@ import {
   isDevspecRemoteControlCommand,
   isOperationalChrome,
   prepareMirrorText,
+  shouldClaimConnectTurnSuppress,
   shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
@@ -127,6 +128,41 @@ describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => 
     assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.work'), false)
+  })
+})
+
+describe('shouldClaimConnectTurnSuppress — real answer under false connect tag (b156e680)', () => {
+  it('does not claim while awaitingRemoteReply', () => {
+    assert.equal(
+      shouldClaimConnectTurnSuppress({
+        awaitingRemoteReply: true,
+        preparedText: null,
+      }),
+      false,
+    )
+  })
+
+  it('does not claim when prepareMirrorText still has a real answer (banner + -1)', () => {
+    const mixed = `${PLAIN_BANNER}\n\n-1.`
+    assert.equal(prepareMirrorText(mixed), '-1.')
+    assert.equal(
+      shouldClaimConnectTurnSuppress({
+        awaitingRemoteReply: false,
+        preparedText: prepareMirrorText(mixed),
+      }),
+      false,
+    )
+  })
+
+  it('claims pure connect chrome so the status turn is not rechecked forever', () => {
+    assert.equal(prepareMirrorText(PLAIN_BANNER), null)
+    assert.equal(
+      shouldClaimConnectTurnSuppress({
+        awaitingRemoteReply: false,
+        preparedText: null,
+      }),
+      true,
+    )
   })
 })
 
