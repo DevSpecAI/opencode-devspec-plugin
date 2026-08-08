@@ -72,13 +72,13 @@ Under `~/.devspec/opencode-remote-control/`:
 
 Do not clobber state with a full `writeState({ ...stale })` while another path patches (double bubbles / lost delivery bookkeeping). Prefer `patchState`.
 
-## Local serve password (rocket launches)
+## Local serve password
 
-Cursor’s cold-launch path (`cursor-devspec-plugin` → `launch-opencode-session.mjs`) starts a headless `opencode serve` on localhost, then attaches with `opencode run --attach`. That local HTTP door is **not** DevSpec auth.
+Cursor’s cold-launch path (`cursor-devspec-plugin` → `launch-opencode-session.mjs`) starts a headless `opencode serve` on localhost, then attaches with `opencode run --attach`. Interactive TUI (`opencode` + `/devspec.remote`) also opens that localhost HTTP door. That door is **not** DevSpec auth.
 
 - **DevSpec long-poll / MCP** uses the DevSpec MCP token. It never needs or receives `OPENCODE_SERVER_PASSWORD`.
 - **Rocket launches** mint a one-time `OPENCODE_SERVER_PASSWORD` per serve process (or reuse one already set in the environment). The same secret is passed only to the serve child and the attach client via env. It is not written into the prompt file, launcher logs, or DevSpec.
-- **Interactive terminal** (`opencode` TUI + `/devspec.remote`): the plugin talks to OpenCode in-process. Remote control still works without DevSpec knowing a serve password. Hardening interactive starts is a separate follow-up; rockets are what depend on attach-over-HTTP.
+- **Interactive terminal** (`opencode` TUI + `/devspec.remote`): the DevSpec OpenCode plugin mints or reuses `OPENCODE_SERVER_PASSWORD` as soon as the plugin module loads (same mint-or-reuse rule as rockets), so the embedded server is never unsecured. The secret stays process-local; remote control still authenticates to DevSpec with the MCP token only.
 
 Do not “fix” an unsecured-server warning by putting a password into project settings or uploading it to DevSpec.
 

@@ -14,6 +14,16 @@ import {
   stateKeyForOpenCodeBond,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
+import {
+  applyServeAuthToPluginClient,
+  ensureServeAuthEnv,
+} from './serve-auth.js'
+
+// Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
+// OPENCODE_SERVER_PASSWORD as early as this module loads — same rule as rocket
+// cold-launch — so the door is never unsecured and the warning stays gone.
+// Never upload this secret to DevSpec; MCP still uses the DevSpec token only.
+const interactiveServeAuth = ensureServeAuthEnv(process.env)
 
 /**
  * Gap after a poll that asked us to wait (an error backoff, or "not connected yet").
@@ -84,6 +94,10 @@ const IDLE_RECHECK_MS = 5000
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
 export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
+  // Defensive: older OpenCode builds omit Authorization on the plugin client
+  // when a serve password is set. No-op on builds that already inject it.
+  applyServeAuthToPluginClient(client, interactiveServeAuth)
+
   // Fallback when an event lacks sessionID (rare). Prefer the event's own
   // sessionID for mirror/idle so multi-bond mirrors stay on the right room.
   // Bonds themselves live in remote-control's openCodeBonds map — never a
