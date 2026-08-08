@@ -53,6 +53,54 @@ export function ensureServeAuthEnv(env: NodeJS.ProcessEnv = process.env): ServeA
  * inject it themselves; this is a no-op / defensive patch so remote-control
  * SDK calls keep working after we mint.
  */
+/**
+ * Stamp Basic auth onto a request's headers without reassigning `req.headers`.
+ *
+ * Live OpenCode SDK interceptors receive Fetch `Request` objects whose
+ * `.headers` is a getter-only `Headers` instance. Assigning `req.headers = …`
+ * throws (Node: "Cannot set property headers…"; Bun: "Attempted to assign to
+ * readonly property") and breaks every remote inject / mirror call
+ * (Purple Kingfisher, 2026-08-08).
+ */
+export function stampServeAuthOnRequest(
+  req: { headers?: unknown },
+  authorizationHeader: string,
+): { headers?: unknown } {
+  const headers = req?.headers
+  if (headers && typeof headers === 'object') {
+    if (typeof (headers as Headers).get === 'function' && typeof (headers as Headers).set === 'function') {
+      const h = headers as Headers
+      if (!h.get('Authorization') && !h.get('authorization')) {
+        try {
+          h.set('Authorization', authorizationHeader)
+        } catch {
+          // Immutable Headers guard — return a cloned Request when possible.
+          if (typeof Request !== 'undefined' && req instanceof Request) {
+            const merged = new Headers(h)
+            merged.set('Authorization', authorizationHeader)
+            return new Request(req, { headers: merged })
+          }
+        }
+      }
+      return req
+    }
+    const record = headers as Record<string, string>
+    if (!record.Authorization && !record.authorization) {
+      record.Authorization = authorizationHeader
+    }
+    return req
+  }
+  // No headers bag — for plain interceptor objects only, attach a mutable map.
+  // Never assign onto a Fetch Request (getter-only).
+  if (typeof Request !== 'undefined' && req instanceof Request) {
+    const merged = new Headers()
+    merged.set('Authorization', authorizationHeader)
+    return new Request(req, { headers: merged })
+  }
+  ;(req as { headers: Record<string, string> }).headers = { Authorization: authorizationHeader }
+  return req
+}
+
 export function applyServeAuthToPluginClient(
   client: unknown,
   auth: Pick<ServeAuth, 'username' | 'password'>,
@@ -65,21 +113,14 @@ export function applyServeAuthToPluginClient(
   const anyClient = client as {
     _client?: {
       interceptors?: {
-        request?: { use?: (fn: (req: { headers?: Record<string, string> }) => unknown) => void }
+        request?: { use?: (fn: (req: { headers?: unknown }) => unknown) => void }
       }
       setConfig?: (cfg: { headers?: Record<string, string> }) => void
     }
   }
   const inner = anyClient._client
   if (inner?.interceptors?.request?.use) {
-    inner.interceptors.request.use((req) => {
-      const headers = req.headers ?? {}
-      if (!headers.Authorization && !headers.authorization) {
-        headers.Authorization = header
-        req.headers = headers
-      }
-      return req
-    })
+    inner.interceptors.request.use((req) => stampServeAuthOnRequest(req, header))
     return true
   }
   if (typeof inner?.setConfig === 'function') {

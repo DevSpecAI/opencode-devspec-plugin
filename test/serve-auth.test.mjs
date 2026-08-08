@@ -75,4 +75,29 @@ describe('applyServeAuthToPluginClient', () => {
     seen[0](req)
     assert.match(req.headers.Authorization, /^Basic /)
   })
+
+  it('stamps Authorization on a Fetch Request without assigning to req.headers', () => {
+    // Live OpenCode SDK passes Request-like objects whose `.headers` is a
+    // Headers instance. Assigning `req.headers = …` throws
+    // "Attempted to assign to readonly property" (Purple Kingfisher, 2026-08-08).
+    const seen = []
+    const client = {
+      _client: {
+        interceptors: {
+          request: {
+            use(fn) {
+              seen.push(fn)
+            },
+          },
+        },
+      },
+    }
+    assert.equal(
+      applyServeAuthToPluginClient(client, { username: 'opencode', password: 'secret' }),
+      true,
+    )
+    const req = new Request('http://127.0.0.1/session/test/message')
+    assert.doesNotThrow(() => seen[0](req))
+    assert.match(req.headers.get('Authorization') ?? '', /^Basic /)
+  })
 })
