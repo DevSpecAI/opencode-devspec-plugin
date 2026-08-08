@@ -449,6 +449,9 @@ function pickStringField(obj: Record<string, unknown>, keys: string[]): string |
  * dispatch_model override). Accepts common aliases; returns why the stamp
  * failed when the raw value is present but unusable — callers must log that
  * path instead of dropping model silently.
+ *
+ * Model.Ref nested shapes use `id` for the model slug (`{ providerID, id }`);
+ * `id` is accepted as a modelID alias.
  */
 export function extractOpenCodeReplyModel(raw: unknown): {
   model?: OpenCodeModelStamp
@@ -475,12 +478,117 @@ export function extractOpenCodeReplyModel(raw: unknown): {
   }
   const obj = raw as Record<string, unknown>
   const providerID = pickStringField(obj, ['providerID', 'providerId', 'provider'])
-  const modelID = pickStringField(obj, ['modelID', 'modelId', 'model'])
+  // `id` is OpenCode Model.Ref's model slug (not message id) when paired with providerID.
+  const modelID = pickStringField(obj, ['modelID', 'modelId', 'model', 'id'])
   if (providerID && modelID) return { model: { providerID, modelID } }
   if (!providerID && !modelID) {
     return { missingReason: 'missing_fields', rawSnippet: summarizeModelShapeSnippet(raw) }
   }
   return { missingReason: 'empty_fields', rawSnippet: summarizeModelShapeSnippet(raw) }
+}
+
+/** Where `resolveOpenCodeAssistantModel` found (or failed to find) the stamp. */
+export type OpenCodeAssistantModelSource =
+  | 'info.flat'
+  | 'info.model'
+  | 'info.metadata.assistant'
+  | 'absent'
+
+/**
+ * Resolve the reply model from an OpenCode session message.
+ *
+ * Assistant turns store flat `info.providerID` + `info.modelID` (e.g. MiniMax).
+ * Nested `info.model` is the user-message / Model.Ref shape. Reading only
+ * `info.model` caused false `model_missing` / `mirrored_without_model` when
+ * the model was present on the assistant message.
+ *
+ * Tries in order: flat info fields → nested `info.model` → legacy
+ * `info.metadata.assistant`.
+ */
+export function resolveOpenCodeAssistantModel(message: {
+  info?: unknown
+} | null | undefined): {
+  model?: OpenCodeModelStamp
+  missingReason?: 'absent' | 'non_object' | 'missing_fields' | 'empty_fields'
+  rawSnippet?: string
+  source: OpenCodeAssistantModelSource
+} {
+  const info = message?.info
+  if (info == null || typeof info !== 'object' || Array.isArray(info)) {
+    return {
+      missingReason: 'absent',
+      rawSnippet: summarizeModelShapeSnippet(info),
+      source: 'absent',
+    }
+  }
+  const infoObj = info as Record<string, unknown>
+
+  // 1. Flat assistant shape — do not pass nested `model` into the extractor
+  //    (that key is a different shape on user messages).
+  const flatRaw: Record<string, unknown> = {
+    providerID: infoObj.providerID,
+    providerId: infoObj.providerId,
+    provider: infoObj.provider,
+    modelID: infoObj.modelID,
+    modelId: infoObj.modelId,
+  }
+  const hasFlatHint = Object.values(flatRaw).some((v) => typeof v === 'string' && v.trim())
+  if (hasFlatHint) {
+    const flat = extractOpenCodeReplyModel(flatRaw)
+    if (flat.model) return { ...flat, source: 'info.flat' }
+  }
+
+  // 2. Nested info.model (user-message / Model.Ref style)
+  if ('model' in infoObj && infoObj.model != null) {
+    const nested = extractOpenCodeReplyModel(infoObj.model)
+    if (nested.model) return { ...nested, source: 'info.model' }
+    // Prefer reporting the nested failure when that field was present.
+    const legacy = resolveLegacyAssistantMetadata(infoObj)
+    if (legacy?.model) return legacy
+    return {
+      missingReason: nested.missingReason ?? 'absent',
+      rawSnippet: nested.rawSnippet ?? summarizeModelShapeSnippet(infoObj.model),
+      source: 'info.model',
+    }
+  }
+
+  // 3. Legacy metadata.assistant
+  const legacy = resolveLegacyAssistantMetadata(infoObj)
+  if (legacy) return legacy
+
+  if (hasFlatHint) {
+    const flat = extractOpenCodeReplyModel(flatRaw)
+    return {
+      missingReason: flat.missingReason ?? 'absent',
+      rawSnippet: flat.rawSnippet ?? summarizeModelShapeSnippet(flatRaw),
+      source: 'info.flat',
+    }
+  }
+
+  return {
+    missingReason: 'absent',
+    rawSnippet: summarizeModelShapeSnippet(infoObj),
+    source: 'absent',
+  }
+}
+
+function resolveLegacyAssistantMetadata(infoObj: Record<string, unknown>): {
+  model?: OpenCodeModelStamp
+  missingReason?: 'absent' | 'non_object' | 'missing_fields' | 'empty_fields'
+  rawSnippet?: string
+  source: OpenCodeAssistantModelSource
+} | null {
+  const meta = infoObj.metadata
+  if (meta == null || typeof meta !== 'object' || Array.isArray(meta)) return null
+  const assistant = (meta as Record<string, unknown>).assistant
+  if (assistant == null) return null
+  const legacy = extractOpenCodeReplyModel(assistant)
+  if (legacy.model) return { ...legacy, source: 'info.metadata.assistant' }
+  return {
+    missingReason: legacy.missingReason ?? 'absent',
+    rawSnippet: legacy.rawSnippet ?? summarizeModelShapeSnippet(assistant),
+    source: 'info.metadata.assistant',
+  }
 }
 
 /** Story `data` fragment when a model stamp is known. */
@@ -2782,17 +2890,17 @@ async function mirrorLatestReply(
   // if we lost a race on lastMirrored — re-check isn't perfect without a
   // lock, but the set membership after merge is enough when both use patchState.
 
-  const modelExtract = extractOpenCodeReplyModel(last.info?.model)
+  const modelExtract = resolveOpenCodeAssistantModel(last)
   const model = modelExtract.model
   if (!model) {
     // Never silent — DevSpec has no record of which model answered when the
     // stamp is dropped (Obsidian Gecko RCA / Restless Ocelot).
     const shape =
       modelExtract.rawSnippet ??
-      summarizeModelShapeSnippet(last.info?.model)
+      summarizeModelShapeSnippet(last.info)
     logPoll(
       `mirrorLatestReply: model stamp missing (${modelExtract.missingReason ?? 'absent'}) ` +
-        `last.id=${last.info.id} shape=${shape}`,
+        `last.id=${last.info.id} source=${modelExtract.source} shape=${shape}`,
     )
     logRemoteControlStory({
       phase: 'mirror_post',
@@ -2806,7 +2914,7 @@ async function mirrorLatestReply(
       data: {
         message_id: last.info.id,
         model_shape: shape,
-        source: 'info.model',
+        source: modelExtract.source,
       },
     })
   }

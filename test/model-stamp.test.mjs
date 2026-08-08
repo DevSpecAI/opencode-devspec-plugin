@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
  * Model stamp extraction + loud model_missing path (item f9e747bd).
+ * Assistant flat providerID/modelID resolution (item a4789863) — MiniMax and
+ * peers store the stamp on info, not nested info.model.
  * Obsidian Gecko RCA: silent drop of reply model left DevSpec with no record
  * of which model answered.
  */
@@ -11,6 +13,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   extractOpenCodeReplyModel,
+  resolveOpenCodeAssistantModel,
   summarizeModelShapeSnippet,
   modelStoryData,
 } from '../dist/remote-control.js'
@@ -38,6 +41,13 @@ describe('extractOpenCodeReplyModel', () => {
     )
   })
 
+  it('accepts Model.Ref providerID + id as modelID', () => {
+    assert.deepEqual(extractOpenCodeReplyModel({ providerID: 'minimax', id: 'MiniMax-M3' }).model, {
+      providerID: 'minimax',
+      modelID: 'MiniMax-M3',
+    })
+  })
+
   it('accepts provider/model slash string', () => {
     assert.deepEqual(extractOpenCodeReplyModel('anthropic/claude-sonnet-4').model, {
       providerID: 'anthropic',
@@ -57,9 +67,81 @@ describe('extractOpenCodeReplyModel', () => {
     assert.equal(partial.missingReason, 'empty_fields')
     assert.match(partial.rawSnippet ?? '', /providerID/)
 
+    // `id` alone is treated as a modelID alias (Model.Ref), so vendor+id is empty_fields
+    // (model slug present, provider missing) rather than missing_fields.
     const weird = extractOpenCodeReplyModel({ vendor: 'x', id: 'y' })
-    assert.equal(weird.missingReason, 'missing_fields')
+    assert.equal(weird.missingReason, 'empty_fields')
     assert.match(weird.rawSnippet ?? '', /vendor/)
+  })
+})
+
+describe('resolveOpenCodeAssistantModel', () => {
+  it('reads MiniMax flat assistant info.providerID + info.modelID', () => {
+    const r = resolveOpenCodeAssistantModel({
+      info: {
+        id: 'msg-assistant-1',
+        role: 'assistant',
+        providerID: 'minimax',
+        modelID: 'MiniMax-M3',
+      },
+    })
+    assert.deepEqual(r.model, { providerID: 'minimax', modelID: 'MiniMax-M3' })
+    assert.equal(r.source, 'info.flat')
+    assert.equal(r.missingReason, undefined)
+  })
+
+  it('still reads nested info.model when flat fields are absent', () => {
+    const r = resolveOpenCodeAssistantModel({
+      info: {
+        id: 'msg-user-or-nested',
+        model: { providerID: 'anthropic', modelID: 'claude-opus-4' },
+      },
+    })
+    assert.deepEqual(r.model, { providerID: 'anthropic', modelID: 'claude-opus-4' })
+    assert.equal(r.source, 'info.model')
+  })
+
+  it('reads nested Model.Ref providerID + id', () => {
+    const r = resolveOpenCodeAssistantModel({
+      info: {
+        model: { providerID: 'openai', id: 'gpt-5' },
+      },
+    })
+    assert.deepEqual(r.model, { providerID: 'openai', modelID: 'gpt-5' })
+    assert.equal(r.source, 'info.model')
+  })
+
+  it('prefers flat assistant fields over nested info.model', () => {
+    const r = resolveOpenCodeAssistantModel({
+      info: {
+        providerID: 'minimax',
+        modelID: 'MiniMax-M3',
+        model: { providerID: 'anthropic', modelID: 'should-not-win' },
+      },
+    })
+    assert.deepEqual(r.model, { providerID: 'minimax', modelID: 'MiniMax-M3' })
+    assert.equal(r.source, 'info.flat')
+  })
+
+  it('falls back to info.metadata.assistant', () => {
+    const r = resolveOpenCodeAssistantModel({
+      info: {
+        metadata: {
+          assistant: { providerID: 'google', modelID: 'gemini-3' },
+        },
+      },
+    })
+    assert.deepEqual(r.model, { providerID: 'google', modelID: 'gemini-3' })
+    assert.equal(r.source, 'info.metadata.assistant')
+  })
+
+  it('reports absent when no model shape is present', () => {
+    const r = resolveOpenCodeAssistantModel({
+      info: { id: 'msg-no-model', role: 'assistant' },
+    })
+    assert.equal(r.model, undefined)
+    assert.equal(r.missingReason, 'absent')
+    assert.equal(r.source, 'absent')
   })
 })
 
@@ -95,8 +177,11 @@ describe('loud model_missing story (mirror_post)', () => {
   })
 
   it('emits mirror_post/model_missing with connectionId, sessionId, and raw shape', () => {
-    const extracted = extractOpenCodeReplyModel({ provider: 'anthropic' })
+    const extracted = resolveOpenCodeAssistantModel({
+      info: { id: 'msg-1', provider: 'anthropic' },
+    })
     assert.equal(extracted.model, undefined)
+    assert.equal(extracted.source, 'info.flat')
 
     logRemoteControlStory({
       phase: 'mirror_post',
@@ -110,7 +195,7 @@ describe('loud model_missing story (mirror_post)', () => {
       data: {
         message_id: 'msg-1',
         model_shape: extracted.rawSnippet ?? summarizeModelShapeSnippet({ provider: 'anthropic' }),
-        source: 'info.model',
+        source: extracted.source,
       },
     })
 
@@ -124,7 +209,23 @@ describe('loud model_missing story (mirror_post)', () => {
     assert.equal(json.sessionId, 'sess-a2a262cd')
     assert.equal(json.agent, 'OpenCode')
     assert.equal(json.message_id, 'msg-1')
+    assert.equal(json.source, 'info.flat')
     assert.match(String(json.model_shape), /provider/)
     assert.ok(json.reason)
+  })
+
+  it('does not emit model_missing when MiniMax flat stamp resolves', () => {
+    const extracted = resolveOpenCodeAssistantModel({
+      info: {
+        id: 'msg-minimax',
+        role: 'assistant',
+        providerID: 'minimax',
+        modelID: 'MiniMax-M3',
+      },
+    })
+    assert.ok(extracted.model)
+    assert.equal(extracted.source, 'info.flat')
+    // Successful mirrors post with model and use done/mirrored — not model_missing.
+    assert.equal(extracted.missingReason, undefined)
   })
 })
