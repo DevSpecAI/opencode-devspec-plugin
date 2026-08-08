@@ -9,28 +9,31 @@
 
 1. **Presence is the bond.** Server attached liveness is ~90s. `last_seen` updates only when a `poll_connection` (or equivalent heartbeat) succeeds — **not** when `report_keepalive` runs alone. Anything that blocks the next successful poll for ~90s ends the connection with `idle_timeout` while the UI can still look attached.
 2. **OpenCode’s pump is in-process** (`src/plugin.ts` → `pollAndDeliver`). Cursor keeps a **detached** Node poller. Do not “fix” OpenCode by copying Cursor’s wait/inbox scripts, and do not await inject / stall / hung `session.messages` on the path back to `poll_connection`.
-3. **Critical path after claiming delivery:** `setBusy(true)` then fire-and-forget `deliverInjectedTurn` (baseline → `promptAsync` → mirror). Return `{ delayMs: 0 }` so the pump re-enters the hold immediately. `checkBusyStall` is also `void`’d, not awaited.
-4. **After changing `dist/`:** fully quit and relaunch OpenCode (or reinstall the local package). Partial reloads leave a stale pump in memory.
-5. **Verify with** `npm test` from the plugin root (see [Running tests](#running-tests-after-a-remote-control-change)). Unit suite uses harness doubles — it does not launch a live TUI bond.
+3. **Multi-bond in one process** (item 7a9b7b0f): several OpenCode chat sessions may each `/devspec.remote` into different DevSpec rooms. The pump iterates `listOpenCodeBondSessions()` — a second attach **adds** a bond; it must **not** overwrite a single `lastKnownSessionId` (that starved Ivory Panda when Racing Dolphin attached, 2026-08-07 → first room `idle_timeout`). Ending one bond removes only that entry. State reads/writes for each bond run under `runWithBoundSession(stateKey)`.
+4. **Critical path after claiming delivery:** `setBusy(true)` then fire-and-forget `deliverInjectedTurn` (baseline → `promptAsync` → mirror), ALS-scoped to the inject bond. Return `{ delayMs: 0 }` so the pump re-enters the hold immediately. `checkBusyStall` is also `void`’d, not awaited.
+5. **After changing `dist/`:** fully quit and relaunch OpenCode (or reinstall the local package). Partial reloads leave a stale pump in memory.
+6. **Verify with** `npm test` from the plugin root (see [Running tests](#running-tests-after-a-remote-control-change)). Unit suite uses harness doubles — it does not launch a live TUI bond.
 
 ## Architecture (how it works today)
 
 ```
 OpenCode process
-  plugin.ts  ──self-scheduling loop──►  pollAndDeliver (remote-control.ts)
-                                            │
-                                            ├─ busy? report_keepalive + void checkBusyStall
-                                            ├─ maybeWarnPresenceGap
-                                            ├─ held poll_connection (25s attended / 30s idle + 15s HTTP grace)
-                                            ├─ commands → renderInjectedTurn → setBusy(true)
-                                            │                 └─ void deliverInjectedTurn
-                                            │                        ├─ session.messages (5s timeout) baseline
-                                            │                        ├─ session.promptAsync
-                                            │                        └─ mirror → post_session_message
-                                            └─ delayMs 0 → loop again (hold IS the wait)
+  plugin.ts  ──self-scheduling multi-bond loop──►  for each openCodeBond:
+                                                    runWithBoundSession(stateKey) →
+                                                      pollAndDeliver (remote-control.ts)
+                                                            │
+                                                            ├─ busy? report_keepalive + void checkBusyStall
+                                                            ├─ maybeWarnPresenceGap
+                                                            ├─ held poll_connection (25s attended / 30s idle + 15s HTTP grace)
+                                                            ├─ commands → renderInjectedTurn → setBusy(true)
+                                                            │                 └─ void deliverInjectedTurn (same ALS)
+                                                            │                        ├─ session.messages (5s timeout) baseline
+                                                            │                        ├─ session.promptAsync
+                                                            │                        └─ mirror → post_session_message
+                                                            └─ delayMs 0 → next bond / loop again (hold IS the wait)
 ```
 
-There is **no** separate inbox wait process and **no** “re-arm the wait” step (unlike Claude/Cursor local-poller family).
+There is **no** separate inbox wait process and **no** “re-arm the wait” step (unlike Claude/Cursor local-poller family). One process may keep **multiple** DevSpec bonds alive concurrently (one OpenCode chat session per bond).
 
 ### Holds and presence constants (`poll-turn.ts` / `remote-control.ts`)
 
@@ -109,6 +112,7 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 - Injecting slash-looking text expecting host commands.
 - Dropping mirror dedup while also letting the model `post_session_message`.
 - Reintroducing a detached wait “for consistency” with Claude.
+- **Replacing multi-bond with a single `lastKnownSessionId` pin** — second attach starves the first → `idle_timeout`.
 - **Awaiting inject or stall before the next `poll_connection`** — presence starve → `idle_timeout`.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
 - Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
@@ -134,6 +138,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 - **Connect turn mirrored as a reply during a mid-attach dispatch** (session `e7ecc1de`): `/devspec.remote` prints terminal-only status plus process narration ("Oriented… Holding for long-poll…"). Banner strip leaves the narration; the mirror posts it; `unansweredCommands` treats it as the answer and drops the pending owner command from the seed inject. **Guard:** never mirror the connect skill turn — `command.executed` for `devspec.remote` / `devspec.remote-stop` records the assistant `messageID` in `nonMirrorMessageIds`, and register / first-attach sets `connectMirrorSuppressed` so a `flushMirrorNow` that races ahead of that event still skips. Cleared after the skip (or when awaiting a real inject reply). Do **not** NLP-widen chrome for "oriented/holding" prose; do **not** weaken the seed filter.
 - **Late `command.executed` poisons the inject answer** (session `8a97effc` / connection `4aab7fe0`): OpenCode fires `devspec.remote` `command.executed` *after* inject against the answer message id. That id lands in `nonMirrorMessageIds`; mirror skips with `connect_turn_suppress` while `awaitingRemoteReply` is true, claims `lastMirrored`, and later polls say "already mirrored" — reply stays in the terminal only. **Guard:** `awaitingRemoteReply` wins — `shouldSkipConnectTurnMirror` never skips while awaiting; `recordRemoteControlSkillCommand` ignores `command.executed` while awaiting so the answer id is never recorded. Do **not** weaken `isOperationalChrome` / `prepareMirrorText` to paper over this.
 - **Sibling agent reply settles OpenCode's unanswered dispatch** (session `5546c769` / command `c117ffae`): after OpenCode fails to mirror, Cursor posts in the same room; on OpenCode reconnect `unansweredCommands` treats that Cursor bubble as the answer and seed_filter drops the still-unanswered OpenCode dispatch (`already_answered`). **Guard:** pass `AGENT_NAME` + `connectionId` into `unansweredCommands` so only THIS agent's `external_agent` rows settle.
+- **Second OpenCode session attach kills the first bond** (Ivory Panda / Racing Dolphin, 2026-08-07): one process stored a single `lastKnownSessionId`; the second `/devspec.remote` overwrote it, so the first connection stopped getting `poll_connection` and `idle_timeout`ed ~90s later. **Guard:** `rememberOpenCodeBond` map + pump iterates all bonds; `runWithBoundSession` scopes state; ending one bond does not stop the pump.
 
 ## Key files
 
@@ -168,6 +173,7 @@ Do **not** ship a remote-control change without that suite passing. Prefer also 
 ### What `npm test` covers (remote-control subset)
 
 - `test/presence-pump.test.mjs` — session API timeout, presence gap / ended stories, inject must not block a follow-up poll tick
+- `test/multi-bond.test.mjs` — second remember keeps first bond; forget is per-bond; ALS state isolation
 - `test/mcp-short-timeout.test.mjs` — hung MCP abort on the pump path
 - `test/poll-turn.test.mjs` / `test/busy-stall.test.mjs` — hold tiers, stall policy
 

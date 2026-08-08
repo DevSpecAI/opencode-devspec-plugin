@@ -22,6 +22,7 @@
  * grounded in the real installed SDK types, but treat this as a first
  * implementation pass, not a battle-tested one.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -780,6 +781,67 @@ export async function handleSessionError(directory: string, event: unknown): Pro
 let boundSessionId: string | null = null
 
 /**
+ * Per-async-context override of `boundSessionId`. Multi-bond (item 7a9b7b0f):
+ * one OpenCode process can drive several DevSpec connections; each poll /
+ * inject / mirror must read and write THAT bond's state file even when
+ * another bond's work is in flight on the same event loop.
+ *
+ * `undefined` store = not inside `runWithBoundSession` → fall back to the
+ * process-global `boundSessionId`. An explicit `null` store means folder-only
+ * state (sessionless bond).
+ */
+const boundSessionAls = new AsyncLocalStorage<string | null>()
+
+function effectiveBoundSessionId(): string | null {
+  const fromAls = boundSessionAls.getStore()
+  return fromAls === undefined ? boundSessionId : fromAls
+}
+
+/** Run `fn` with state reads/writes scoped to `stateKey` (DevSpec session id or null). */
+export function runWithBoundSession<T>(stateKey: string | null, fn: () => T): T {
+  return boundSessionAls.run(stateKey, fn)
+}
+
+export async function runWithBoundSessionAsync<T>(
+  stateKey: string | null,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return boundSessionAls.run(stateKey, fn)
+}
+
+/**
+ * OpenCode session id → DevSpec state-file key (session UUID, or null for
+ * folder-only / sessionless). The pump iterates this map so a second
+ * `/devspec.remote` ADDS a bond instead of overwriting a single pin
+ * (Ivory Panda idle_timeout when Racing Dolphin attached — 2026-08-07).
+ */
+const openCodeBonds = new Map<string, string | null>()
+
+export function rememberOpenCodeBond(opencodeSessionId: string, stateKey: string | null): void {
+  if (!opencodeSessionId) return
+  openCodeBonds.set(opencodeSessionId, stateKey)
+  logPoll(
+    `bond remember opencodeSession=${opencodeSessionId} stateKey=${stateKey ?? '(folder-only)'} ` +
+      `(active=${openCodeBonds.size})`,
+  )
+}
+
+export function forgetOpenCodeBond(opencodeSessionId: string): void {
+  if (!opencodeSessionId) return
+  if (!openCodeBonds.delete(opencodeSessionId)) return
+  logPoll(`bond forget opencodeSession=${opencodeSessionId} (active=${openCodeBonds.size})`)
+}
+
+export function listOpenCodeBondSessions(): string[] {
+  return [...openCodeBonds.keys()]
+}
+
+export function stateKeyForOpenCodeBond(opencodeSessionId: string): string | null | undefined {
+  if (!openCodeBonds.has(opencodeSessionId)) return undefined
+  return openCodeBonds.get(opencodeSessionId)
+}
+
+/**
  * Real bug found live-testing (round 10, same day as the round 9 fix above):
  * plain `Buffer.from(raw).toString('base64url').slice(0, 32)` does NOT
  * distinguish sessions in practice. A typical resolved project path is
@@ -816,7 +878,7 @@ function stateFileForKey(directory: string, sessionKey: string | null): string {
 }
 
 function stateFile(directory: string): string {
-  return stateFileForKey(directory, boundSessionId)
+  return stateFileForKey(directory, effectiveBoundSessionId())
 }
 
 function readStateAtKey(directory: string, sessionKey: string | null): ConnectionState | null {
@@ -1003,11 +1065,12 @@ export function bindSessionState(
 /** Test helper — reset the process-global session bind between cases. */
 export function resetBoundSessionIdForTests(): void {
   boundSessionId = null
+  openCodeBonds.clear()
 }
 
 /** Exported for regression tests (item 67794386) — prefer patchState in production paths. */
 export function readState(directory: string): ConnectionState | null {
-  return readStateAtKey(directory, boundSessionId)
+  return readStateAtKey(directory, effectiveBoundSessionId())
 }
 
 /**
@@ -1074,6 +1137,7 @@ export function recordConnectionEventFromTool(
   toolName: string,
   args: unknown,
   hookOutput: unknown,
+  opencodeSessionId?: string | null,
 ): void {
   const isRegister = toolName === 'devspec_register_connection' || toolName.endsWith('register_connection')
   const isAttach = toolName === 'devspec_attach_connection' || toolName.endsWith('attach_connection')
@@ -1122,6 +1186,9 @@ export function recordConnectionEventFromTool(
         connectMirrorSuppressed: true,
       })
     }
+    // Sessionless (or pre-attach) bond: folder-only state key. A later attach
+    // in this OpenCode session upgrades the key — rememberOpenCodeBond again.
+    if (opencodeSessionId) rememberOpenCodeBond(opencodeSessionId, boundSessionId)
     return
   }
 
@@ -1154,6 +1221,7 @@ export function recordConnectionEventFromTool(
     connectionId,
     codename: prior?.codename ?? null,
   })
+  if (opencodeSessionId) rememberOpenCodeBond(opencodeSessionId, sessionId)
 }
 
 /**
@@ -1676,12 +1744,13 @@ export async function pollAndDeliver(
     })
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
+    forgetOpenCodeBond(sessionId)
     return { delayMs: 0, stop: true, reason: terminal.reason ?? 'server_ended' }
   }
   if (terminal) {
     // A deliberate human end ('ui' / 'local_stop'). This one must stick.
     const reason = terminal.reason ?? 'ended_from_ui'
-    logPoll(`connection ended (${reason}) — stopping the pump; do not restart`)
+    logPoll(`connection ended (${reason}) — dropping this bond; other bonds keep polling`)
     logConnectionEndedStory({
       connectionId: state.connectionId,
       sessionId: state.sessionId,
@@ -1692,6 +1761,7 @@ export async function pollAndDeliver(
     })
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
+    forgetOpenCodeBond(sessionId)
     return { delayMs: 0, stop: true, reason }
   }
   // A clean poll clears the recoverable streak — a blip that resolves is over.
@@ -1996,15 +2066,20 @@ export async function pollAndDeliver(
     reason: 'inject_turn',
   })
 
-  void deliverInjectedTurn({
-    client,
-    directory,
-    sessionId,
-    auth,
-    text,
-    fileParts,
-    model,
-  }).catch((err) => {
+  // Capture this bond's state key so fire-and-forget deliver keeps writing the
+  // right file even if the pump moves on to another OpenCode session (7a9b7b0f).
+  const injectStateKey = effectiveBoundSessionId()
+  void runWithBoundSessionAsync(injectStateKey, () =>
+    deliverInjectedTurn({
+      client,
+      directory,
+      sessionId,
+      auth,
+      text,
+      fileParts,
+      model,
+    }),
+  ).catch((err) => {
     logPoll(`deliverInjectedTurn failed: ${err}`)
   })
 
@@ -2191,30 +2266,43 @@ export const MIRROR_SETTLE_MS = 2_000
 const mirrorGuards = new Map<string, { at: number; inFlight: boolean }>()
 const mirrorSettleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
+function mirrorGuardKey(directory: string, sessionId: string): string {
+  return `${path.resolve(directory)}::${sessionId}`
+}
+
 export async function mirrorNow(
   client: Parameters<Plugin>[0]['client'],
   directory: string,
   sessionId: string,
   { force = false }: { force?: boolean } = {},
 ): Promise<void> {
-  const auth = resolveDevspecAuth(directory)
-  const state = readState(directory)
-  if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId) return
+  const bondKey = stateKeyForOpenCodeBond(sessionId)
+  const run = async () => {
+    const auth = resolveDevspecAuth(directory)
+    const state = readState(directory)
+    if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId) return
 
-  const guard = mirrorGuards.get(directory) ?? { at: 0, inFlight: false }
-  if (guard.inFlight) return
-  if (!force && Date.now() - guard.at < MIRROR_MIN_GAP_MS) return
-  guard.inFlight = true
-  guard.at = Date.now()
-  mirrorGuards.set(directory, guard)
-  try {
-    await mirrorLatestReply(client, auth, directory, state, sessionId)
-  } catch (err) {
-    logPoll(`mirrorNow failed: ${err}`)
-  } finally {
-    guard.inFlight = false
-    mirrorGuards.set(directory, guard)
+    const key = mirrorGuardKey(directory, sessionId)
+    const guard = mirrorGuards.get(key) ?? { at: 0, inFlight: false }
+    if (guard.inFlight) return
+    if (!force && Date.now() - guard.at < MIRROR_MIN_GAP_MS) return
+    guard.inFlight = true
+    guard.at = Date.now()
+    mirrorGuards.set(key, guard)
+    try {
+      await mirrorLatestReply(client, auth, directory, state, sessionId)
+    } catch (err) {
+      logPoll(`mirrorNow failed: ${err}`)
+    } finally {
+      guard.inFlight = false
+      mirrorGuards.set(key, guard)
+    }
   }
+  if (bondKey === undefined) {
+    await run()
+    return
+  }
+  await runWithBoundSessionAsync(bondKey, run)
 }
 
 /**
@@ -2226,17 +2314,18 @@ export function scheduleMirrorNow(
   directory: string,
   sessionId: string,
 ): void {
-  const prev = mirrorSettleTimers.get(directory)
+  const key = mirrorGuardKey(directory, sessionId)
+  const prev = mirrorSettleTimers.get(key)
   if (prev) clearTimeout(prev)
   const timer = setTimeout(() => {
-    mirrorSettleTimers.delete(directory)
+    mirrorSettleTimers.delete(key)
     void mirrorNow(client, directory, sessionId)
   }, MIRROR_SETTLE_MS)
   // Don't keep the process alive solely for this timer.
   if (typeof timer === 'object' && timer && 'unref' in timer) {
     ;(timer as NodeJS.Timeout).unref()
   }
-  mirrorSettleTimers.set(directory, timer)
+  mirrorSettleTimers.set(key, timer)
 }
 
 /** Cancel any pending settle timer and mirror immediately (session.idle path). */
@@ -2245,9 +2334,10 @@ export function flushMirrorNow(
   directory: string,
   sessionId: string,
 ): void {
-  const prev = mirrorSettleTimers.get(directory)
+  const key = mirrorGuardKey(directory, sessionId)
+  const prev = mirrorSettleTimers.get(key)
   if (prev) clearTimeout(prev)
-  mirrorSettleTimers.delete(directory)
+  mirrorSettleTimers.delete(key)
   void mirrorNow(client, directory, sessionId, { force: true })
 }
 

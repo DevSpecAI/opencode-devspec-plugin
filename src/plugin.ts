@@ -2,13 +2,16 @@ import type { Plugin } from '@opencode-ai/plugin'
 import {
   flushMirrorNow,
   handleSessionError,
+  listOpenCodeBondSessions,
   logPoll,
   pollAndDeliver,
   recordConnectionEventFromTool,
   recordManualPostSessionMessage,
   recordRemoteControlSkillCommand,
+  runWithBoundSessionAsync,
   scheduleMirrorNow,
   setBusy,
+  stateKeyForOpenCodeBond,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
 
@@ -55,6 +58,13 @@ const IDLE_RECHECK_MS = 5000
  *     now separate. Later runs DID see `session.idle` fire, so both paths are kept —
  *     `setBusy` and `mirrorNow` are both idempotent.
  *
+ * MULTI-BOND (item 7a9b7b0f): one OpenCode process may host several chat sessions,
+ * each `/devspec.remote`-bonded to a different DevSpec room. The pump iterates
+ * every active OpenCode session in `listOpenCodeBondSessions()` — a second attach
+ * ADDS a bond; it must never overwrite a single pin (that idle_timeouted Ivory
+ * Panda when Racing Dolphin joined, 2026-08-07). Ending one bond removes only
+ * that entry; the pump keeps running for the others.
+ *
  * Still no separate poller process or inbox file, unlike Claude Code's design — see
  * remote-control.ts for why.
  *
@@ -74,31 +84,16 @@ const IDLE_RECHECK_MS = 5000
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
 export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
-  // Real bug found live-testing (severe — a live runaway ping-pong loop,
-  // not just a delivery gap): this used to update from the generic `event`
-  // hook's sessionID on EVERY event type, unconditionally. OpenCode's
-  // server re-syncs/touches previously-persisted sessions for a project
-  // directory on its own (background session.updated/status/diff activity
-  // for OLD sessions the plugin was never actually driving) — so this
-  // cache kept getting silently hijacked away from the CURRENT connect's
-  // session to some unrelated, dormant one and back again. Two sessions
-  // then took turns being "last known," and since mirrorLatestReply's
-  // dedup is keyed off content it had already posted for EACH session
-  // independently, the two rotated forever, reposting each other's static
-  // last message over and over with no new content ever involved.
-  //
-  // Fixed by only ever setting this from `tool.execute.after`'s own
-  // `sessionID` field (confirmed present on the hook's input type) at the
-  // exact moment register_connection/attach_connection succeeds — the one
-  // signal that unambiguously identifies the session driving THIS connect,
-  // immune to background noise from sessions we have nothing to do with.
-  let lastKnownSessionId: string | null = null
+  // Fallback when an event lacks sessionID (rare). Prefer the event's own
+  // sessionID for mirror/idle so multi-bond mirrors stay on the right room.
+  // Bonds themselves live in remote-control's openCodeBonds map — never a
+  // single lastKnown overwrite (7a9b7b0f).
+  let fallbackSessionId: string | null = null
 
-  // ---- The long-poll pump (item c9457ab8) -------------------------------------------
-  // One self-scheduling loop instead of a setInterval: issue a held request, act the
-  // instant it returns, immediately issue the next. `stopped` + the AbortController are
-  // what let `dispose` (below) cut a 25s hold short so a held request can never outlive
-  // the host process — the reason the old interval had to be `unref`'d.
+  // ---- The long-poll pump (item c9457ab8 + multi-bond 7a9b7b0f) ---------------------
+  // One self-scheduling loop: for each active bond, issue a held request (scoped
+  // to that bond's state key), then loop. `stopped` + AbortController let dispose
+  // cut an in-flight hold short so it never outlives the host process.
   let stopped = false
   const abort = new AbortController()
   let pumpRunning = false
@@ -114,32 +109,45 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   const pump = async () => {
     if (pumpRunning) return
     pumpRunning = true
-    logPoll('pump: started (long-poll mode)')
+    logPoll('pump: started (long-poll multi-bond mode)')
     try {
       while (!stopped) {
-        const sessionId = lastKnownSessionId
-        if (!sessionId) {
-          // No OpenCode session pinned yet (no `/devspec.remote` run in this process).
-          // Costs zero network calls — the gate is purely local.
+        const sessions = listOpenCodeBondSessions()
+        if (sessions.length === 0) {
+          // No `/devspec.remote` bond yet. Costs zero network calls.
           await sleep(IDLE_RECHECK_MS)
           continue
         }
-        try {
-          const outcome = await pollAndDeliver(client, directory, sessionId, {
-            signal: abort.signal,
-          })
-          if (outcome.stop) {
-            logPoll(`pump: stopping — ${outcome.reason ?? 'connection ended'}`)
-            stopped = true
-            break
+        let minDelay = Number.POSITIVE_INFINITY
+        for (const sessionId of sessions) {
+          if (stopped) break
+          const stateKey = stateKeyForOpenCodeBond(sessionId)
+          if (stateKey === undefined) continue
+          try {
+            const outcome = await runWithBoundSessionAsync(stateKey, () =>
+              pollAndDeliver(client, directory, sessionId, {
+                signal: abort.signal,
+              }),
+            )
+            if (outcome.stop) {
+              // One bond ended — keep polling the others (forgetOpenCodeBond already
+              // ran inside pollAndDeliver). Do NOT set stopped / exit the pump.
+              logPoll(
+                `pump: bond ended for opencodeSession=${sessionId} — ${outcome.reason ?? 'connection ended'} ` +
+                  `(remaining=${listOpenCodeBondSessions().length})`,
+              )
+              continue
+            }
+            if (outcome.delayMs < minDelay) minDelay = outcome.delayMs
+          } catch (err) {
+            // Remote control is best-effort: a delivery failure must never interrupt the
+            // session the user is actually working in, and must never kill the pump.
+            logPoll(`pump: pollAndDeliver threw for ${sessionId}: ${err}`)
+            if (IDLE_RECHECK_MS < minDelay) minDelay = IDLE_RECHECK_MS
           }
-          await sleep(outcome.delayMs)
-        } catch (err) {
-          // Remote control is best-effort: a delivery failure must never interrupt the
-          // session the user is actually working in, and must never kill the pump.
-          logPoll(`pump: pollAndDeliver threw: ${err}`)
-          await sleep(IDLE_RECHECK_MS)
         }
+        if (!Number.isFinite(minDelay)) minDelay = IDLE_RECHECK_MS
+        await sleep(minDelay)
       }
     } finally {
       pumpRunning = false
@@ -147,7 +155,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     }
   }
 
-  // Start immediately: with no session pinned yet the loop idles on a purely local
+  // Start immediately: with no bond yet the loop idles on a purely local
   // check (no MCP calls at all), so starting early costs nothing and means the first
   // poll goes out the moment `/devspec.remote` completes its handshake.
   void pump()
@@ -166,9 +174,8 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       registerBundledCommands(cfg)
     },
     event: async ({ event }) => {
-      // Deliberately NOT updating lastKnownSessionId here anymore — see the
-      // comment on its declaration above. Only used now for the (still
-      // never observed, but kept for forward-compat) session.idle path.
+      // Never hijack bonds from background session.* noise — only tool.execute.after
+      // register/attach adds bonds (see comment historically on lastKnownSessionId).
       const props = (event as { properties?: Record<string, unknown> }).properties
       const sessionId = typeof props?.sessionID === 'string' ? props.sessionID : undefined
       let propsSummary = ''
@@ -183,15 +190,22 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // Turn finished: clear busy and mirror the reply immediately. Delivery is the
         // pump's job now, so this no longer needs to poll. Flush any pending settle
         // timer from message.updated so we do not double-fire after the idle path.
-        await setBusy(directory, false)
-        const target = sessionId ?? lastKnownSessionId
-        if (target) flushMirrorNow(client, directory, target)
+        const target = sessionId ?? fallbackSessionId
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, () => setBusy(directory, false))
+          } else {
+            await setBusy(directory, false)
+          }
+          flushMirrorNow(client, directory, target)
+        }
       } else if (event.type === 'message.updated') {
         // MIRRORING is event-driven now, not a side-effect of the poll tick (see
         // scheduleMirrorNow). Debounce so a model that still calls
         // post_session_message (against skill docs) can record its content hash
         // before we mirror — otherwise text lands first and we double-post.
-        const target = sessionId ?? lastKnownSessionId
+        const target = sessionId ?? fallbackSessionId
         if (target) scheduleMirrorNow(client, directory, target)
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
@@ -206,20 +220,23 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     },
     'tool.execute.after': async (input, output) => {
       try {
-        recordConnectionEventFromTool(directory, input.tool, input.args, output)
+        const opencodeSessionId = typeof input.sessionID === 'string' ? input.sessionID : null
+        recordConnectionEventFromTool(directory, input.tool, input.args, output, opencodeSessionId)
         recordManualPostSessionMessage(directory, input.tool, input.args)
         if (
           (input.tool === 'devspec_register_connection' ||
             input.tool.endsWith('register_connection') ||
             input.tool === 'devspec_attach_connection' ||
             input.tool.endsWith('attach_connection')) &&
-          typeof input.sessionID === 'string'
+          opencodeSessionId
         ) {
-          logPoll(`pinning lastKnownSessionId=${input.sessionID} from tool=${input.tool}`)
-          lastKnownSessionId = input.sessionID
-          // Re-arm if the pump ever exited (e.g. a previous connection was ended from
-          // the Agents page): a fresh connect must start polling again. The pumpRunning
-          // guard makes this a no-op while it is already looping.
+          fallbackSessionId = opencodeSessionId
+          logPoll(
+            `bond handshake tool=${input.tool} opencodeSession=${opencodeSessionId} ` +
+              `active=${listOpenCodeBondSessions().length}`,
+          )
+          // Re-arm if the pump ever exited (dispose / empty). pumpRunning makes
+          // this a no-op while the multi-bond loop is already alive.
           if (stopped) {
             stopped = false
             logPoll('pump: re-arming after a fresh connect handshake')
