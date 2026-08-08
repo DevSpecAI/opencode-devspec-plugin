@@ -406,6 +406,91 @@ export function assistantTextFromMessage(message: { parts?: unknown } | null | u
     .trim()
 }
 
+/** Shape `post_session_message` accepts for reply model attribution. */
+export type OpenCodeModelStamp = { providerID: string; modelID: string }
+
+const MODEL_SHAPE_SNIPPET_MAX = 240
+
+/**
+ * Compact, safe-for-logs preview of an unknown model field — never silent
+ * when the stamp guard rejects a shape (Obsidian Gecko / Restless Ocelot).
+ */
+export function summarizeModelShapeSnippet(raw: unknown): string {
+  if (raw === undefined) return 'undefined'
+  if (raw === null) return 'null'
+  if (typeof raw === 'string') {
+    return raw.length > MODEL_SHAPE_SNIPPET_MAX
+      ? `${raw.slice(0, MODEL_SHAPE_SNIPPET_MAX)}…`
+      : raw
+  }
+  try {
+    const json = JSON.stringify(raw)
+    if (json == null) return Object.prototype.toString.call(raw)
+    return json.length > MODEL_SHAPE_SNIPPET_MAX
+      ? `${json.slice(0, MODEL_SHAPE_SNIPPET_MAX)}…`
+      : json
+  } catch {
+    return Object.prototype.toString.call(raw)
+  }
+}
+
+function pickStringField(obj: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const v = obj[key]
+    if (typeof v === 'string' && v.trim()) return v.trim()
+  }
+  return null
+}
+
+/**
+ * Extract `{ providerID, modelID }` from OpenCode `message.info.model` (or a
+ * dispatch_model override). Accepts common aliases; returns why the stamp
+ * failed when the raw value is present but unusable — callers must log that
+ * path instead of dropping model silently.
+ */
+export function extractOpenCodeReplyModel(raw: unknown): {
+  model?: OpenCodeModelStamp
+  missingReason?: 'absent' | 'non_object' | 'missing_fields' | 'empty_fields'
+  rawSnippet?: string
+} {
+  if (raw == null) return { missingReason: 'absent' }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) return { missingReason: 'empty_fields', rawSnippet: summarizeModelShapeSnippet(raw) }
+    const slash = trimmed.indexOf('/')
+    if (slash > 0 && slash < trimmed.length - 1) {
+      return {
+        model: {
+          providerID: trimmed.slice(0, slash),
+          modelID: trimmed.slice(slash + 1),
+        },
+      }
+    }
+    return { missingReason: 'missing_fields', rawSnippet: summarizeModelShapeSnippet(raw) }
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { missingReason: 'non_object', rawSnippet: summarizeModelShapeSnippet(raw) }
+  }
+  const obj = raw as Record<string, unknown>
+  const providerID = pickStringField(obj, ['providerID', 'providerId', 'provider'])
+  const modelID = pickStringField(obj, ['modelID', 'modelId', 'model'])
+  if (providerID && modelID) return { model: { providerID, modelID } }
+  if (!providerID && !modelID) {
+    return { missingReason: 'missing_fields', rawSnippet: summarizeModelShapeSnippet(raw) }
+  }
+  return { missingReason: 'empty_fields', rawSnippet: summarizeModelShapeSnippet(raw) }
+}
+
+/** Story `data` fragment when a model stamp is known. */
+export function modelStoryData(model: OpenCodeModelStamp | undefined): Record<string, unknown> {
+  if (!model) return {}
+  return {
+    model: `${model.providerID}/${model.modelID}`,
+    providerID: model.providerID,
+    modelID: model.modelID,
+  }
+}
+
 /**
  * True when the latest assistant message still has an in-flight tool
  * (pending / running). Completed tools alone are not progress — the turn
@@ -2027,6 +2112,31 @@ export async function pollAndDeliver(
       `${context?.owner_ambient.length ?? 0} owner-ambient, ${context?.room_context.length ?? 0} room-context, ` +
       `${context?.dropped ?? 0} dropped`,
   )
+  // Per-message provider/model override — only meaningful for provider-agnostic hosts.
+  const rawDispatchModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
+  const dispatchModelExtract = extractOpenCodeReplyModel(rawDispatchModel)
+  const model = dispatchModelExtract.model
+  if (rawDispatchModel != null && !model) {
+    logPoll(
+      `inject: dispatch_model shape rejected (${dispatchModelExtract.missingReason}): ` +
+        `${dispatchModelExtract.rawSnippet ?? summarizeModelShapeSnippet(rawDispatchModel)}`,
+    )
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'model_missing',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'promptAsync',
+      reason: dispatchModelExtract.missingReason ?? 'missing_fields',
+      data: {
+        source: 'dispatch_model',
+        model_shape: dispatchModelExtract.rawSnippet ?? summarizeModelShapeSnippet(rawDispatchModel),
+      },
+    })
+  }
+
   logRemoteControlStory({
     phase: 'inject',
     outcome: 'queued',
@@ -2040,16 +2150,9 @@ export async function pollAndDeliver(
       commands: commands.length,
       owner_ambient: context?.owner_ambient.length ?? 0,
       room_context: context?.room_context.length ?? 0,
+      ...modelStoryData(model),
     },
   })
-
-  // Per-message provider/model override — only meaningful for provider-agnostic hosts.
-  const rawModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
-  const model =
-    rawModel && typeof rawModel === 'object' &&
-    typeof rawModel.providerID === 'string' && typeof rawModel.modelID === 'string'
-      ? { providerID: rawModel.providerID, modelID: rawModel.modelID }
-      : undefined
 
   // Assert busy BEFORE returning to the pump so the next poll_connection re-asserts
   // busy:true. Inject (baseline + promptAsync + mirror) must NOT block presence —
@@ -2064,6 +2167,10 @@ export async function pollAndDeliver(
     codename: state.codename,
     tool: 'setBusy',
     reason: 'inject_turn',
+    data: {
+      commands: commands.length,
+      ...modelStoryData(model),
+    },
   })
 
   // Capture this bond's state key so fire-and-forget deliver keeps writing the
@@ -2151,6 +2258,7 @@ export async function deliverInjectedTurn(input: {
       codename: state.codename,
       tool: 'promptAsync',
       reason: 'owner_commands',
+      data: { ...modelStoryData(model) },
     })
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
@@ -2595,11 +2703,34 @@ async function mirrorLatestReply(
   // if we lost a race on lastMirrored — re-check isn't perfect without a
   // lock, but the set membership after merge is enough when both use patchState.
 
-  const modelInfo = last.info.model
-  const model =
-    modelInfo && typeof modelInfo.providerID === 'string' && typeof modelInfo.modelID === 'string'
-      ? { providerID: modelInfo.providerID, modelID: modelInfo.modelID }
-      : undefined
+  const modelExtract = extractOpenCodeReplyModel(last.info?.model)
+  const model = modelExtract.model
+  if (!model) {
+    // Never silent — DevSpec has no record of which model answered when the
+    // stamp is dropped (Obsidian Gecko RCA / Restless Ocelot).
+    const shape =
+      modelExtract.rawSnippet ??
+      summarizeModelShapeSnippet(last.info?.model)
+    logPoll(
+      `mirrorLatestReply: model stamp missing (${modelExtract.missingReason ?? 'absent'}) ` +
+        `last.id=${last.info.id} shape=${shape}`,
+    )
+    logRemoteControlStory({
+      phase: 'mirror_post',
+      outcome: 'model_missing',
+      connectionId: fresh.connectionId,
+      sessionId: fresh.sessionId,
+      agent: AGENT_NAME,
+      codename: fresh.codename,
+      tool: 'post_session_message',
+      reason: modelExtract.missingReason ?? 'absent',
+      data: {
+        message_id: last.info.id,
+        model_shape: shape,
+        source: 'info.model',
+      },
+    })
+  }
 
   try {
     await mcpToolsCall({
@@ -2622,10 +2753,28 @@ async function mirrorLatestReply(
       recentPostedContentHashes: hashes,
     })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
+    logRemoteControlStory({
+      phase: 'mirror_post',
+      outcome: 'failed',
+      connectionId: fresh.connectionId,
+      sessionId: fresh.sessionId,
+      agent: AGENT_NAME,
+      codename: fresh.codename,
+      tool: 'post_session_message',
+      reason: 'post_failed',
+      data: {
+        message_id: last.info.id,
+        error: err instanceof Error ? err.message : String(err),
+        ...modelStoryData(model),
+      },
+    })
     return
   }
 
-  logPoll(`mirrorLatestReply: posted last.id=${last.info.id} via connection_id`)
+  logPoll(
+    `mirrorLatestReply: posted last.id=${last.info.id} via connection_id` +
+      (model ? ` model=${model.providerID}/${model.modelID}` : ' model=(none)'),
+  )
   logRemoteControlStory({
     phase: 'mirror_post',
     outcome: 'posted',
@@ -2635,7 +2784,26 @@ async function mirrorLatestReply(
     codename: fresh.codename,
     tool: 'post_session_message',
     reason: 'plugin_mirror',
-    data: { message_id: last.info.id },
+    data: {
+      message_id: last.info.id,
+      ...modelStoryData(model),
+      model_stamped: Boolean(model),
+    },
+  })
+  logRemoteControlStory({
+    phase: 'done',
+    outcome: model ? 'mirrored' : 'mirrored_without_model',
+    connectionId: fresh.connectionId,
+    sessionId: fresh.sessionId,
+    agent: AGENT_NAME,
+    codename: fresh.codename,
+    tool: 'post_session_message',
+    reason: 'plugin_mirror',
+    data: {
+      message_id: last.info.id,
+      ...modelStoryData(model),
+      model_stamped: Boolean(model),
+    },
   })
 
   // Real bug found live-testing: `session.idle` — the event the busy:false
