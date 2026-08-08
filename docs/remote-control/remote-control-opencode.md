@@ -53,6 +53,7 @@ There is **no** separate inbox wait process and **no** “re-arm the wait” ste
 | `MCP_HEARTBEAT_TIMEOUT_MS` | 5s | Heartbeat / detach |
 | `STALL_TIMEOUT_MS` | 120s (override `DEVSPEC_OPENCODE_STALL_MS`) | Busy with no observable progress |
 | `MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES` | 2 | Cap keepalive slides on the same “running” tool id |
+| `PERMISSION_ASK_STALL_MS` | 15s | Early stall after `permission.asked` (never slides as `active_tool`) |
 | `IDLE_RECHECK_MS` (plugin) | 5s | Sleep only when **not connected** yet or after errors — not a poll cadence |
 
 `poll_connection` heartbeats server-side at the **start** of each hold. A completed hold with nothing to deliver is normal — re-issue immediately (`delayMs: 0`). A client ceiling timeout on the hold is also normal (nothing arrived) — re-issue, do not back off as if the bond died.
@@ -134,6 +135,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 
 - Double reply: mirror + model both post the same answer.
 - Stall: busy with **no observable progress** for the stall timeout (empty reply text *and* no new assistant step *and* no in-flight tool). Active tool loops slide the timer — text-only emptiness is not enough to stall (Tembo / Racing Heron false positives). See `decideBusyStall` / `checkBusyStall` and `poll.log`. Eternal “running” tool parts are capped by `MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES`.
+- **Hung `permission.asked`** (item bb633917): a permission wait is **not** progress. `permission.asked` (plugin event) sets `permissionAskedPending` / `permissionAskedAt`; `decideBusyStall` never returns `slide`/`active_tool` while that is set, and stalls with story reason `permission_asked` after `PERMISSION_ASK_STALL_MS` (~15s) — sooner than the empty-assistant / multi-slide path (~minutes). Message-part detection (`messageHasPendingPermissionAsk`) is a belt-and-suspenders when the event is missed. Cleared on permission resolved/denied and whenever busy clears.
 - **Presence starve → idle_timeout** (sessions Gentle Weasel / Crimson Osprey, 2026-08-07): poll never reached within ~90s after pickup or after a healthy turn. Look for client story `pickup` → silence → `ended`/`idle_timeout` with large `last_poll_age_ms`, or `poll_error`/`presence_gap`. Guard: fire-and-forget inject + non-blocking stall + session API timeouts.
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).

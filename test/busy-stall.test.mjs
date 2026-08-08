@@ -2,13 +2,16 @@
 /**
  * Activity-aware busy stall (item c73d23a9) — tool-heavy turns must not
  * false-stall on empty reply text alone.
+ * Permission-ask path (item bb633917) — hung permission.asked is not progress.
  */
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   decideBusyStall,
   messageHasActiveToolWork,
+  messageHasPendingPermissionAsk,
   assistantTextFromMessage,
+  PERMISSION_ASK_STALL_MS,
 } from '../dist/remote-control.js'
 
 const TIMEOUT = 120_000
@@ -36,6 +39,69 @@ describe('messageHasActiveToolWork', () => {
     )
     assert.equal(messageHasActiveToolWork(assistant('m1', [{ type: 'reasoning', text: '…' }])), false)
     assert.equal(messageHasActiveToolWork(assistant('m1', [{ type: 'text', text: 'hi' }])), false)
+  })
+})
+
+describe('messageHasPendingPermissionAsk', () => {
+  it('detects tool state ask / waiting / permission*', () => {
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [{ type: 'tool', state: { status: 'ask' } }]),
+      ),
+      true,
+    )
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [{ type: 'tool', state: { status: 'waiting' } }]),
+      ),
+      true,
+    )
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [{ type: 'tool', state: { status: 'awaiting_permission' } }]),
+      ),
+      true,
+    )
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [{ type: 'tool', state: { status: 'permission' } }]),
+      ),
+      true,
+    )
+  })
+
+  it('detects permission part types and nested permission flags', () => {
+    assert.equal(
+      messageHasPendingPermissionAsk(assistant('m1', [{ type: 'permission' }])),
+      true,
+    )
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [{ type: 'tool', state: { status: 'running', permissionAsk: true } }]),
+      ),
+      true,
+    )
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [
+          { type: 'tool', state: { status: 'running', permission: { status: 'asked' } } },
+        ]),
+      ),
+      true,
+    )
+  })
+
+  it('is false for ordinary running tools without an ask', () => {
+    assert.equal(
+      messageHasPendingPermissionAsk(
+        assistant('m1', [{ type: 'tool', state: { status: 'running' } }]),
+      ),
+      false,
+    )
+    assert.equal(
+      messageHasPendingPermissionAsk(assistant('m1', [{ type: 'text', text: 'hi' }])),
+      false,
+    )
   })
 })
 
@@ -108,6 +174,7 @@ describe('decideBusyStall', () => {
       previousProgressAssistantId: 'm1',
     })
     assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'empty_assistant_timeout')
     assert.equal(d.assistantId, 'm1')
   })
 
@@ -119,6 +186,7 @@ describe('decideBusyStall', () => {
       previousProgressAssistantId: null,
     })
     assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'empty_assistant_timeout')
     assert.equal(d.assistantId, null)
   })
 
@@ -145,6 +213,7 @@ describe('decideBusyStall', () => {
       maxActiveToolSlides: 2,
     })
     assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'active_tool_cap')
     assert.equal(d.assistantId, 'm1')
   })
 
@@ -160,5 +229,66 @@ describe('decideBusyStall', () => {
     assert.equal(d.action, 'slide')
     assert.equal(d.reason, 'active_tool')
     assert.equal(d.assistantId, 'm2')
+  })
+
+  it('never slides active_tool while a permission ask is pending', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [{ type: 'tool', state: { status: 'running' } }]),
+      previousProgressAssistantId: 'm1',
+      sameAssistantActiveToolSlides: 0,
+      maxActiveToolSlides: 2,
+      permissionAskPending: true,
+      permissionAskElapsedMs: 1_000,
+      permissionAskStallMs: PERMISSION_ASK_STALL_MS,
+    })
+    assert.equal(d.action, 'under_timeout')
+  })
+
+  it('stalls after the permission-ask window even with a running tool', () => {
+    const d = decideBusyStall({
+      elapsedMs: 20_000,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [
+        { type: 'tool', state: { status: 'running' } },
+        { type: 'permission' },
+      ]),
+      previousProgressAssistantId: 'm1',
+      sameAssistantActiveToolSlides: 0,
+      maxActiveToolSlides: 2,
+      permissionAskPending: true,
+      permissionAskElapsedMs: PERMISSION_ASK_STALL_MS,
+      permissionAskStallMs: PERMISSION_ASK_STALL_MS,
+    })
+    assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'permission_asked')
+    assert.equal(d.assistantId, 'm1')
+  })
+
+  it('detects permission ask from message parts without an explicit flag', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [{ type: 'tool', state: { status: 'ask' } }]),
+      previousProgressAssistantId: 'm1',
+      permissionAskElapsedMs: PERMISSION_ASK_STALL_MS,
+    })
+    assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'permission_asked')
+  })
+
+  it('without permission, active_tool still slides before the cap', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [{ type: 'tool', state: { status: 'running' } }]),
+      previousProgressAssistantId: 'm1',
+      sameAssistantActiveToolSlides: 0,
+      maxActiveToolSlides: 2,
+      permissionAskPending: false,
+    })
+    assert.equal(d.action, 'slide')
+    assert.equal(d.reason, 'active_tool')
   })
 })

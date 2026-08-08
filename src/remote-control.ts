@@ -159,6 +159,15 @@ export const PRESENCE_GAP_WARN_COOLDOWN_MS = 30_000
 export const MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES = 2
 
 /**
+ * After OpenCode emits `permission.asked` (or a tool part is stuck in an ask /
+ * permission-wait state), how long we wait before clearing busy. A hung
+ * permission prompt is not progress — do not slide the busy timer the way a
+ * healthy `active_tool` does (live hang: write tool `running` + external_directory
+ * ask → multi-slide then ~6 min empty_assistant_timeout).
+ */
+export const PERMISSION_ASK_STALL_MS = 15_000
+
+/**
  * Race a promise against a wall-clock ceiling. Used for OpenCode session API
  * calls that have no built-in timeout.
  */
@@ -270,6 +279,17 @@ interface ConnectionState {
    */
   stallActiveToolSlides?: number | null
   /**
+   * True while OpenCode is waiting on a permission prompt (`permission.asked`
+   * or equivalent). Cleared when the ask is resolved/denied or busy clears.
+   * Stall policy treats this as non-progress — never an `active_tool` slide.
+   */
+  permissionAskedPending?: boolean
+  /**
+   * Epoch ms when we first observed the pending permission ask. Used with
+   * `PERMISSION_ASK_STALL_MS` for an early stall (sooner than `STALL_TIMEOUT_MS`).
+   */
+  permissionAskedAt?: number | null
+  /**
    * Bounded list of OpenCode assistant message ids already mirrored to
    * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
    * pointer only stops re-posting the SAME message twice in a row). Real
@@ -375,6 +395,10 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
       stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
       stallActiveToolSlides: busy ? 0 : null,
+      // Permission wait is turn-scoped — clear on both busy edges so a stale
+      // ask cannot poison the next turn or linger after we clear busy.
+      permissionAskedPending: false,
+      permissionAskedAt: null,
     })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
@@ -512,16 +536,127 @@ export function messageHasActiveToolWork(message: { parts?: unknown } | null | u
   return false
 }
 
+/**
+ * True when the latest assistant message indicates OpenCode is waiting on a
+ * permission prompt (hung `permission.asked`). Defensive across part shapes
+ * OpenCode has used: dedicated permission parts, tool state ask/waiting/
+ * permission*, and nested permission flags. A "running" tool alone is NOT
+ * enough — that still looks like healthy work until an ask is present.
+ */
+export function messageHasPendingPermissionAsk(
+  message: { parts?: unknown } | null | undefined,
+): boolean {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue
+    const part = p as Record<string, unknown>
+    const type = String(part.type ?? '').toLowerCase()
+    if (
+      type === 'permission' ||
+      type === 'permission_ask' ||
+      type === 'permission-ask' ||
+      type === 'permission.asked'
+    ) {
+      return true
+    }
+
+    const topStatus = String(part.status ?? '').toLowerCase()
+    if (
+      topStatus === 'ask' ||
+      topStatus === 'waiting' ||
+      topStatus === 'permission' ||
+      topStatus === 'permission_ask' ||
+      topStatus === 'awaiting_permission' ||
+      topStatus.includes('permission')
+    ) {
+      return true
+    }
+    if (part.permission === true || part.permissionAsk === true || part.needsPermission === true) {
+      return true
+    }
+
+    const state = part.state
+    if (state && typeof state === 'object') {
+      const st = state as Record<string, unknown>
+      const status = String(st.status ?? '').toLowerCase()
+      if (
+        status === 'ask' ||
+        status === 'waiting' ||
+        status === 'permission' ||
+        status === 'permission_ask' ||
+        status === 'awaiting_permission' ||
+        status.includes('permission')
+      ) {
+        return true
+      }
+      if (st.permission === true || st.permissionAsk === true || st.needsPermission === true) {
+        return true
+      }
+      const nestedPerm = st.permission
+      if (nestedPerm && typeof nestedPerm === 'object') {
+        const np = nestedPerm as Record<string, unknown>
+        const nestStatus = String(np.status ?? np.state ?? '').toLowerCase()
+        if (
+          nestStatus === 'ask' ||
+          nestStatus === 'asked' ||
+          nestStatus === 'pending' ||
+          nestStatus === 'waiting' ||
+          nestStatus.includes('ask')
+        ) {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Record that OpenCode asked for permission (plugin `permission.asked` path).
+ * Idempotent on the timestamp — keep the first ask time so the early stall
+ * clock does not reset if the event repeats.
+ */
+export function markPermissionAsked(directory: string, nowMs: number = Date.now()): void {
+  const state = readState(directory)
+  if (!state) return
+  if (state.permissionAskedPending && state.permissionAskedAt != null) {
+    logPoll(`markPermissionAsked: already pending since ${state.permissionAskedAt}`)
+    return
+  }
+  patchState(directory, {
+    permissionAskedPending: true,
+    permissionAskedAt: state.permissionAskedAt ?? nowMs,
+  })
+  logPoll(`markPermissionAsked: pending permission ask at ${state.permissionAskedAt ?? nowMs}`)
+}
+
+/** Clear a pending permission ask (resolved / denied / replied, or busy clear). */
+export function clearPermissionAsked(directory: string): void {
+  const state = readState(directory)
+  if (!state) return
+  if (!state.permissionAskedPending && state.permissionAskedAt == null) return
+  patchState(directory, {
+    permissionAskedPending: false,
+    permissionAskedAt: null,
+  })
+  logPoll('clearPermissionAsked: cleared pending permission ask')
+}
+
 export type BusyStallDecision =
   | { action: 'under_timeout' }
   | { action: 'has_text' }
   | { action: 'slide'; reason: 'active_tool' | 'new_assistant'; assistantId: string | null }
-  | { action: 'stall'; assistantId: string | null }
+  | {
+      action: 'stall'
+      assistantId: string | null
+      reason: 'permission_asked' | 'empty_assistant_timeout' | 'active_tool_cap'
+    }
 
 /**
  * Pure stall policy (unit-tested). Call only after `elapsedMs >= timeoutMs`
  * except the early `under_timeout` branch used by callers that still gate
- * on wall-clock first.
+ * on wall-clock first — and the permission-ask early path, which can stall
+ * before `timeoutMs` once `permissionAskElapsedMs >= permissionAskStallMs`.
  */
 export function decideBusyStall(input: {
   elapsedMs: number
@@ -531,15 +666,34 @@ export function decideBusyStall(input: {
   /** Slides already granted for the current `previousProgressAssistantId` via active_tool. */
   sameAssistantActiveToolSlides?: number
   maxActiveToolSlides?: number
+  /** Hung permission wait — never treated as active_tool progress. */
+  permissionAskPending?: boolean
+  /** ms since `permissionAskedAt` (0 if pending but clock unknown). */
+  permissionAskElapsedMs?: number
+  permissionAskStallMs?: number
 }): BusyStallDecision {
-  if (input.elapsedMs < input.timeoutMs) return { action: 'under_timeout' }
-
   const lastId =
     typeof input.lastAssistant?.info?.id === 'string' && input.lastAssistant.info.id.length > 0
       ? input.lastAssistant.info.id
       : null
 
   if (assistantTextFromMessage(input.lastAssistant)) return { action: 'has_text' }
+
+  const permissionPending =
+    !!input.permissionAskPending || messageHasPendingPermissionAsk(input.lastAssistant)
+  const askStallMs = input.permissionAskStallMs ?? PERMISSION_ASK_STALL_MS
+  const askElapsed = input.permissionAskElapsedMs ?? 0
+
+  if (permissionPending) {
+    // Never slide on active_tool while a permission ask is outstanding — the
+    // tool looks "running" but nothing can proceed until a human answers.
+    if (askElapsed >= askStallMs) {
+      return { action: 'stall', assistantId: lastId, reason: 'permission_asked' }
+    }
+    return { action: 'under_timeout' }
+  }
+
+  if (input.elapsedMs < input.timeoutMs) return { action: 'under_timeout' }
 
   if (messageHasActiveToolWork(input.lastAssistant)) {
     const prev = input.previousProgressAssistantId ?? null
@@ -548,7 +702,7 @@ export function decideBusyStall(input: {
     // Same stuck "running" tool forever is not progress — cap slides so keepalive
     // cannot starve poll_connection until the server idle_timeouts the bond.
     if (lastId && lastId === prev && slides >= max) {
-      return { action: 'stall', assistantId: lastId }
+      return { action: 'stall', assistantId: lastId, reason: 'active_tool_cap' }
     }
     return { action: 'slide', reason: 'active_tool', assistantId: lastId }
   }
@@ -558,7 +712,7 @@ export function decideBusyStall(input: {
     return { action: 'slide', reason: 'new_assistant', assistantId: lastId }
   }
 
-  return { action: 'stall', assistantId: lastId }
+  return { action: 'stall', assistantId: lastId, reason: 'empty_assistant_timeout' }
 }
 
 /** Normalize reply text before hashing so trivial whitespace drift cannot bypass dedup. */
@@ -713,7 +867,9 @@ async function postSessionNotice(
  * If we've been busy longer than STALL_TIMEOUT_MS with no observable progress
  * (no reply text, no new assistant step, no in-flight tool), clear busy and
  * warn in the DevSpec session. Healthy tool-heavy turns slide `busySince`
- * instead of false-stalling. Called every poll while busy.
+ * instead of false-stalling. A pending `permission.asked` is NOT progress —
+ * it never slides and stalls after PERMISSION_ASK_STALL_MS. Called every poll
+ * while busy.
  */
 export async function checkBusyStall(
   client: Parameters<Plugin>[0]['client'],
@@ -733,8 +889,20 @@ export async function checkBusyStall(
   }
 
   const elapsed = Date.now() - state.busySince
-  if (elapsed < STALL_TIMEOUT_MS) {
-    logPoll(`stall check: busy ${elapsed}ms (< ${STALL_TIMEOUT_MS}ms) — ok`)
+  const permissionPendingFromState = !!state.permissionAskedPending
+  const permissionAskElapsed =
+    state.permissionAskedAt != null ? Date.now() - state.permissionAskedAt : 0
+  const mayPermissionStallEarly =
+    permissionPendingFromState && permissionAskElapsed >= PERMISSION_ASK_STALL_MS
+
+  if (!mayPermissionStallEarly && elapsed < STALL_TIMEOUT_MS) {
+    logPoll(
+      `stall check: busy ${elapsed}ms (< ${STALL_TIMEOUT_MS}ms)` +
+        (permissionPendingFromState
+          ? ` permission_ask ${permissionAskElapsed}ms (< ${PERMISSION_ASK_STALL_MS}ms)`
+          : '') +
+        ' — ok',
+    )
     return
   }
 
@@ -753,6 +921,27 @@ export async function checkBusyStall(
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
   const last = assistantMessages[assistantMessages.length - 1]
+  const fromMessage = messageHasPendingPermissionAsk(last)
+  const permissionAskPending = permissionPendingFromState || fromMessage
+  // Late message-only detection (no event): treat the ask window as already
+  // elapsed so we stall instead of sliding active_tool into another 2+ minutes.
+  const permissionAskElapsedMs =
+    state.permissionAskedAt != null
+      ? Date.now() - state.permissionAskedAt
+      : fromMessage && !permissionPendingFromState
+        ? PERMISSION_ASK_STALL_MS
+        : permissionPendingFromState
+          ? permissionAskElapsed
+          : 0
+
+  if (fromMessage && !permissionPendingFromState) {
+    patchState(directory, {
+      permissionAskedPending: true,
+      permissionAskedAt: state.permissionAskedAt ?? Date.now() - PERMISSION_ASK_STALL_MS,
+    })
+    state = readState(directory) ?? state
+  }
+
   const decision = decideBusyStall({
     elapsedMs: elapsed,
     timeoutMs: STALL_TIMEOUT_MS,
@@ -760,11 +949,24 @@ export async function checkBusyStall(
     previousProgressAssistantId: state.stallProgressAssistantId,
     sameAssistantActiveToolSlides: state.stallActiveToolSlides ?? 0,
     maxActiveToolSlides: MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES,
+    permissionAskPending,
+    permissionAskElapsedMs,
+    permissionAskStallMs: PERMISSION_ASK_STALL_MS,
   })
 
   if (decision.action === 'has_text') {
     logPoll(
       `stall check: busy ${elapsed}ms but last assistant (${last?.info?.id}) has text — not a stall`,
+    )
+    return
+  }
+
+  if (decision.action === 'under_timeout') {
+    logPoll(
+      `stall check: under_timeout` +
+        (permissionAskPending
+          ? ` (permission ask ${permissionAskElapsedMs}ms / ${PERMISSION_ASK_STALL_MS}ms)`
+          : ` (busy ${elapsed}ms)`),
     )
     return
   }
@@ -797,8 +999,9 @@ export async function checkBusyStall(
   }
 
   const lastId = decision.assistantId ?? 'none'
+  const stallReason = decision.reason
   logPoll(
-    `STALL: busy ${elapsed}ms with no progress (last.id=${lastId}) — clearing busy and posting warning`,
+    `STALL: busy ${elapsed}ms reason=${stallReason} (last.id=${lastId}) — clearing busy and posting warning`,
   )
   logRemoteControlStory({
     phase: 'stall',
@@ -808,17 +1011,26 @@ export async function checkBusyStall(
     agent: AGENT_NAME,
     codename: state.codename,
     tool: 'checkBusyStall',
-    reason: 'empty_assistant_timeout',
-    data: { elapsed_ms: elapsed, stall_timeout_ms: STALL_TIMEOUT_MS, last_id: lastId },
+    reason: stallReason,
+    data: {
+      elapsed_ms: elapsed,
+      stall_timeout_ms: STALL_TIMEOUT_MS,
+      permission_ask_elapsed_ms: permissionAskPending ? permissionAskElapsedMs : undefined,
+      permission_ask_stall_ms: PERMISSION_ASK_STALL_MS,
+      last_id: lastId,
+    },
   })
   patchState(directory, { stallWarnedAt: state.busySince })
-  await postSessionNotice(
-    auth,
-    state,
-    `⚠️ OpenCode turn stalled after ${Math.round(elapsed / 1000)}s with no reply text ` +
-      `(assistant message \`${lastId}\`). Cleared the busy indicator — check ` +
-      `~/.devspec/opencode-remote-control/poll.log if this keeps happening.`,
-  )
+  const notice =
+    stallReason === 'permission_asked'
+      ? `⚠️ OpenCode turn stalled after a hung permission ask ` +
+        `(~${Math.round((permissionAskElapsedMs || elapsed) / 1000)}s; assistant \`${lastId}\`). ` +
+        `Cleared the busy indicator — approve/deny the permission in the TUI or check ` +
+        `~/.devspec/opencode-remote-control/poll.log.`
+      : `⚠️ OpenCode turn stalled after ${Math.round(elapsed / 1000)}s with no reply text ` +
+        `(assistant message \`${lastId}\`). Cleared the busy indicator — check ` +
+        `~/.devspec/opencode-remote-control/poll.log if this keeps happening.`
+  await postSessionNotice(auth, state, notice)
   await setBusy(directory, false)
 }
 
@@ -1037,6 +1249,17 @@ export function mergeConnectionStates(
       ? (primary.busySince ?? null)
       : (primary.busySince ?? secondary.busySince ?? null),
     stallWarnedAt: primary.stallWarnedAt ?? secondary.stallWarnedAt ?? null,
+    permissionAskedPending: Boolean(
+      primary.permissionAskedPending || secondary.permissionAskedPending,
+    ),
+    // Keep the earliest ask clock so a merge cannot reset the early-stall window.
+    permissionAskedAt: (() => {
+      const a = primary.permissionAskedAt ?? null
+      const b = secondary.permissionAskedAt ?? null
+      if (a == null) return b
+      if (b == null) return a
+      return Math.min(a, b)
+    })(),
     connectMirrorSuppressed: Boolean(
       primary.connectMirrorSuppressed || secondary.connectMirrorSuppressed,
     ),

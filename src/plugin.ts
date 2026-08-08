@@ -1,9 +1,11 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import {
+  clearPermissionAsked,
   flushMirrorNow,
   handleSessionError,
   listOpenCodeBondSessions,
   logPoll,
+  markPermissionAsked,
   pollAndDeliver,
   recordConnectionEventFromTool,
   recordManualPostSessionMessage,
@@ -38,6 +40,21 @@ const interactiveServeAuth = ensureServeAuthEnv(process.env)
  * delivers instantly. Kept only as the floor for the not-yet-connected case.
  */
 const IDLE_RECHECK_MS = 5000
+
+/** OpenCode emits these live; `@opencode-ai/plugin` Event unions may lag. */
+function isPermissionAskedEvent(type: string): boolean {
+  return type === 'permission.asked' || type === 'permission.ask'
+}
+
+function isPermissionResolvedEvent(type: string): boolean {
+  return (
+    type === 'permission.replied' ||
+    type === 'permission.resolved' ||
+    type === 'permission.denied' ||
+    type === 'permission.answered' ||
+    type === 'permission.reply'
+  )
+}
 
 /**
  * DevSpec OpenCode plugin entry point.
@@ -230,6 +247,39 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // `/devspec.remote` / `/devspec.remote-stop` assistant turns must never
         // mirror into the room (session e7ecc1de connect-turn race).
         recordRemoteControlSkillCommand(directory, props ?? null)
+      } else if (isPermissionAskedEvent(event.type)) {
+        // Hung permission wait is NOT stall progress — mark so checkBusyStall
+        // never slides on the still-"running" tool (bb633917). OpenCode emits
+        // `permission.asked` live; SDK Event typings may lag — compare as string.
+        const target = sessionId ?? fallbackSessionId
+        const mark = async () => {
+          markPermissionAsked(directory)
+        }
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, mark)
+          } else {
+            await mark()
+          }
+        } else {
+          await mark()
+        }
+      } else if (isPermissionResolvedEvent(event.type)) {
+        const target = sessionId ?? fallbackSessionId
+        const clear = async () => {
+          clearPermissionAsked(directory)
+        }
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, clear)
+          } else {
+            await clear()
+          }
+        } else {
+          await clear()
+        }
       }
     },
     'tool.execute.after': async (input, output) => {
