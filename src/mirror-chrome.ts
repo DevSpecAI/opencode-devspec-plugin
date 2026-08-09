@@ -7,9 +7,43 @@
  * banner body but left ``` leftovers, which were posted as a blank bubble;
  * unansweredCommands then treated that bubble as a reply and settled the
  * prior owner command. These helpers are the single place that decision lives.
+ *
+ * Live failure (Dashing Osprey / session 7976fffb): the model printed a
+ * variant status block — a box-drawing rule without the exact
+ * `━━━ DevSpec Remote Control ━━━` title — plus an "Internal note (not
+ * mirrored)" orientation paragraph. Narrow title matching left the whole
+ * turn postable; this module now treats field-block + internal-note chrome
+ * the same as the canonical banner.
  */
 
 export const REMOTE_STATUS_BANNER = '━━━ DevSpec Remote Control ━━━'
+
+/** Line-start labels in the terminal-only connect status block. */
+const STATUS_FIELD_LABELS = [
+  'Agent',
+  'Connection',
+  'Session',
+  'Status',
+  'Open',
+  'Stop with',
+] as const
+
+/** Full-width or ascii rule used as status-block delimiters. */
+const RULE_LINE_RE = /^[━─\-═]{8,}\s*$/
+
+/**
+ * Canonical title line, or a bare box-drawing rule that models invent when
+ * they skip the exact `REMOTE_STATUS_BANNER` string.
+ */
+const STATUS_OPENER_RE = /^(?:━━━\s*DevSpec Remote Control\s*━━━|[━─\-═]{8,})\s*$/
+
+const STATUS_FIELD_LINE_RE = /^(?:Agent|Connection|Session|Status|Open|Stop with):\s/
+
+/** Models sometimes paste orientation as a labelled "Internal note" aside. */
+function internalNotePattern(): RegExp {
+  // Fresh instance every call — never share a /g lastIndex across helpers.
+  return /(?:^|\n)\s*(?:>\s*)?\*{0,2}Internal note(?:\s*\([^)]*\))?\*{0,2}:[^\n]*(?:\n(?![━─\-═]{8,}\s*$)(?!(?:Agent|Connection|Session|Status|Open|Stop with):\s)[^\n]*)*/gi
+}
 
 /**
  * If the whole string is one fenced markdown block, return the inner body.
@@ -30,12 +64,46 @@ export function collapseOrphanMarkdownFences(text: string): string {
     .trim()
 }
 
+/** How many distinct status-field labels appear at line start. */
+export function statusFieldHitCount(text: string): number {
+  const t = String(text ?? '')
+  let n = 0
+  for (const label of STATUS_FIELD_LABELS) {
+    if (new RegExp(`^${label}:\\s`, 'm').test(t)) n++
+  }
+  return n
+}
+
+/**
+ * Strip labelled "Internal note (not mirrored)" orientation chrome.
+ * The skill (and models) mark this as terminal-only; it must not become a
+ * room bubble even when the status banner was already stripped or omitted.
+ */
+export function stripInternalNoteChrome(text: string): string {
+  return String(text ?? '')
+    .replace(internalNotePattern(), '\n')
+    .replace(/^\s+|\s+$/g, '')
+}
+
 /**
  * Strip the terminal-only status block the devspec.remote command tells the
- * model to print. Removes from the banner header through the trailing rule line.
+ * model to print — both the canonical `REMOTE_STATUS_BANNER` form and
+ * variant field blocks that open with a bare box-drawing rule (or dive
+ * straight into Agent/Connection/Session lines).
  */
 export function stripRemoteControlBanner(text: string): string {
-  const t = String(text ?? '')
+  const raw = String(text ?? '')
+  if (!raw) return raw
+
+  // Fast path: classic exact-title strip (kept for clarity + tests).
+  let t = stripCanonicalRemoteBanner(raw)
+
+  // Variant / leftover field blocks (Dashing Osprey): rule + Agent/…/Stop with.
+  t = stripStatusFieldBlocks(t)
+  return t.replace(/^\s+|\s+$/g, '')
+}
+
+function stripCanonicalRemoteBanner(t: string): string {
   const start = t.indexOf(REMOTE_STATUS_BANNER)
   if (start < 0) return t
   const afterHeader = t.slice(start + REMOTE_STATUS_BANNER.length)
@@ -47,7 +115,55 @@ export function stripRemoteControlBanner(text: string): string {
     const nextBlank = afterHeader.search(/\n\s*\n/)
     end = nextBlank >= 0 ? start + REMOTE_STATUS_BANNER.length + nextBlank : t.length
   }
-  return `${t.slice(0, start)}${t.slice(end)}`.replace(/^\s+|\s+$/g, '')
+  return `${t.slice(0, start)}${t.slice(end)}`
+}
+
+/**
+ * Remove one or more consecutive status field blocks. A block is:
+ * optional opener (canonical title or rule line) + ≥3 status field lines +
+ * optional trailing rule. Requires ≥3 distinct field labels so a real reply
+ * that happens to mention "Session: foo" once is not stripped.
+ */
+function stripStatusFieldBlocks(text: string): string {
+  if (statusFieldHitCount(text) < 3) return text
+
+  const lines = text.split(/\r?\n/)
+  const keep: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i] ?? ''
+    const openerHere = STATUS_OPENER_RE.test(line)
+    const fieldHere = STATUS_FIELD_LINE_RE.test(line)
+
+    if (!openerHere && !fieldHere) {
+      keep.push(line)
+      i++
+      continue
+    }
+
+    // Peek: collect optional opener + consecutive field lines + optional rule.
+    let j = i
+    if (openerHere) j++
+    const fieldStart = j
+    while (j < lines.length && STATUS_FIELD_LINE_RE.test(lines[j] ?? '')) j++
+    const fieldCount = j - fieldStart
+    // Distinct labels in this run (not just line count).
+    const runText = lines.slice(fieldStart, j).join('\n')
+    const distinct = statusFieldHitCount(runText)
+
+    if (distinct >= 3 && fieldCount >= 3) {
+      if (j < lines.length && RULE_LINE_RE.test(lines[j] ?? '')) j++
+      // Drop the block; skip a single blank line that hugged it.
+      if (j < lines.length && (lines[j] ?? '').trim() === '') j++
+      i = j
+      continue
+    }
+
+    // Not a status block — keep the current line and move on.
+    keep.push(line)
+    i++
+  }
+  return keep.join('\n')
 }
 
 /**
@@ -68,8 +184,16 @@ export function isOperationalChrome(text: string): boolean {
   if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
   if (/^Connected and waiting for your next command\b/i.test(t) && t.length < 280) return true
 
-  if (t.includes(REMOTE_STATUS_BANNER)) {
+  const firstLine = t.split(/\r?\n/, 1)[0] ?? ''
+  const hasInternalNote = internalNotePattern().test(t)
+  const hadStatusShape =
+    t.includes(REMOTE_STATUS_BANNER) ||
+    statusFieldHitCount(t) >= 3 ||
+    STATUS_OPENER_RE.test(firstLine)
+
+  if (hadStatusShape || hasInternalNote) {
     t = stripRemoteControlBanner(t).trim()
+    t = stripInternalNoteChrome(t).trim()
     t = collapseOrphanMarkdownFences(t)
     if (!t) return true
     if (/^[`~\s]*$/.test(t)) return true
@@ -77,6 +201,12 @@ export function isOperationalChrome(text: string): boolean {
     if (/^You're connected to .+ agent on their local machine\.?\s*$/i.test(t)) return true
     // Banner plus a tiny leftover (e.g. "Open: Agents page") — still chrome.
     if (t.length < 80 && /^(Agent|Connection|Session|Status|Open|Stop with):/m.test(t)) return true
+  }
+
+  // Pure internal-note orientation with no status fields.
+  if (/^\s*(?:>\s*)?\*{0,2}Internal note(?:\s*\([^)]*\))?\*{0,2}:/i.test(t)) {
+    const stripped = stripInternalNoteChrome(t).trim()
+    if (!stripped) return true
   }
 
   return false
@@ -93,7 +223,8 @@ export function prepareMirrorText(text: string): string | null {
   if (!t) return null
 
   t = unwrapSingleOuterMarkdownFence(t)
-  if (t.includes(REMOTE_STATUS_BANNER)) t = stripRemoteControlBanner(t).trim()
+  t = stripRemoteControlBanner(t).trim()
+  t = stripInternalNoteChrome(t).trim()
   t = collapseOrphanMarkdownFences(t)
 
   if (!t || isOperationalChrome(t)) return null

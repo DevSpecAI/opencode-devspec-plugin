@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Remote control — full session UUID for transcript + broader status chrome strip
+
+Live (OpenCode · Dashing Osprey / session `7976fffb`): `/devspec.remote --session <short>` attached fine, then `get_session_transcript` with the same short code failed ("Session not found"). Separately, a variant status block (box-drawing rule without the exact `━━━ DevSpec Remote Control ━━━` title) plus an `Internal note (not mirrored)` orientation paragraph was mirrored into the DevSpec room.
+
+- Skill (`commands/devspec.remote.md`): after `attach_connection`, always use the **returned full `session_id`** for transcript — never the CLI short code alone.
+- `prepareMirrorText` / `isOperationalChrome`: strip variant Agent/Connection/Session field blocks and labelled Internal-note chrome, not only the canonical banner title.
+- Tests cover the live variant sample; real answers after a pasted block still post.
+
+Item `6d008352`.
+
 ## 0.3.5 - 2026-08-04
 
 ### Read a memory before superseding it — search now returns a card
