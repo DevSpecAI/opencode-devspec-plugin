@@ -2074,6 +2074,16 @@ function playbookRunCommandText(d: Record<string, unknown>): string {
  * inject what it sends — the labelling is the server's, not ours (Ali, 24 Jul:
  * standardise what we control on the server rather than forcing plugin uniformity).
  */
+/**
+ * One-shot latch for the "bond exists but auth is unresolvable" log line in
+ * pollAndDeliver. That state is ALWAYS a bug (as opposed to no state file at
+ * all, which just means `/devspec.remote` was never run) — yet the idle path
+ * below costs no network calls precisely so it can burn forever without a
+ * trace, which is exactly how the .jsonc resolver bug (item 8e0bb031) hid for
+ * an entire session. Log once per failure streak, never every 5s.
+ */
+let authFailureLogged = false
+
 export async function pollAndDeliver(
   client: Parameters<Plugin>[0]['client'],
   directory: string,
@@ -2089,8 +2099,20 @@ export async function pollAndDeliver(
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
     // Not connected yet (no `/devspec.remote` run). Idle cheaply — and note this costs
     // NO network calls, unlike the interval it replaces.
+    if (state && (!auth.ok || !auth.token || !auth.mcp_url)) {
+      if (!authFailureLogged) {
+        authFailureLogged = true
+        logPoll(
+          `poll idle: connection state exists (${state.codename ?? state.connectionId ?? 'unknown'}) ` +
+            `but DevSpec auth is unresolvable — no polls until fixed: ${auth.error ?? 'incomplete config'}`,
+        )
+      }
+    } else {
+      authFailureLogged = false
+    }
     return { delayMs: 5_000, stop: false }
   }
+  authFailureLogged = false
 
   const pump = pumpStateFor(state.connectionId, {
     cursor: state.lastDeliveredMessageId ?? null,
