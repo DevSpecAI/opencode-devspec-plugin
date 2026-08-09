@@ -14,11 +14,17 @@
  * registered the connection.
  *
  * Lookup order (token):
- * 1. Project opencode.json (the `directory` OpenCode handed the plugin, and parents)
- * 2. Global opencode.json (~/.config/opencode/opencode.json)
- * 3. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN env — fallback ONLY when no opencode.json
- *    token is configured (env-only setups). `DEVSPEC_MCP_URL` still overrides the
- *    resolved URL in every branch.
+ * 1. Project opencode config (the `directory` OpenCode handed the plugin, and
+ *    parents) — opencode.jsonc / opencode.json / config.json, probed in reverse
+ *    of OpenCode's own load order so the same file wins on conflict.
+ * 2. Global opencode config (~/.config/opencode/) — same filenames.
+ * 3. DEVSPEC_MCP_TOKEN / DEVSPEC_TOKEN env — fallback ONLY when no config-file
+ *    token is configured (env-only setups). `DEVSPEC_MCP_URL` still overrides
+ *    the resolved URL in every branch.
+ *
+ * Files are parsed as JSONC (comments + trailing commas tolerated) — OpenCode
+ * documents .jsonc, and strict JSON.parse here once killed remote control
+ * silently on a .jsonc-only machine (item 8e0bb031).
  *
  * Backward compatible: when only one token source is present the result is
  * unchanged; only the both-present-and-different case flips — and it now resolves
@@ -35,6 +41,66 @@ import path from 'node:path'
 
 const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
 
+/**
+ * OpenCode reads its config as JSONC — `opencode.jsonc` is the documented
+ * recommendation — so this resolver must too. `JSON.parse` alone throws on
+ * `//` comments and trailing commas, and readJson swallows that to null,
+ * which upstream turns into the SILENT "not connected" idle path (live
+ * incident 2026-08-08: global config was opencode.jsonc only, resolver found
+ * no token, the connection never polled once).
+ *
+ * String-aware state machine — a naive regex strip would eat the `//` in
+ * `"url": "https://..."` values. Also drops trailing commas (`,}` / `,]`),
+ * which strict JSON rejects.
+ */
+function jsoncToJson(text: string): string {
+  let out = ''
+  let inString = false
+  const n = text.length
+  let i = 0
+  while (i < n) {
+    const c = text[i]!
+    if (inString) {
+      out += c
+      if (c === '\\' && i + 1 < n) {
+        out += text[i + 1]
+        i += 2
+        continue
+      }
+      if (c === '"') inString = false
+      i++
+      continue
+    }
+    if (c === '"') {
+      inString = true
+      out += c
+      i++
+      continue
+    }
+    if (c === '/' && text[i + 1] === '/') {
+      while (i < n && text[i] !== '\n') i++
+      continue
+    }
+    if (c === '/' && text[i + 1] === '*') {
+      i += 2
+      while (i < n && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i = Math.min(i + 2, n)
+      continue
+    }
+    if (c === ',') {
+      let j = i + 1
+      while (j < n && /\s/.test(text[j]!)) j++
+      if (text[j] === '}' || text[j] === ']') {
+        i++ // trailing comma — drop it
+        continue
+      }
+    }
+    out += c
+    i++
+  }
+  return out
+}
+
 export interface DevspecAuth {
   ok: boolean
   token?: string
@@ -45,7 +111,7 @@ export interface DevspecAuth {
 
 function readJson(file: string): any {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'))
+    return JSON.parse(jsoncToJson(fs.readFileSync(file, 'utf8')))
   } catch {
     return null
   }
@@ -79,13 +145,23 @@ function fromOpencodeConfig(file: string): (ReturnType<typeof fromServerEntry> &
   return { ...got, source: file }
 }
 
+/**
+ * Config filenames OpenCode itself loads, in its load order (config.json →
+ * opencode.json → opencode.jsonc — later deep-merges OVER earlier). A
+ * first-hit resolver must therefore probe in REVERSE order so that on
+ * conflict the same file wins that OpenCode's own MCP client would use.
+ */
+const CONFIG_FILENAMES = ['opencode.jsonc', 'opencode.json', 'config.json'] as const
+
 function walkOpencodeJson(startDir: string) {
   let dir = path.resolve(startDir || process.cwd())
   for (let i = 0; i < 12; i++) {
-    const file = path.join(dir, 'opencode.json')
-    if (fs.existsSync(file)) {
-      const got = fromOpencodeConfig(file)
-      if (got?.token || got?.mcp_url) return got
+    for (const name of CONFIG_FILENAMES) {
+      const file = path.join(dir, name)
+      if (fs.existsSync(file)) {
+        const got = fromOpencodeConfig(file)
+        if (got?.token || got?.mcp_url) return got
+      }
     }
     const parent = path.dirname(dir)
     if (parent === dir) break
@@ -95,8 +171,12 @@ function walkOpencodeJson(startDir: string) {
 }
 
 function fromGlobalConfig() {
-  const file = path.join(os.homedir(), '.config', 'opencode', 'opencode.json')
-  return fromOpencodeConfig(file)
+  const dir = path.join(os.homedir(), '.config', 'opencode')
+  for (const name of CONFIG_FILENAMES) {
+    const got = fromOpencodeConfig(path.join(dir, name))
+    if (got) return got
+  }
+  return null
 }
 
 export function resolveDevspecAuth(cwd: string = process.cwd()): DevspecAuth {
@@ -129,13 +209,13 @@ export function resolveDevspecAuth(cwd: string = process.cwd()): DevspecAuth {
       mcp_url: envUrl || fromProject.mcp_url,
       source: fromProject.source,
       error:
-        'Found a DevSpec MCP URL in opencode.json but no Bearer token. Set DEVSPEC_MCP_TOKEN or add mcp.devspec.headers.Authorization.',
+        'Found a DevSpec MCP URL in opencode config but no Bearer token. Set DEVSPEC_MCP_TOKEN or add mcp.devspec.headers.Authorization.',
     }
   }
 
   return {
     ok: false,
     mcp_url: envUrl || DEFAULT_PROD_URL,
-    error: 'No DevSpec MCP token found. Set DEVSPEC_MCP_TOKEN, or configure mcp.devspec.headers.Authorization in opencode.json.',
+    error: 'No DevSpec MCP token found. Set DEVSPEC_MCP_TOKEN, or configure mcp.devspec.headers.Authorization in opencode.json / opencode.jsonc.',
   }
 }
