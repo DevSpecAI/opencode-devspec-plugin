@@ -42,7 +42,9 @@ const STATUS_FIELD_LINE_RE = /^(?:Agent|Connection|Session|Status|Open|Stop with
 /** Models sometimes paste orientation as a labelled "Internal note" aside. */
 function internalNotePattern(): RegExp {
   // Fresh instance every call — never share a /g lastIndex across helpers.
-  return /(?:^|\n)\s*(?:>\s*)?\*{0,2}Internal note(?:\s*\([^)]*\))?\*{0,2}:[^\n]*(?:\n(?![━─\-═]{8,}\s*$)(?!(?:Agent|Connection|Session|Status|Open|Stop with):\s)[^\n]*)*/gi
+  // Continuation lines require non-empty content (`[^\n]+`) and stop before a
+  // blank line (`\n` then another `\n`) so a real answer after `\n\n` still posts.
+  return /(?:^|\n)\s*(?:>\s*)?\*{0,2}Internal note(?:\s*\([^)]*\))?\*{0,2}:[^\n]*(?:\n(?!\n)(?![━─\-═]{8,}\s*$)(?!(?:Agent|Connection|Session|Status|Open|Stop with):\s)[^\n]+)*/gi
 }
 
 /**

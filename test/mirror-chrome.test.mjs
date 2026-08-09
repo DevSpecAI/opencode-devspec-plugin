@@ -95,6 +95,10 @@ describe('prepareMirrorText — variant status chrome (Dashing Osprey / 7976fffb
     assert.equal(prepareMirrorText(`${VARIANT_BANNER}\n\n2`), '2')
   })
 
+  it('keeps a real answer after variant banner + Internal note (blank-line separated)', () => {
+    assert.equal(prepareMirrorText(`${VARIANT_WITH_INTERNAL_NOTE}\n\n2`), '2')
+  })
+
   it('does not strip a real reply that mentions Session once in prose', () => {
     const reply = 'The Session: field on that form is optional.'
     assert.equal(prepareMirrorText(reply), reply)
