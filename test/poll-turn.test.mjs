@@ -566,6 +566,31 @@ describe('shouldAdvanceMessageCursor — never skip uninjected deliverables', ()
     )
   })
 
+  // Item 40279ae0 (stuck turns): seedKept>0 && inject=0 also happens when the
+  // command is real and deliverable but ALREADY in `deliveredMessageIds` from
+  // a turn that stalled without ever answering — `commands` (post-dedup) is
+  // then empty even though `liveRoomCommands` (pre-dedup) was not. Holding
+  // here is still CORRECT in that instant: advancing would permanently skip
+  // the command. The fix for the resulting hold loop is NOT a change to this
+  // function — it is `clearInjectTurnState(directory, { unclaim: true })`
+  // removing the stalled turn's ids from `deliveredMessageIds` on the
+  // abnormal-end paths (checkBusyStall / handleSessionError / an abandoned
+  // baseline), so the NEXT poll's dedup filter no longer zeroes out
+  // `commands` for the same still-undelivered command, and `injectCount`
+  // becomes > 0 again. See clearInjectTurnState tests in busy-stall.test.mjs.
+  it('this exact shape is what an unclaimed re-inject resolves — pinned as documentation', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 0,
+        deliverableRoomCount: 1,
+        seedKeptCount: 1,
+        wasSeed: false,
+        dispatchCount: 0,
+      }),
+      false,
+    )
+  })
+
   it('HOLDS when dispatches were packaged but not injected', () => {
     assert.equal(
       shouldAdvanceMessageCursor({

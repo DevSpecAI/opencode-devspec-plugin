@@ -12,6 +12,7 @@ import { describe, it } from 'node:test'
 import {
   TRAIL_MAX_CHARS,
   TRAIL_POST_MIN_GAP_MS,
+  TRAIL_SEED_TEXT,
   TRAIL_TRIM_NOTICE,
   clampTrail,
   elideLongOutput,
@@ -189,6 +190,75 @@ describe('shouldPostTrail', () => {
       shouldPostTrail({ ...base, lastPostedTrailHash: 'h1', lastPostedAt: base.now, force: true }),
       false,
     )
+  })
+
+  // Item 05a88ed5: eager "Working…" trail on turn start.
+  describe('force + seed (turn-start placeholder)', () => {
+    const emptyBase = { trail: '', trailHash: 'empty-hash', now: 10_000 }
+
+    it('refuses an empty trail even when seeded, unless also forced', () => {
+      assert.equal(
+        shouldPostTrail({ ...emptyBase, lastPostedAt: null, lastPostedTrailHash: null, seed: true }),
+        false,
+      )
+    })
+
+    it('refuses a forced empty trail when not seeded (no placeholder requested)', () => {
+      assert.equal(
+        shouldPostTrail({ ...emptyBase, lastPostedAt: null, lastPostedTrailHash: null, force: true }),
+        false,
+      )
+    })
+
+    it('allows a forced + seeded empty trail through — the turn-start placeholder', () => {
+      assert.equal(
+        shouldPostTrail({
+          ...emptyBase,
+          lastPostedAt: null,
+          lastPostedTrailHash: null,
+          force: true,
+          seed: true,
+        }),
+        true,
+      )
+    })
+
+    it('still refuses a repeat seed post once the placeholder already landed', () => {
+      assert.equal(
+        shouldPostTrail({
+          ...emptyBase,
+          lastPostedAt: 9_000,
+          lastPostedTrailHash: 'empty-hash',
+          force: true,
+          seed: true,
+        }),
+        false,
+      )
+    })
+
+    it('never lets seed clobber real content — a non-empty trail ignores the flag', () => {
+      // Real content always takes the normal (non-seed) path, so a race between
+      // the eager seed call and a message.updated-triggered post can never
+      // regress real content back to the placeholder (item 05a88ed5, "one trail row").
+      assert.equal(
+        shouldPostTrail({
+          trail: 'real progress',
+          trailHash: 'real-hash',
+          lastPostedAt: null,
+          lastPostedTrailHash: null,
+          now: 10_000,
+          seed: true,
+        }),
+        true,
+      )
+    })
+  })
+})
+
+describe('TRAIL_SEED_TEXT', () => {
+  it('is a non-empty placeholder distinct from any real trail content', () => {
+    assert.equal(typeof TRAIL_SEED_TEXT, 'string')
+    assert.ok(TRAIL_SEED_TEXT.trim().length > 0)
   })
 })
 

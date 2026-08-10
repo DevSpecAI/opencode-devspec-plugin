@@ -38,6 +38,20 @@ export const TRAIL_TRIM_NOTICE = '… earlier output trimmed …\n'
 /** Minimum spacing between trail posts — one per second keeps the bubble ~1s behind. */
 export const TRAIL_POST_MIN_GAP_MS = 1_000
 
+/**
+ * Placeholder body for the eager turn-start trail post (item 05a88ed5).
+ *
+ * A remote turn used to stay busy-dots-only until the FIRST `message.updated`
+ * produced something serializable — on a slow model that can be many seconds,
+ * during which the room looks dead even though the agent already picked up
+ * the command. Opening the bubble with this text the instant the turn starts
+ * gives the owner an immediate "yes, it's working" signal; the very next real
+ * trail post replaces it wholesale (the client always sends the FULL
+ * cumulative trail, never an append), so it never lingers once there is
+ * anything real to show.
+ */
+export const TRAIL_SEED_TEXT = 'Working…'
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -221,8 +235,19 @@ export function shouldPostTrail(input: {
   now: number
   minGapMs?: number
   force?: boolean
+  /**
+   * Turn-start seed (item 05a88ed5): the caller has already substituted
+   * `TRAIL_SEED_TEXT` for `trail` because there was nothing real to serialize
+   * yet. Only meaningful together with `force` — an un-forced seed call would
+   * otherwise still refuse to post nothing, which is the correct behavior for
+   * a debounced `message.updated` tick that just happens to catch an empty
+   * turn. Ignored once `trail` has real content — a genuine update is never
+   * treated as a seed, so the seed body can never clobber it.
+   */
+  seed?: boolean
 }): boolean {
-  if (!input.trail.trim()) return false
+  const isEmpty = !input.trail.trim()
+  if (isEmpty && !(input.force && input.seed)) return false
   if (input.trailHash === (input.lastPostedTrailHash ?? null)) return false
   if (input.force) return true
   const gap = input.minGapMs ?? TRAIL_POST_MIN_GAP_MS

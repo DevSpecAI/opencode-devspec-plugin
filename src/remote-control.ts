@@ -59,6 +59,7 @@ import {
 import { logRemoteControlStory } from './remote-control-story.js'
 import {
   TRAIL_POST_MIN_GAP_MS,
+  TRAIL_SEED_TEXT,
   serializeTurnTrail,
   shouldPostTrail,
 } from './work-trail.js'
@@ -244,6 +245,21 @@ interface ConnectionState {
    * the delivery loop — only needs to cover recent history.
    */
   deliveredMessageIds?: string[]
+  /**
+   * DevSpec message ids injected for the turn CURRENTLY in flight (bounded,
+   * cleared once the turn ends). Distinct from `deliveredMessageIds` — that
+   * set is permanent (never delivered twice, ever), while this one exists so
+   * an abnormal end (stall / `session.error`) can unclaim exactly this
+   * turn's ids from `deliveredMessageIds` and let them re-inject, without
+   * touching anything an earlier, already-answered turn delivered. Real bug
+   * found live: a stalled turn's command stayed marked delivered forever, so
+   * `shouldAdvanceMessageCursor` held the poll cursor in place (seedKept>0,
+   * inject=0) with no way to ever make progress — see `clearInjectTurnState`.
+   * Populated in `pollAndDeliver` alongside `deliveredMessageIds`; cleared
+   * (without unclaiming) on a genuine answer, or unclaimed via
+   * `clearInjectTurnState` on stall/error.
+   */
+  currentTurnMessageIds?: string[] | null
   /** Assignment ids already injected into OpenCode (sessionless + attached). */
   deliveredAssignmentIds?: string[]
   /**
@@ -317,6 +333,16 @@ interface ConnectionState {
    * impossible even when the model ignores the skill wording.
    */
   recentPostedContentHashes?: string[]
+  /**
+   * True once the model has itself called `post_session_message` during the
+   * CURRENT `awaitingRemoteReply` turn (item 5f75c2cb). A message-id-independent
+   * double-post guard alongside the hash/tool-part checks in `mirrorLatestReply` —
+   * it survives even if the posting assistant message is not (or is no longer)
+   * the candidate `mirrorLatestReply` is evaluating. Set by
+   * `recordManualPostSessionMessage`; reset to false whenever a turn ends
+   * (answer landed, chrome-only, stalled, errored) or a new one is injected.
+   */
+  manualAnswerPostedThisTurn?: boolean
   /**
    * OpenCode assistant message ids that must never be mirrored — filled from
    * `command.executed` for `/devspec.remote` / `/devspec.remote-stop` so the
@@ -1101,6 +1127,18 @@ function rememberPostedContentHash(directory: string, hash: string): void {
 /**
  * Record a successful model-initiated `post_session_message` so the auto-mirror
  * skips the same body. Wired from `tool.execute.after` in plugin.ts.
+ *
+ * Item 5f75c2cb / turn-scoped tool detection: `tool.execute.after` carries no
+ * `messageID` (verified against the plugin's own hook signature), so this
+ * cannot correlate the call back to a specific OpenCode assistant message —
+ * the content-hash remembered below is the mechanical guard for that. This
+ * also sets `manualAnswerPostedThisTurn`, a second, message-id-independent
+ * guard scoped to "did the model post at all during THIS remote turn" —
+ * `mirrorLatestReply` checks both, so a manual post cannot double up with the
+ * mirror even in a shape neither the hash nor the tool-part scan catches.
+ * Only set while `awaitingRemoteReply`: a manual post during a plain local
+ * OpenCode turn (not remote-injected) has no turn to scope it to, and this
+ * flag must never suppress an unrelated later remote turn's mirror.
  */
 export function recordManualPostSessionMessage(directory: string, toolName: string, args: unknown): void {
   const lower = String(toolName ?? '').toLowerCase()
@@ -1114,10 +1152,23 @@ export function recordManualPostSessionMessage(directory: string, toolName: stri
   }
   const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
   const message = typeof argsObj.message === 'string' ? argsObj.message : null
-  if (!message || !normalizePostedContent(message)) return
+  if (!message || !normalizePostedContent(message)) {
+    logPoll(
+      `recordManualPostSessionMessage: model called post_session_message with an empty/whitespace ` +
+        `message — nothing to dedup, not recording a hash`,
+    )
+    return
+  }
   const hash = hashPostedContent(message)
   rememberPostedContentHash(directory, hash)
-  logPoll(`recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}…`)
+  const state = readState(directory)
+  if (state?.awaitingRemoteReply && !state.manualAnswerPostedThisTurn) {
+    patchState(directory, { manualAnswerPostedThisTurn: true })
+  }
+  logPoll(
+    `recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}… ` +
+      `awaitingRemoteReply=${Boolean(state?.awaitingRemoteReply)}`,
+  )
 }
 
 /**
@@ -1271,7 +1322,32 @@ export async function checkBusyStall(
   }
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
-  const last = assistantMessages[assistantMessages.length - 1]
+  // Item 40279ae0: scope progress to assistants AFTER the pre-inject baseline,
+  // not the global last assistant. The old global-last version had a real bug:
+  // a freshly-injected turn's stall check could see the PRE-inject assistant's
+  // old text — from a completely different, already-answered turn — and report
+  // "last assistant has text — not a stall" even though THIS turn had produced
+  // nothing at all yet. Mirrors the same correlation `mirrorLatestReply` uses.
+  const baselineDecision = decideAwaitingBaseline({
+    baseline: state.replyAfterOpenCodeMessageId ?? null,
+    baselineCaptured: state.replyBaselineCaptured,
+    assistantIds: assistantMessages.map((m) => m?.info?.id).filter(Boolean) as string[],
+  })
+  if (baselineDecision.action === 'clear_abandoned') {
+    // The pre-inject baseline id is gone from the current OpenCode session
+    // (session rotated under an abandoned turn — 8d0f1726). There is nothing
+    // to evaluate progress against; recover immediately instead of waiting
+    // out the stall timeout on a cursor that can never resolve.
+    clearAbandonedInjectCursor(directory, baselineDecision.baseline)
+    clearInjectTurnState(directory, { unclaim: true })
+    logPoll(
+      `stall check: abandoned inject cursor (baseline ${baselineDecision.baseline} not in current ` +
+        `session) — cleared busy/awaiting immediately`,
+    )
+    return
+  }
+  const scopedAssistants = scopeAssistantsAfterBaseline(assistantMessages, baselineDecision)
+  const last = scopedAssistants[scopedAssistants.length - 1]
   const fromMessage = messageHasPendingPermissionAsk(last)
   const permissionAskPending = permissionPendingFromState || fromMessage
   // Late message-only detection (no event): treat the ask window as already
@@ -1387,6 +1463,12 @@ export async function checkBusyStall(
   // turn still claiming to stream. Fall back to the notice when none is open.
   const failedTrail = await failOpenTrailTurn(auth, directory, readState(directory) ?? state, notice)
   if (!failedTrail) await postSessionNotice(auth, state, notice)
+  // Item 40279ae0: this IS the abnormal end — unclaim this turn's command ids
+  // from `deliveredMessageIds` so they are eligible to re-inject, breaking the
+  // seedKept>0/inject=0 hold loop a stalled-but-never-answered command used to
+  // cause. `failOpenTrailTurn` above already cleared the non-unclaiming parts
+  // of inject-turn state; this call additionally unclaims.
+  clearInjectTurnState(directory, { unclaim: true })
   await setBusy(directory, false)
 }
 
@@ -1416,6 +1498,10 @@ export async function handleSessionError(directory: string, event: unknown): Pro
     const failedTrail = await failOpenTrailTurn(auth, directory, state, notice)
     if (!failedTrail) await postSessionNotice(auth, state, notice)
   }
+  // Item 40279ae0: a session.error is an abnormal end for whatever turn was
+  // in flight — unclaim its command ids so they can re-inject instead of
+  // being silently swallowed forever by the delivery dedup set.
+  clearInjectTurnState(directory, { unclaim: true })
   await setBusy(directory, false)
 }
 
@@ -2744,9 +2830,10 @@ export async function pollAndDeliver(
   }
   pump.consecutiveEmpty = 0
 
-  for (const m of commands) {
-    if (typeof m?.id === 'string') deliveredIds.add(m.id)
-  }
+  const commandIds = commands
+    .map((m) => (typeof m?.id === 'string' ? m.id : null))
+    .filter((id): id is string => id != null)
+  for (const id of commandIds) deliveredIds.add(id)
   for (const d of freshDispatches) pump.deliveredDispatchIds.add(d.id)
   // Claim BEFORE injecting and persist immediately, so a concurrent poll — or a restarted
   // process — sees these ids as delivered rather than independently delivering them again.
@@ -2754,6 +2841,14 @@ export async function pollAndDeliver(
   {
     const deliveryPatch: Partial<ConnectionState> = {
       deliveredMessageIds: Array.from(deliveredIds).slice(-50),
+      // Item 40279ae0: also track which ids belong to the turn currently in
+      // flight (unioned, not replaced — a needs_input answer can extend an
+      // already-open turn) so an abnormal end can unclaim exactly these ids
+      // from deliveredMessageIds via clearInjectTurnState, without touching
+      // anything an earlier, already-answered turn delivered.
+      currentTurnMessageIds: Array.from(
+        new Set([...(state.currentTurnMessageIds ?? []), ...commandIds]),
+      ).slice(-50),
     }
     if (freshDispatches.length > 0) {
       deliveryPatch.deliveredAssignmentIds = Array.from(pump.deliveredDispatchIds).slice(-50)
@@ -2780,10 +2875,12 @@ export async function pollAndDeliver(
     logPoll('needs_input: question.reply failed — will retry owner command on next poll')
     // Un-claim so the same dispatch is retried (ids already in delivered set would
     // otherwise soft-drop). Drop only the last batch from the set.
-    for (const m of commands) {
-      if (typeof m?.id === 'string') deliveredIds.delete(m.id)
-    }
-    patchState(directory, { deliveredMessageIds: Array.from(deliveredIds).slice(-50) })
+    for (const id of commandIds) deliveredIds.delete(id)
+    const stillCurrent = new Set(commandIds)
+    patchState(directory, {
+      deliveredMessageIds: Array.from(deliveredIds).slice(-50),
+      currentTurnMessageIds: (state.currentTurnMessageIds ?? []).filter((id) => !stillCurrent.has(id)),
+    })
     return { delayMs: 2000, stop: false }
   }
 
@@ -2969,6 +3066,24 @@ export async function deliverInjectedTurn(input: {
       reason: 'owner_commands',
       data: { ...modelStoryData(model) },
     })
+    // Eager Working trail (item 05a88ed5): open the bubble the instant OpenCode
+    // has accepted the turn, rather than waiting for the first message.updated
+    // with real content — on a slow model that gap can be many seconds, during
+    // which the room looks dead even though the turn is genuinely running.
+    // force+seed: `shouldPostTrail` would otherwise refuse an empty trail; this
+    // is the one case a placeholder body is correct, since the very next real
+    // update overwrites it wholesale (the client always resends the full
+    // cumulative trail, never an append) — so it never lingers, and there is
+    // still only ever one trail row for this turn.
+    //
+    // Own try/catch: promptAsync already succeeded by this point, so a trail
+    // hiccup must never fall into the catch below and be misreported as a
+    // failed delivery (which would unclaim and re-inject an already-running turn).
+    try {
+      await postWorkTrail(client, directory, sessionId, { force: true, seed: true })
+    } catch (err) {
+      logPoll(`deliverInjectedTurn: eager trail seed failed (non-fatal): ${err}`)
+    }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     const freshForNotice = readState(directory) ?? state
@@ -2989,13 +3104,12 @@ export async function deliverInjectedTurn(input: {
     } else {
       logPoll(`promptAsync failed (sessionless): ${reason}`)
     }
-    // No turn is actually running, so clear the busy we just asserted.
+    // No turn is actually running, so clear the busy we just asserted. Item
+    // 40279ae0: `promptAsync` itself rejecting means OpenCode never even
+    // started this turn — unclaim so the command is eligible to re-inject on
+    // the next poll instead of being silently swallowed forever.
     await setBusy(directory, false)
-    patchState(directory, {
-      awaitingRemoteReply: false,
-      replyAfterOpenCodeMessageId: null,
-      replyBaselineCaptured: undefined,
-    })
+    clearInjectTurnState(directory, { unclaim: true })
     return
   }
 
@@ -3036,6 +3150,38 @@ export function decideAwaitingBaseline(opts: {
   }
   if (opts.baselineCaptured === true) return { action: 'all' }
   return { action: 'fail_closed_legacy' }
+}
+
+/**
+ * Turn an `AwaitingBaselineDecision` into the assistant messages `checkBusyStall`
+ * should evaluate progress against (item 40279ae0). Unlike `mirrorLatestReply`'s
+ * own use of the same decision — where several actions must `return` outright
+ * (never post an answer without a confident correlation) — stall detection has
+ * a safe meaning for "nothing after baseline yet": empty input is exactly what
+ * `decideBusyStall` needs to correctly declare `empty_assistant_timeout` for a
+ * freshly-injected turn that has produced nothing at all, rather than falling
+ * back to whatever a completely unrelated, already-answered turn's last
+ * assistant happened to say (the bug this fix closes: a stale global-last
+ * assistant with real text made a brand-new, silent turn look "not a stall").
+ */
+export function scopeAssistantsAfterBaseline<T extends { info?: { id?: string } }>(
+  assistants: T[],
+  decision: AwaitingBaselineDecision,
+): T[] {
+  switch (decision.action) {
+    case 'slice':
+      return assistants.slice(decision.fromIndex)
+    case 'all':
+    case 'fail_closed_legacy':
+      // Legacy state shape (no baseline info at all) — fall back to the whole
+      // history rather than fail closed, which has no safe meaning here the
+      // way it does for mirroring.
+      return assistants
+    case 'wait':
+    case 'fail_closed_snapshot':
+    default:
+      return []
+  }
 }
 
 /**
@@ -3107,7 +3253,7 @@ export async function mirrorNow(
     guard.at = Date.now()
     mirrorGuards.set(key, guard)
     try {
-      await mirrorLatestReply(client, auth, directory, state, sessionId)
+      await mirrorLatestReply(client, auth, directory, state, sessionId, { force })
     } catch (err) {
       logPoll(`mirrorNow failed: ${err}`)
     } finally {
@@ -3208,7 +3354,7 @@ export async function postWorkTrail(
   client: Parameters<Plugin>[0]['client'],
   directory: string,
   sessionId: string,
-  { force = false }: { force?: boolean } = {},
+  { force = false, seed = false }: { force?: boolean; seed?: boolean } = {},
 ): Promise<void> {
   const bondKey = stateKeyForOpenCodeBond(sessionId)
   const run = async () => {
@@ -3245,9 +3391,15 @@ export async function postWorkTrail(
 
     // Same baseline the mirror correlates on: everything after the pre-inject
     // assistant is this remote turn's work. Without one, only the newest turn.
-    const trail = serializeTurnTrail(messages, {
+    const rawTrail = serializeTurnTrail(messages, {
       afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
     })
+    // Turn-start seed (item 05a88ed5): only substitute the placeholder when
+    // there is genuinely nothing to show yet. Real content always wins, so a
+    // seed call racing behind a message.updated-triggered post never clobbers
+    // it — "one trail row" holds, never an orphan second bubble.
+    const usingSeed = seed && !rawTrail.trim()
+    const trail = usingSeed ? TRAIL_SEED_TEXT : rawTrail
     const trailHash = hashPostedContent(trail)
     if (
       !shouldPostTrail({
@@ -3257,6 +3409,7 @@ export async function postWorkTrail(
         lastPostedAt: state.lastTrailPostedAt ?? null,
         now: Date.now(),
         force,
+        seed,
       })
     ) {
       return
@@ -3336,6 +3489,48 @@ function parsePostedToolJson(result: unknown): Record<string, unknown> | null {
   return null
 }
 
+/**
+ * Reset all inject-turn correlation state (item 40279ae0): the
+ * awaiting-reply flag, baseline pointer, turn-scoped tool-post flag, and
+ * trail pointers. Every code path that ends a remote turn — a real answer,
+ * chrome-only completion, a stall, or a `session.error` — must clear these
+ * or the NEXT turn inherits stale correlation state (a wrong baseline, a
+ * phantom manual-post flag, an orphan trail bubble).
+ *
+ * `unclaim: true` is for an ABNORMAL end only (stall / session.error): it
+ * also removes this turn's ids from `deliveredMessageIds` so they are
+ * eligible to re-inject on the next poll. Real bug found live: a stalled
+ * turn's command stayed permanently marked "delivered" even though it was
+ * never actually answered, so `shouldAdvanceMessageCursor` held the poll
+ * cursor in place forever (deliverable room command present, but filtered
+ * to zero injects by the dedup set) — see `currentTurnMessageIds` on
+ * `ConnectionState`. A CLEAN end must never pass `unclaim: true` — the
+ * command really was answered, and re-injecting it would duplicate the turn.
+ */
+export function clearInjectTurnState(directory: string, opts: { unclaim?: boolean } = {}): void {
+  const state = readState(directory)
+  if (!state) return
+  const patch: Partial<ConnectionState> = {
+    awaitingRemoteReply: false,
+    replyAfterOpenCodeMessageId: null,
+    replyBaselineCaptured: undefined,
+    currentTurnMessageIds: null,
+    manualAnswerPostedThisTurn: false,
+    activeTrailMessageId: null,
+    lastTrailHash: null,
+    lastTrailPostedAt: null,
+  }
+  if (opts.unclaim && state.currentTurnMessageIds?.length) {
+    const stuck = new Set(state.currentTurnMessageIds)
+    patch.deliveredMessageIds = (state.deliveredMessageIds ?? []).filter((id) => !stuck.has(id))
+    logPoll(
+      `clearInjectTurnState: unclaiming ${stuck.size} stalled command id(s) from deliveredMessageIds ` +
+        `so they can re-inject on the next poll: ${Array.from(stuck).join(', ')}`,
+    )
+  }
+  patchState(directory, patch)
+}
+
 /** Forget this turn's trail bookkeeping once the turn has landed. */
 function clearTrailState(directory: string): void {
   patchState(directory, {
@@ -3384,7 +3579,12 @@ async function failOpenTrailTurn(
   const closed = extractClosedTrailTurn(result)
   if (!closed) {
     // Server had no open trail turn — leave the fallback notice path alone.
-    clearTrailState(directory)
+    // Item 40279ae0: also clear the broader inject-turn state (not just the
+    // trail pointers) here — this "abandon" branch still means the turn is
+    // over from this connection's point of view. Callers that know the end
+    // was ABNORMAL (checkBusyStall, handleSessionError) additionally unclaim
+    // this turn's ids at their own call site right after this returns.
+    clearInjectTurnState(directory)
     return false
   }
   const messageId = extractPostedMessageId(result) ?? state.activeTrailMessageId ?? null
@@ -3399,7 +3599,9 @@ async function failOpenTrailTurn(
     reason: 'work_trail_error',
     data: { message_id: messageId, phase: 'error' },
   })
-  clearTrailState(directory)
+  // Item 40279ae0: same reasoning as the abandon branch above — a closed
+  // trail turn means this connection's remote turn is over.
+  clearInjectTurnState(directory)
   return true
 }
 
@@ -3420,6 +3622,7 @@ async function mirrorLatestReply(
   directory: string,
   state: ConnectionState,
   sessionId: string,
+  opts: { force?: boolean } = {},
 ): Promise<void> {
   // Sessionless: no room. connection_id without attachment would be rejected server-side.
   if (!auth.ok || !auth.token || !auth.mcp_url || !state.sessionId || !state.connectionId) return
@@ -3460,6 +3663,11 @@ async function mirrorLatestReply(
     }
     if (decision.action === 'clear_abandoned') {
       clearAbandonedInjectCursor(directory, decision.baseline)
+      // Item 40279ae0: an abandoned cursor is an abnormal end for whatever
+      // command(s) this turn claimed — unclaim them so they can re-inject
+      // against the (now current) OpenCode session instead of being
+      // silently swallowed forever by the delivery dedup set.
+      clearInjectTurnState(directory, { unclaim: true })
       await setBusy(directory, false)
       return
     }
@@ -3491,6 +3699,31 @@ async function mirrorLatestReply(
   }
   // When not awaiting a remote reply, still allow local-terminal answers while
   // attached — but never re-post something older than lastMirrored (handled above).
+
+  // No answer-path narration mid-turn (item d4b8adcb): `message.updated` fires
+  // repeatedly while a turn is still running, and can land while `last` still
+  // has an in-flight tool part. Posting it now would mirror half-finished
+  // work as if it were the model's final answer — the room reads intermediate
+  // narration as done. The live trail is built for exactly this progress
+  // view; defer to it and let the turn actually finish.
+  //
+  // `opts.force` (session.idle's flushMirrorNow) always bypasses this: that
+  // event is OpenCode's own authoritative "this turn is over" signal, and
+  // trusting it unconditionally is what keeps this deadlock-free. Without the
+  // bypass, a tool whose status field never updates after session.idle fires
+  // would leave the connection stuck at busy:false forever with no answer
+  // ever posted and no stall recovery — checkBusyStall only runs while
+  // busy:true (see pollAndDeliver's turnActive gate), so nothing would ever
+  // re-check `last` again. A non-forced skip here is always safe to retry:
+  // either a later message.updated re-triggers the debounced mirror once the
+  // tool genuinely finishes, or session.idle forces it through regardless.
+  if (!opts.force && messageHasActiveToolWork(last)) {
+    logPoll(
+      `mirrorLatestReply: skip (active tool work, mid-turn) last.id=${last.info.id} — ` +
+        `trail covers this; waiting for quiescence or session.idle`,
+    )
+    return
+  }
 
   // Connect skill turn (e7ecc1de): never post — would settle unanswered
   // owner dispatches that landed during attach. command.executed ids +
@@ -3558,6 +3791,8 @@ async function mirrorLatestReply(
         // Handshake skip only — awaitingRemoteReply is already false above.
         replyAfterOpenCodeMessageId: null,
         replyBaselineCaptured: undefined,
+        currentTurnMessageIds: null,
+        manualAnswerPostedThisTurn: false,
       })
       await setBusy(directory, false)
       return
@@ -3596,7 +3831,11 @@ async function mirrorLatestReply(
   // banner from an otherwise-real reply, and returns null for pure chrome.
   const preparedText = prepareMirrorText(text)
 
-  if (!preparedText) {
+  // Item 5f75c2cb: never post empty/whitespace. `prepareMirrorText` already
+  // trims and returns null for nothing-postable, so `!preparedText.trim()`
+  // should be unreachable in practice — this is explicit defense-in-depth
+  // against a future regression there, not a workaround for one today.
+  if (!preparedText || !preparedText.trim()) {
     // Claim + treat as a finished (non-)turn so busy clears, but never post.
     logPoll(`mirrorLatestReply: skip (operational chrome) last.id=${last.info.id}`)
     logRemoteControlStory({
@@ -3628,21 +3867,33 @@ async function mirrorLatestReply(
       awaitingRemoteReply: false,
       replyAfterOpenCodeMessageId: null,
       replyBaselineCaptured: undefined,
+      currentTurnMessageIds: null,
+      manualAnswerPostedThisTurn: false,
     })
     await setBusy(directory, false)
     return
   }
 
-  // Mechanical double-post guard (a70cdf78): if the model already called
-  // post_session_message for this turn (tool part on the message, or hash
-  // recorded from tool.execute.after during the settle window), claim the
-  // OpenCode message id and do NOT post again.
+  // Mechanical double-post guard (a70cdf78, hardened for 5f75c2cb): if the
+  // model already called post_session_message for this turn, claim the
+  // OpenCode message id and do NOT post again. Three independent signals,
+  // because no single one covers every shape observed live:
+  // - content hash: the exact same body was already posted (manual or mirror).
+  // - tool-part scan across every post-inject candidate (not just `last`) —
+  //   the model may have called post_session_message from an EARLIER
+  //   assistant message in this turn and then kept working, ending on a
+  //   `last` with no tool part of its own.
+  // - `manualAnswerPostedThisTurn`: message-id-independent — set the instant
+  //   `tool.execute.after` observes the call (see recordManualPostSessionMessage),
+  //   so it also catches a shape neither the hash nor the tool-part scan sees.
   const contentHash = hashPostedContent(preparedText)
   const alreadyPostedByHash = (fresh.recentPostedContentHashes ?? []).includes(contentHash)
-  const alreadyPostedByTool = messageHasPostSessionMessageTool(last)
-  if (alreadyPostedByHash || alreadyPostedByTool) {
+  const alreadyPostedByTool = candidates.some((m) => messageHasPostSessionMessageTool(m))
+  const alreadyPostedManually = Boolean(fresh.manualAnswerPostedThisTurn)
+  if (alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) {
+    const via = alreadyPostedByTool ? 'tool' : alreadyPostedManually ? 'manual-flag' : 'content-hash'
     logPoll(
-      `mirrorLatestReply: skip (already posted via ${alreadyPostedByTool ? 'tool' : 'content-hash'}) ` +
+      `mirrorLatestReply: skip (already posted via ${via}) ` +
         `last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…`,
     )
     logRemoteControlStory({
@@ -3653,7 +3904,8 @@ async function mirrorLatestReply(
       agent: AGENT_NAME,
       codename: fresh.codename,
       tool: 'mirrorLatestReply',
-      reason: alreadyPostedByTool ? 'already_posted_tool' : 'already_posted_hash',
+      reason:
+        via === 'tool' ? 'already_posted_tool' : via === 'manual-flag' ? 'already_posted_manual_flag' : 'already_posted_hash',
       data: { message_id: last.info.id },
     })
     alreadyMirrored.add(last.info.id)
@@ -3663,6 +3915,8 @@ async function mirrorLatestReply(
       awaitingRemoteReply: false,
       replyAfterOpenCodeMessageId: null,
       replyBaselineCaptured: undefined,
+      currentTurnMessageIds: null,
+      manualAnswerPostedThisTurn: false,
       recentPostedContentHashes: (fresh.recentPostedContentHashes ?? []).includes(contentHash)
         ? fresh.recentPostedContentHashes
         : [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
@@ -3687,6 +3941,8 @@ async function mirrorLatestReply(
     awaitingRemoteReply: false,
     replyAfterOpenCodeMessageId: null,
     replyBaselineCaptured: undefined,
+    currentTurnMessageIds: null,
+    manualAnswerPostedThisTurn: false,
     // A successful real mirror means the connect handshake is over.
     connectMirrorSuppressed: false,
     // Claim the content hash too so a racing manual post that lands during
@@ -3756,6 +4012,8 @@ async function mirrorLatestReply(
       awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
       replyAfterOpenCodeMessageId: fresh.replyAfterOpenCodeMessageId ?? null,
       replyBaselineCaptured: fresh.replyBaselineCaptured,
+      currentTurnMessageIds: fresh.currentTurnMessageIds ?? null,
+      manualAnswerPostedThisTurn: fresh.manualAnswerPostedThisTurn ?? false,
       recentPostedContentHashes: hashes,
     })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)

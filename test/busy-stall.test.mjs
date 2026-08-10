@@ -3,14 +3,24 @@
  * Activity-aware busy stall (item c73d23a9) — tool-heavy turns must not
  * false-stall on empty reply text alone.
  * Permission-ask path (item bb633917) — hung permission.asked is not progress.
+ * Baseline-scoped stall + inject-turn cleanup (item 40279ae0).
  */
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { describe, it, after, beforeEach } from 'node:test'
 import {
+  clearInjectTurnState,
+  decideAwaitingBaseline,
   decideBusyStall,
   messageHasActiveToolWork,
   messageHasPendingPermissionAsk,
   assistantTextFromMessage,
+  readState,
+  resetBoundSessionIdForTests,
+  scopeAssistantsAfterBaseline,
+  writeState,
   PERMISSION_ASK_STALL_MS,
 } from '../dist/remote-control.js'
 
@@ -18,6 +28,10 @@ const TIMEOUT = 120_000
 
 function assistant(id, parts) {
   return { info: { id, role: 'assistant' }, parts }
+}
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-devspec-stall-'))
 }
 
 describe('messageHasActiveToolWork', () => {
@@ -290,5 +304,175 @@ describe('decideBusyStall', () => {
     })
     assert.equal(d.action, 'slide')
     assert.equal(d.reason, 'active_tool')
+  })
+})
+
+// Item 40279ae0: checkBusyStall must scope its "last assistant" to messages
+// AFTER the pre-inject baseline, not the global last assistant in the
+// session — otherwise a stale, already-answered turn's real text makes a
+// brand-new, genuinely silent turn look "not a stall".
+describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () => {
+  const assistants = [
+    assistant('a1', [{ type: 'text', text: 'OLD ANSWERED TURN' }]),
+    assistant('a2', [{ type: 'text', text: 'newer, still part of old turn' }]),
+  ]
+
+  it('slice: only assistants strictly after the baseline are candidates', () => {
+    const decision = decideAwaitingBaseline({
+      baseline: 'a1',
+      baselineCaptured: true,
+      assistantIds: ['a1', 'a2'],
+    })
+    assert.equal(decision.action, 'slice')
+    // a2 is genuinely after baseline a1 — a real candidate for this turn,
+    // not the pre-inject baseline message itself.
+    const scoped = scopeAssistantsAfterBaseline(assistants, decision)
+    assert.equal(scoped.length, 1)
+    assert.equal(scoped[0].info.id, 'a2')
+  })
+
+  it('wait: baseline is the newest assistant — no progress yet, not the stale text', () => {
+    const decision = decideAwaitingBaseline({
+      baseline: 'a2',
+      baselineCaptured: true,
+      assistantIds: ['a1', 'a2'],
+    })
+    assert.equal(decision.action, 'wait')
+    const scoped = scopeAssistantsAfterBaseline(assistants, decision)
+    assert.deepEqual(scoped, [])
+    // Confirms the regression this closes: decideBusyStall must see nothing
+    // (and so correctly stall on true silence) rather than a2's real text.
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: scoped[scoped.length - 1],
+      previousProgressAssistantId: null,
+    })
+    assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'empty_assistant_timeout')
+  })
+
+  it('a genuine new post-inject assistant is still visible for progress', () => {
+    const withNew = [...assistants, assistant('a3', [{ type: 'text', text: 'real reply' }])]
+    const decision = decideAwaitingBaseline({
+      baseline: 'a2',
+      baselineCaptured: true,
+      assistantIds: ['a1', 'a2', 'a3'],
+    })
+    assert.equal(decision.action, 'slice')
+    const scoped = scopeAssistantsAfterBaseline(withNew, decision)
+    assert.equal(scoped.length, 1)
+    assert.equal(scoped[0].info.id, 'a3')
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: scoped[scoped.length - 1],
+      previousProgressAssistantId: null,
+    })
+    assert.equal(d.action, 'has_text')
+  })
+
+  it('fail_closed_snapshot: baseline snapshot failed — treated as no progress, not all history', () => {
+    const decision = decideAwaitingBaseline({
+      baseline: 'a1',
+      baselineCaptured: false,
+      assistantIds: ['a1', 'a2'],
+    })
+    assert.deepEqual(scopeAssistantsAfterBaseline(assistants, decision), [])
+  })
+
+  it('all: empty history at inject — every assistant is new', () => {
+    const decision = decideAwaitingBaseline({
+      baseline: null,
+      baselineCaptured: true,
+      assistantIds: ['a1', 'a2'],
+    })
+    assert.deepEqual(scopeAssistantsAfterBaseline(assistants, decision), assistants)
+  })
+
+  it('fail_closed_legacy: no baseline info at all — lenient fallback to full history', () => {
+    const decision = decideAwaitingBaseline({
+      baseline: null,
+      baselineCaptured: undefined,
+      assistantIds: ['a1', 'a2'],
+    })
+    assert.equal(decision.action, 'fail_closed_legacy')
+    assert.deepEqual(scopeAssistantsAfterBaseline(assistants, decision), assistants)
+  })
+})
+
+describe('clearInjectTurnState (item 40279ae0)', () => {
+  const dirs = []
+  beforeEach(() => {
+    resetBoundSessionIdForTests()
+  })
+  after(() => {
+    resetBoundSessionIdForTests()
+    for (const d of dirs) {
+      try {
+        fs.rmSync(d, { recursive: true, force: true })
+      } catch {
+        /* best-effort */
+      }
+    }
+  })
+
+  function seedState(dir, extra = {}) {
+    writeState(dir, {
+      connectionId: '5aa9129e-aa63-4b80-a2ad-ad8c5e336bde',
+      sessionId: '5546c769-0cc2-4eac-9bcf-ca91b14151c4',
+      codename: 'Fierce Eagle',
+      awaitingRemoteReply: true,
+      replyAfterOpenCodeMessageId: 'msg_base',
+      replyBaselineCaptured: true,
+      manualAnswerPostedThisTurn: true,
+      activeTrailMessageId: 'trail-1',
+      lastTrailHash: 'hash-1',
+      lastTrailPostedAt: 111,
+      deliveredMessageIds: ['cmd-1', 'cmd-2', 'cmd-3'],
+      currentTurnMessageIds: ['cmd-2', 'cmd-3'],
+      ...extra,
+    })
+  }
+
+  it('clears awaiting/baseline/trail/manual-post state without touching deliveredMessageIds by default', () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    seedState(dir)
+
+    clearInjectTurnState(dir)
+
+    const fresh = readState(dir)
+    assert.equal(fresh?.awaitingRemoteReply, false)
+    assert.equal(fresh?.replyAfterOpenCodeMessageId, null)
+    assert.equal(fresh?.currentTurnMessageIds, null)
+    assert.equal(fresh?.manualAnswerPostedThisTurn, false)
+    assert.equal(fresh?.activeTrailMessageId, null)
+    assert.equal(fresh?.lastTrailHash, null)
+    assert.equal(fresh?.lastTrailPostedAt, null)
+    // A CLEAN end never unclaims — the command was genuinely answered.
+    assert.deepEqual(fresh?.deliveredMessageIds, ['cmd-1', 'cmd-2', 'cmd-3'])
+  })
+
+  it('unclaim:true removes exactly this turn\'s ids from deliveredMessageIds — the stuck-turn fix', () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    seedState(dir)
+
+    clearInjectTurnState(dir, { unclaim: true })
+
+    const fresh = readState(dir)
+    assert.equal(fresh?.awaitingRemoteReply, false)
+    assert.equal(fresh?.currentTurnMessageIds, null)
+    // cmd-2/cmd-3 belonged to the stalled turn — unclaimed so they can
+    // re-inject. cmd-1 belonged to an earlier, already-answered turn and
+    // must survive untouched.
+    assert.deepEqual(fresh?.deliveredMessageIds, ['cmd-1'])
+  })
+
+  it('is a safe no-op when there is no state file for the directory', () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    assert.doesNotThrow(() => clearInjectTurnState(dir, { unclaim: true }))
   })
 })
