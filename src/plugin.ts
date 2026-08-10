@@ -13,6 +13,7 @@ import {
   runWithBoundSessionAsync,
   scheduleMirrorNow,
   setBusy,
+  shouldAutoAllowRemoteControlPermission,
   stateKeyForOpenCodeBond,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
@@ -192,6 +193,26 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   void pump()
 
   return {
+    /**
+     * Unattended remote-control yolo: later owner commands arrive via
+     * `promptAsync` and never inherit cold-launch `opencode run --auto`.
+     * Auto-allow only while a DevSpec bond is live in this process.
+     */
+    'permission.ask': async (input, output) => {
+      if (!shouldAutoAllowRemoteControlPermission()) return
+      output.status = 'allow'
+      const kind = typeof input?.type === 'string' ? input.type : 'unknown'
+      const patterns = input?.pattern
+      const patternPreview = Array.isArray(patterns)
+        ? patterns.slice(0, 3).join(', ')
+        : typeof patterns === 'string'
+          ? patterns
+          : ''
+      logPoll(
+        `permission.ask auto-allow (remote-control bond active) type=${kind}` +
+          (patternPreview ? ` patterns=${patternPreview}` : ''),
+      )
+    },
     /**
      * Verified present on the Hooks type: `dispose?: () => Promise<void>`. Aborting the
      * in-flight hold here is what keeps a 25s held request from delaying host shutdown.

@@ -1243,6 +1243,23 @@ export function listOpenCodeBondSessions(): string[] {
   return [...openCodeBonds.keys()]
 }
 
+/**
+ * Whether OpenCode's `permission.ask` hook should auto-allow.
+ *
+ * Cold-launch `opencode run --auto` only covers the first connect turn.
+ * Later owner commands are injected via `promptAsync` into the live session,
+ * so they never inherit `--auto`. Live stall 2026-08-10 (session 1187956b):
+ * `external_directory` for `~/.config/opencode` got `permission.asked` with
+ * no `permission.replied`, then hung until empty_assistant_timeout ~131s.
+ *
+ * While any DevSpec remote-control bond is active in this process, auto-allow
+ * — that is the unattended equivalent of Claude/Cursor yolo for remote turns.
+ * Plain interactive TUI with no `/devspec.remote` bond still prompts.
+ */
+export function shouldAutoAllowRemoteControlPermission(): boolean {
+  return listOpenCodeBondSessions().length > 0
+}
+
 export function stateKeyForOpenCodeBond(opencodeSessionId: string): string | null | undefined {
   if (!openCodeBonds.has(opencodeSessionId)) return undefined
   return openCodeBonds.get(opencodeSessionId)

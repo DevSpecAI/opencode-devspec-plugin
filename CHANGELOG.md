@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Remote control — auto-allow permission.ask while bonded (yolo for promptAsync)
+
+Live stall (session `1187956b`, 2026-08-10): OpenCode asked `external_directory` for `~/.config/opencode` on a later remote turn and never got a reply. Cold-launch `opencode run --auto` only covers the first connect message; subsequent owner commands are injected via `promptAsync`, so they never inherit `--auto`.
+
+- New `permission.ask` hook: while any DevSpec remote-control bond is active in the process, set `output.status = 'allow'`.
+- Interactive TUI with no `/devspec.remote` bond still prompts as before.
+- `shouldAutoAllowRemoteControlPermission()` + unit tests.
+
+Item `1514baa3`. Requires plugin rebuild/reload (**0.3.8**).
+
 ### Remote control — full session UUID for transcript + broader status chrome strip
 
 Live (OpenCode · Dashing Osprey / session `7976fffb`): `/devspec.remote --session <short>` attached fine, then `get_session_transcript` with the same short code failed ("Session not found"). Separately, a variant status block (box-drawing rule without the exact `━━━ DevSpec Remote Control ━━━` title) plus an `Internal note (not mirrored)` orientation paragraph was mirrored into the DevSpec room.
