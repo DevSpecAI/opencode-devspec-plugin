@@ -54,6 +54,7 @@ import {
   isDevspecRemoteControlCommand,
   prepareMirrorText,
   shouldClaimConnectTurnSuppress,
+  shouldDeferInjectDuringConnect,
   shouldSkipConnectTurnMirror,
 } from './mirror-chrome.js'
 import { logRemoteControlStory } from './remote-control-story.js'
@@ -71,6 +72,7 @@ export {
   isOperationalChrome,
   prepareMirrorText,
   shouldClaimConnectTurnSuppress,
+  shouldDeferInjectDuringConnect,
   shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
@@ -2753,9 +2755,33 @@ export async function pollAndDeliver(
   // Dedup against what we have already injected (a bounded set — the cursor alone is not
   // enough, as a racing/stale cursor read has caused triple-delivery in this file before).
   const deliveredIds = new Set(state.deliveredMessageIds ?? [])
-  const commands = [...dispatchCommands, ...liveRoomCommands].filter(
+  const pendingCommands = [...dispatchCommands, ...liveRoomCommands].filter(
     (m) => !(typeof m?.id === 'string' && deliveredIds.has(m.id)),
   )
+  // Item 6990fd9e: never inject owner commands into a still-settling connect turn.
+  // Hold the cursor until connectMirrorSuppressed clears, then deliver on a later poll.
+  const deferInject = shouldDeferInjectDuringConnect({
+    connectMirrorSuppressed: state.connectMirrorSuppressed,
+    awaitingRemoteReply: state.awaitingRemoteReply,
+  })
+  const commands = deferInject ? [] : pendingCommands
+  if (deferInject && pendingCommands.length > 0) {
+    logPoll(
+      `deferring inject of ${pendingCommands.length} command(s) — connect handshake still settling ` +
+        `(connectMirrorSuppressed); will retry after suppress clears`,
+    )
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'deferred',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'promptAsync',
+      reason: 'connect_handshake',
+      data: { commands: pendingCommands.length },
+    })
+  }
 
   if (typeof res.dispatch_cursor === 'string') pump.dispatchCursor = res.dispatch_cursor
   // Advance the message cursor only when the packaged turn was fully consumed.
@@ -2783,12 +2809,21 @@ export async function pollAndDeliver(
     logPoll(
       `holding message cursor — deliverable work not injected ` +
         `(room=${roomCommands.length}, seedKept=${liveRoomCommands.length}, ` +
-        `dispatch=${dispatchCommands.length}, inject=${commands.length}); will retry`,
+        `dispatch=${dispatchCommands.length}, inject=${commands.length}` +
+        `${deferInject ? ', deferred=connect_handshake' : ''}); will retry`,
     )
     // Keep seed semantics so the next poll still asks for catch-up.
     if (wasSeed || liveRoomCommands.length > 0 || dispatchCommands.length > 0) {
       pump.needsSeed = true
     }
+  }
+
+  // Deferred mid-connect inject: do not fall into empty-change backoff — the
+  // package had real owner work; we deliberately held it.
+  if (deferInject && pendingCommands.length > 0) {
+    pump.consecutiveEmpty = 0
+    await mirrorNow(client, directory, sessionId)
+    return { delayMs: 0, stop: false }
   }
 
   if (commands.length === 0) {
@@ -3457,9 +3492,11 @@ export async function postWorkTrail(
 }
 
 /**
- * DevSpec's `message_id` out of an MCP tool result (the tool returns a JSON body
- * in a text content block). Returns null for any shape we don't recognise —
- * the id is a convenience for failing an open turn, never required for a post.
+ * DevSpec's `message_id` out of an MCP tool result.
+ *
+ * `mcpToolsCall` unwraps JSON to `{ message_id, … }`; tests and some call
+ * sites still pass the raw MCP envelope. Both shapes are accepted.
+ * Mirror answer posts MUST require this id before claiming success (item 6990fd9e).
  */
 export function extractPostedMessageId(result: unknown): string | null {
   const parsed = parsePostedToolJson(result)
@@ -3472,8 +3509,31 @@ export function extractClosedTrailTurn(result: unknown): boolean {
   return parsePostedToolJson(result)?.closed_trail_turn === true
 }
 
-function parsePostedToolJson(result: unknown): Record<string, unknown> | null {
-  const content = (result as { content?: unknown } | null)?.content
+/**
+ * Parse `post_session_message` (and similar) MCP tool results.
+ *
+ * `mcpToolsCall` unwraps the JSON body and returns `{ message_id, … }` directly.
+ * Some call sites / tests still pass the raw MCP envelope
+ * `{ content: [{ type: 'text', text: '<json>' }] }`. Accept both — otherwise a
+ * success check on `message_id` always misses and falsely rolls back (or, before
+ * the verify fix, never verified at all).
+ */
+export function parsePostedToolJson(result: unknown): Record<string, unknown> | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null
+  const obj = result as Record<string, unknown>
+
+  // Unwrapped mcpToolsCall success (the live path).
+  if (
+    typeof obj.message_id === 'string' ||
+    obj.closed_trail_turn === true ||
+    obj.noop === true ||
+    typeof obj.session_id === 'string'
+  ) {
+    return obj
+  }
+
+  // Raw MCP envelope.
+  const content = obj.content
   for (const block of Array.isArray(content) ? content : []) {
     const text = (block as { text?: unknown } | null)?.text
     if (typeof text !== 'string') continue
@@ -3484,6 +3544,18 @@ function parsePostedToolJson(result: unknown): Record<string, unknown> | null {
       }
     } catch {
       // Not JSON (a plain error string) — nothing to extract.
+    }
+  }
+
+  // mcpToolsCall fallback shape when the body was not valid JSON.
+  if (typeof obj.raw === 'string') {
+    try {
+      const parsed = JSON.parse(obj.raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      /* ignore */
     }
   }
   return null
@@ -3989,8 +4061,9 @@ async function mirrorLatestReply(
   // open trail turn the server falls back to the historical insert, so every
   // mirror can take this path unconditionally. complete_turn rides along so the
   // Working dots clear with the bubble rather than one report_complete later.
+  let postedDevspecMessageId: string | null = null
   try {
-    await mcpToolsCall({
+    const result = await mcpToolsCall({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'post_session_message',
@@ -4002,6 +4075,16 @@ async function mirrorLatestReply(
       }),
       timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
+    // Item 6990fd9e: "no throw" is not success. Live: mcpToolsCall returned
+    // without throwing, we logged posted + claimed the OpenCode id, but no
+    // session_messages row existed. Require a DevSpec message_id before keeping
+    // the optimistic claim.
+    postedDevspecMessageId = extractPostedMessageId(result)
+    if (!postedDevspecMessageId) {
+      throw new Error(
+        'post_session_message returned without message_id — refusing silent mirror success',
+      )
+    }
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.
     const ids = (readState(directory)?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id)
@@ -4042,6 +4125,7 @@ async function mirrorLatestReply(
 
   logPoll(
     `mirrorLatestReply: posted last.id=${last.info.id} via connection_id` +
+      ` devspec_message_id=${postedDevspecMessageId}` +
       (model ? ` model=${model.providerID}/${model.modelID}` : ' model=(none)'),
   )
   logRemoteControlStory({
@@ -4055,6 +4139,7 @@ async function mirrorLatestReply(
     reason: 'plugin_mirror',
     data: {
       message_id: last.info.id,
+      devspec_message_id: postedDevspecMessageId,
       ...modelStoryData(model),
       model_stamped: Boolean(model),
     },
@@ -4070,6 +4155,7 @@ async function mirrorLatestReply(
     reason: 'plugin_mirror',
     data: {
       message_id: last.info.id,
+      devspec_message_id: postedDevspecMessageId,
       ...modelStoryData(model),
       model_stamped: Boolean(model),
     },

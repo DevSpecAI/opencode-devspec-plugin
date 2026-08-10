@@ -270,9 +270,23 @@ describe('extractPostedMessageId', () => {
     assert.equal(extractPostedMessageId(result), 'msg-1')
   })
 
+  it('reads message_id from the unwrapped mcpToolsCall success object', () => {
+    // Live path: mcpToolsCall JSON.parses the tool body and returns it directly.
+    assert.equal(
+      extractPostedMessageId({
+        message_id: '6705e707-18d6-4d42-923b-29ae8a801af8',
+        session_id: 'bf7acd8c-61e5-4f44-8e93-2dfc668f8b35',
+        phase: 'answer',
+        complete_turn: true,
+      }),
+      '6705e707-18d6-4d42-923b-29ae8a801af8',
+    )
+  })
+
   it('returns null for a plain-text or malformed result rather than throwing', () => {
     assert.equal(extractPostedMessageId({ content: [{ type: 'text', text: 'Session not found' }] }), null)
     assert.equal(extractPostedMessageId({ content: [] }), null)
     assert.equal(extractPostedMessageId(null), null)
+    assert.equal(extractPostedMessageId({ ok: true }), null)
   })
 })

@@ -260,6 +260,28 @@ export function isDevspecRemoteControlCommand(name: unknown): boolean {
  * real reply was skip-claimed forever. When awaiting an inject reply, never
  * skip — that flag is the mechanical "this turn is the owner's answer" signal.
  */
+/**
+ * Defer owner-command inject while the connect/handshake turn is still settling.
+ *
+ * Live session bf7acd8c / item 6990fd9e: an owner dispatch landed mid-
+ * `/devspec.remote` (register done, attach not finished). Seed inject fired
+ * `promptAsync` into that connect turn; the model answered in the terminal, the
+ * mirror claimed success without a room row, and the handshake never completed
+ * cleanly. `connectMirrorSuppressed` already means "handshake still settling"
+ * for the mirror path — reuse it so inject waits until suppress clears.
+ *
+ * Does NOT apply when `awaitingRemoteReply` is already true (a real inject turn
+ * is in flight — suppress may still be set from register; do not starve that
+ * turn's follow-ups).
+ */
+export function shouldDeferInjectDuringConnect(opts: {
+  connectMirrorSuppressed?: boolean | null
+  awaitingRemoteReply?: boolean | null
+}): boolean {
+  if (opts.awaitingRemoteReply) return false
+  return Boolean(opts.connectMirrorSuppressed)
+}
+
 export function shouldSkipConnectTurnMirror(opts: {
   messageId: string | null | undefined
   nonMirrorMessageIds?: Iterable<string> | null

@@ -10,6 +10,7 @@ import {
   isOperationalChrome,
   prepareMirrorText,
   shouldClaimConnectTurnSuppress,
+  shouldDeferInjectDuringConnect,
   shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
@@ -173,6 +174,38 @@ describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => 
     assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.work'), false)
+  })
+})
+
+describe('shouldDeferInjectDuringConnect — mid-handshake owner command (6990fd9e)', () => {
+  it('defers inject while connectMirrorSuppressed and not awaiting a reply', () => {
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectMirrorSuppressed: true,
+        awaitingRemoteReply: false,
+      }),
+      true,
+    )
+  })
+
+  it('does not defer after handshake suppress clears', () => {
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectMirrorSuppressed: false,
+        awaitingRemoteReply: false,
+      }),
+      false,
+    )
+  })
+
+  it('does not defer when already awaiting an inject reply (suppress may still be set)', () => {
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectMirrorSuppressed: true,
+        awaitingRemoteReply: true,
+      }),
+      false,
+    )
   })
 })
 
