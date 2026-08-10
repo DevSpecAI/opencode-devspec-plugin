@@ -1,7 +1,9 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import {
   clearPermissionAsked,
+  clearPendingQuestion,
   flushMirrorNow,
+  handleQuestionAsked,
   handleSessionError,
   listOpenCodeBondSessions,
   logPoll,
@@ -10,6 +12,7 @@ import {
   recordConnectionEventFromTool,
   recordManualPostSessionMessage,
   recordRemoteControlSkillCommand,
+  rejectPendingQuestion,
   runWithBoundSessionAsync,
   scheduleMirrorNow,
   scheduleWorkTrailPost,
@@ -55,6 +58,19 @@ function isPermissionResolvedEvent(type: string): boolean {
     type === 'permission.denied' ||
     type === 'permission.answered' ||
     type === 'permission.reply'
+  )
+}
+
+function isQuestionAskedEvent(type: string): boolean {
+  return type === 'question.asked' || type === 'question.v2.asked'
+}
+
+function isQuestionResolvedEvent(type: string): boolean {
+  return (
+    type === 'question.replied' ||
+    type === 'question.rejected' ||
+    type === 'question.v2.replied' ||
+    type === 'question.v2.rejected'
   )
 }
 
@@ -298,6 +314,47 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         const target = sessionId ?? fallbackSessionId
         const clear = async () => {
           clearPermissionAsked(directory)
+        }
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, clear)
+          } else {
+            await clear()
+          }
+        } else {
+          await clear()
+        }
+      } else if (isQuestionAskedEvent(event.type)) {
+        const target = sessionId ?? fallbackSessionId
+        const ask = async () => {
+          await handleQuestionAsked(directory, props ?? null)
+        }
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, ask)
+          } else {
+            await ask()
+          }
+        } else {
+          await ask()
+        }
+      } else if (isQuestionResolvedEvent(event.type)) {
+        const target = sessionId ?? fallbackSessionId
+        const clear = async () => {
+          // Terminal dismiss without our reply: fail the open trail so the room
+          // does not sit at Needs your input forever. A successful question.reply
+          // already cleared pendingQuestion before this event arrives.
+          if (event.type.includes('rejected')) {
+            await rejectPendingQuestion({
+              client,
+              directory,
+              reason: 'OpenCode question was dismissed before an answer arrived.',
+            })
+          } else {
+            clearPendingQuestion(directory)
+          }
         }
         if (target) {
           const stateKey = stateKeyForOpenCodeBond(target)

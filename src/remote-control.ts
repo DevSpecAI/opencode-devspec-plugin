@@ -344,6 +344,16 @@ interface ConnectionState {
   lastTrailHash?: string | null
   /** Epoch ms of the last trail post (throttle floor, TRAIL_POST_MIN_GAP_MS). */
   lastTrailPostedAt?: number | null
+  /**
+   * OpenCode question the turn is blocked on (item 7b4090e4). While set, the next
+   * owner `local_agent_dispatch` is delivered via `client.question.reply` instead
+   * of `promptAsync`, and busy-stall does not fire — a human may take minutes.
+   */
+  pendingQuestion?: {
+    requestId: string
+    questionCount: number
+    postedAt: number
+  } | null
 }
 
 /**
@@ -769,6 +779,195 @@ export function clearPermissionAsked(directory: string): void {
   logPoll('clearPermissionAsked: cleared pending permission ask')
 }
 
+/** Format OpenCode question.asked properties into a DevSpec-readable prompt. */
+export function formatQuestionPrompt(props: {
+  questions?: Array<{
+    question?: string
+    header?: string
+    options?: Array<{ label?: string; description?: string }>
+  }>
+}): string {
+  const questions = Array.isArray(props.questions) ? props.questions : []
+  if (questions.length === 0) return 'OpenCode needs your input.'
+  const blocks = questions.map((q, i) => {
+    const header = typeof q.header === 'string' && q.header.trim() ? q.header.trim() : null
+    const body = typeof q.question === 'string' && q.question.trim() ? q.question.trim() : 'Question'
+    const opts = Array.isArray(q.options)
+      ? q.options
+          .map((o) => {
+            const label = typeof o?.label === 'string' ? o.label.trim() : ''
+            if (!label) return null
+            const desc = typeof o?.description === 'string' && o.description.trim() ? ` — ${o.description.trim()}` : ''
+            return `- ${label}${desc}`
+          })
+          .filter(Boolean)
+      : []
+    const title = questions.length > 1 ? `${i + 1}. ${header ? `${header}: ` : ''}${body}` : `${header ? `${header}: ` : ''}${body}`
+    return opts.length > 0 ? `${title}\n${opts.join('\n')}` : title
+  })
+  return blocks.join('\n\n')
+}
+
+/**
+ * Surface an OpenCode question.asked event as DevSpec needs-your-input on the
+ * open live trail turn. Idempotent on the same request id.
+ */
+export async function handleQuestionAsked(
+  directory: string,
+  props: Record<string, unknown> | null | undefined,
+): Promise<void> {
+  const requestId = typeof props?.id === 'string' ? props.id.trim() : ''
+  if (!requestId) {
+    logPoll('handleQuestionAsked: missing request id — ignored')
+    return
+  }
+  const state = readState(directory)
+  if (!state?.connectionId) {
+    logPoll(`handleQuestionAsked: no connection for request ${requestId}`)
+    return
+  }
+  if (state.pendingQuestion?.requestId === requestId) {
+    logPoll(`handleQuestionAsked: already pending ${requestId}`)
+    return
+  }
+
+  const questions = Array.isArray(props?.questions) ? (props!.questions as Array<Record<string, unknown>>) : []
+  const prompt = formatQuestionPrompt({ questions: questions as any })
+  const auth = resolveDevspecAuth(directory)
+  if (!auth.ok || !auth.token || !auth.mcp_url) return
+
+  try {
+    const result = await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: postMessageArgs(state, prompt, {
+        turn_kind: 'agent',
+        phase: 'needs_input',
+        needs_input: {
+          kind: 'question',
+          request_id: requestId,
+          prompt,
+          options: questions,
+        },
+      }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+    const messageId = extractPostedMessageId(result)
+    patchState(directory, {
+      pendingQuestion: {
+        requestId,
+        questionCount: Math.max(1, questions.length),
+        postedAt: Date.now(),
+      },
+      ...(messageId ? { activeTrailMessageId: messageId } : {}),
+    })
+    logPoll(`handleQuestionAsked: posted needs_input request=${requestId} message=${messageId ?? 'n/a'}`)
+    logRemoteControlStory({
+      phase: 'mirror_post',
+      outcome: 'posted',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'post_session_message',
+      reason: 'needs_input',
+      data: { request_id: requestId, question_count: questions.length },
+    })
+  } catch (err) {
+    logPoll(`handleQuestionAsked: post failed: ${err}`)
+  }
+}
+
+/** Clear a pending question after reply/reject/disconnect. */
+export function clearPendingQuestion(directory: string): void {
+  const state = readState(directory)
+  if (!state?.pendingQuestion) return
+  patchState(directory, { pendingQuestion: null })
+  logPoll('clearPendingQuestion: cleared')
+}
+
+/**
+ * Deliver an owner command into a waiting OpenCode question (not a new prompt).
+ * Returns true when the reply was sent (caller should not also promptAsync).
+ */
+export async function replyPendingQuestion(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  answerText: string
+}): Promise<boolean> {
+  const { client, directory, answerText } = input
+  const state = readState(directory)
+  const pending = state?.pendingQuestion
+  if (!state || !pending?.requestId) return false
+  const text = answerText.trim()
+  if (!text) {
+    logPoll('replyPendingQuestion: empty answer — not sending')
+    return false
+  }
+  const answers = Array.from({ length: Math.max(1, pending.questionCount) }, () => [text])
+  try {
+    await withTimeout(
+      (client as any).question.reply({
+        requestID: pending.requestId,
+        answers,
+      }),
+      OPENCODE_SESSION_API_TIMEOUT_MS,
+      'question.reply',
+    )
+    clearPendingQuestion(directory)
+    logPoll(`replyPendingQuestion: replied to ${pending.requestId}`)
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'queued',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'question.reply',
+      reason: 'needs_input_answer',
+      data: { request_id: pending.requestId },
+    })
+    return true
+  } catch (err) {
+    logPoll(`replyPendingQuestion: failed: ${err}`)
+    return false
+  }
+}
+
+/**
+ * Reject a pending OpenCode question (terminal dismiss / disconnect path).
+ */
+export async function rejectPendingQuestion(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  reason?: string
+}): Promise<void> {
+  const { client, directory, reason } = input
+  const state = readState(directory)
+  const pending = state?.pendingQuestion
+  if (!state || !pending?.requestId) return
+  try {
+    await withTimeout(
+      (client as any).question.reject({ requestID: pending.requestId }),
+      OPENCODE_SESSION_API_TIMEOUT_MS,
+      'question.reject',
+    )
+  } catch (err) {
+    logPoll(`rejectPendingQuestion: reject call failed: ${err}`)
+  }
+  clearPendingQuestion(directory)
+  const auth = resolveDevspecAuth(directory)
+  if (auth.ok && auth.token && auth.mcp_url) {
+    await failOpenTrailTurn(
+      auth,
+      directory,
+      state,
+      reason ?? 'OpenCode question was dismissed before an answer arrived.',
+    )
+  }
+}
+
 export type BusyStallDecision =
   | { action: 'under_timeout' }
   | { action: 'has_text' }
@@ -959,8 +1158,14 @@ function postMessageArgs(
   extras?: {
     turn_kind?: 'agent' | 'local_prompt'
     model?: { providerID: string; modelID: string }
-    /** Live-trail lifecycle (item bfca2495). Omitted = the historical answer post. */
-    phase?: 'trail' | 'answer' | 'error'
+    /** Live-trail lifecycle (items bfca2495 / 7b4090e4). Omitted = the historical answer post. */
+    phase?: 'trail' | 'needs_input' | 'answer' | 'error'
+    needs_input?: {
+      kind: 'question' | 'permission'
+      request_id: string
+      prompt: string
+      options?: unknown
+    }
     /** End the connection's Working attempt in the same request as the bubble. */
     complete_turn?: boolean
   },
@@ -971,6 +1176,7 @@ function postMessageArgs(
     ...(extras?.turn_kind ? { turn_kind: extras.turn_kind } : {}),
     ...(extras?.model ? { model: extras.model } : {}),
     ...(extras?.phase ? { phase: extras.phase } : {}),
+    ...(extras?.needs_input ? { needs_input: extras.needs_input } : {}),
     ...(extras?.complete_turn ? { complete_turn: true } : {}),
   }
   if (state.connectionId) args.connection_id = state.connectionId
@@ -1015,6 +1221,15 @@ export async function checkBusyStall(
   const auth = resolveDevspecAuth(directory)
   let state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state?.busy || !state.sessionId) return
+
+  // Waiting on a DevSpec-surfaced OpenCode question is not a stall — the human
+  // may answer from phone/web minutes later (item 7b4090e4).
+  if (state.pendingQuestion?.requestId) {
+    logPoll(
+      `stall check: pending question ${state.pendingQuestion.requestId} — waiting on owner, not stalling`,
+    )
+    return
+  }
 
   // Older state files may have busy:true with no busySince — seed now so we
   // don't immediately treat a mid-flight upgrade as already timed out.
@@ -2544,6 +2759,32 @@ export async function pollAndDeliver(
       deliveryPatch.deliveredAssignmentIds = Array.from(pump.deliveredDispatchIds).slice(-50)
     }
     state = patchState(directory, deliveryPatch) ?? { ...state, ...deliveryPatch }
+  }
+
+  // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
+  // question, the next owner command answers THAT question — it must not start
+  // a fresh promptAsync turn. Advisory chatter never reaches this branch
+  // (commands are local_agent_dispatch only).
+  if (state.pendingQuestion?.requestId) {
+    const pendingRequestId = state.pendingQuestion.requestId
+    const answerText = commands
+      .map((c: any) => (typeof c?.content === 'string' ? c.content : typeof c?.text === 'string' ? c.text : ''))
+      .filter((t: string) => t.trim())
+      .join('\n\n')
+    const replied = await replyPendingQuestion({ client, directory, answerText })
+    if (replied) {
+      pump.carry.take() // discard carried advisory — it must not become the answer
+      logPoll(`needs_input: delivered owner reply to question ${pendingRequestId}`)
+      return { delayMs: 0, stop: false }
+    }
+    logPoll('needs_input: question.reply failed — will retry owner command on next poll')
+    // Un-claim so the same dispatch is retried (ids already in delivered set would
+    // otherwise soft-drop). Drop only the last batch from the set.
+    for (const m of commands) {
+      if (typeof m?.id === 'string') deliveredIds.delete(m.id)
+    }
+    patchState(directory, { deliveredMessageIds: Array.from(deliveredIds).slice(-50) })
+    return { delayMs: 2000, stop: false }
   }
 
   // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
