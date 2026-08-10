@@ -57,6 +57,11 @@ import {
   shouldSkipConnectTurnMirror,
 } from './mirror-chrome.js'
 import { logRemoteControlStory } from './remote-control-story.js'
+import {
+  TRAIL_POST_MIN_GAP_MS,
+  serializeTurnTrail,
+  shouldPostTrail,
+} from './work-trail.js'
 
 export {
   REMOTE_STATUS_BANNER,
@@ -325,6 +330,20 @@ interface ConnectionState {
    * session (avoids eating a normal TUI reply after a mid-session reattach).
    */
   connectMirrorSuppressed?: boolean
+  /**
+   * DevSpec `session_messages.id` of the live work-trail turn currently open for
+   * this connection (item bfca2495). Set from the first `phase:'trail'` post of a
+   * turn, cleared when the answer or an error closes it. Its real purpose is
+   * knowing whether there IS an open bubble to fail: without it a stalled or dead
+   * turn leaves a bubble streaming for ever, which is the one outcome the live
+   * trail must never produce. The SERVER still resolves which row to write from
+   * the connection itself — this is never sent as a target.
+   */
+  activeTrailMessageId?: string | null
+  /** Hash of the last trail body posted — skips updates that would change nothing. */
+  lastTrailHash?: string | null
+  /** Epoch ms of the last trail post (throttle floor, TRAIL_POST_MIN_GAP_MS). */
+  lastTrailPostedAt?: number | null
 }
 
 /**
@@ -937,13 +956,22 @@ export function materializeLargeAttachmentToDisk(input: {
 function postMessageArgs(
   state: ConnectionState,
   message: string,
-  extras?: { turn_kind?: 'agent' | 'local_prompt'; model?: { providerID: string; modelID: string } },
+  extras?: {
+    turn_kind?: 'agent' | 'local_prompt'
+    model?: { providerID: string; modelID: string }
+    /** Live-trail lifecycle (item bfca2495). Omitted = the historical answer post. */
+    phase?: 'trail' | 'answer' | 'error'
+    /** End the connection's Working attempt in the same request as the bubble. */
+    complete_turn?: boolean
+  },
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {
     message,
     agent_name: AGENT_NAME,
     ...(extras?.turn_kind ? { turn_kind: extras.turn_kind } : {}),
     ...(extras?.model ? { model: extras.model } : {}),
+    ...(extras?.phase ? { phase: extras.phase } : {}),
+    ...(extras?.complete_turn ? { complete_turn: true } : {}),
   }
   if (state.connectionId) args.connection_id = state.connectionId
   else if (state.sessionId) args.session_id = state.sessionId
@@ -1138,7 +1166,12 @@ export async function checkBusyStall(
       : `⚠️ OpenCode turn stalled after ${Math.round(elapsed / 1000)}s with no reply text ` +
         `(assistant message \`${lastId}\`). Cleared the busy indicator — check ` +
         `~/.devspec/opencode-remote-control/poll.log if this keeps happening.`
-  await postSessionNotice(auth, state, notice)
+  // A stall is exactly the case a live trail bubble cannot survive: the turn is
+  // over and no answer is coming, so failing the open bubble (which keeps the
+  // trail readable under error chrome) says more than a separate notice under a
+  // turn still claiming to stream. Fall back to the notice when none is open.
+  const failedTrail = await failOpenTrailTurn(auth, directory, readState(directory) ?? state, notice)
+  if (!failedTrail) await postSessionNotice(auth, state, notice)
   await setBusy(directory, false)
 }
 
@@ -1161,11 +1194,12 @@ export async function handleSessionError(directory: string, event: unknown): Pro
   logPoll(`session.error handled: ${detail}`)
 
   if (state && auth.ok && (state.sessionId || state.connectionId)) {
-    await postSessionNotice(
-      auth,
-      state,
-      `⚠️ OpenCode reported \`session.error\`. Busy cleared. Detail: ${detail}`,
-    )
+    const notice = `⚠️ OpenCode reported \`session.error\`. Busy cleared. Detail: ${detail}`
+    // Same reasoning as the stall path: close the open live-trail bubble as
+    // failed so it stops streaming, keeping the trail visible; only post a
+    // standalone notice when this turn never opened one.
+    const failedTrail = await failOpenTrailTurn(auth, directory, state, notice)
+    if (!failedTrail) await postSessionNotice(auth, state, notice)
   }
   await setBusy(directory, false)
 }
@@ -2654,16 +2688,26 @@ export async function deliverInjectedTurn(input: {
       logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`)
       baselineCaptured = false
     }
+    // A new turn starts with no bubble of its own: dropping the previous turn's
+    // trail pointer here is what stops the first chunk of THIS turn from being
+    // appended to the last turn's already-answered row.
+    const freshTurnTrail = {
+      activeTrailMessageId: null,
+      lastTrailHash: null,
+      lastTrailPostedAt: null,
+    } as const
     state =
       patchState(directory, {
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
+        ...freshTurnTrail,
       }) ?? {
         ...state,
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
+        ...freshTurnTrail,
       }
 
     await (client as any).session.promptAsync({
@@ -2874,6 +2918,251 @@ export function flushMirrorNow(
 }
 
 /**
+ * Live work trail (item bfca2495) — publish what this turn has produced SO FAR
+ * into DevSpec's streaming bubble, so the room is not blank while OpenCode works.
+ *
+ * Separate from the mirror on purpose. The mirror is answer-shaped: it fires once
+ * per turn, dedups, strips chrome, and closes the turn. The trail is progress-
+ * shaped: it fires repeatedly with unfiltered output and closes nothing. They
+ * share only the connection and the tool.
+ *
+ * Throttled leading-edge: the first update of a turn goes out immediately, and
+ * later ones are spaced by TRAIL_POST_MIN_GAP_MS with a trailing flush scheduled
+ * at the boundary — so the bubble stays about a second behind the terminal
+ * without turning `message.updated` into an MCP call per token.
+ */
+const trailGuards = new Map<string, { inFlight: boolean; pending: boolean }>()
+const trailTrailingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+/** Debounced/throttled trail publish for `message.updated`. */
+export function scheduleWorkTrailPost(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+): void {
+  const key = mirrorGuardKey(directory, sessionId)
+  void postWorkTrail(client, directory, sessionId)
+  // Whatever arrives during the gap still reaches the room: schedule one trailing
+  // publish so the last update before a quiet stretch is never the one dropped.
+  if (trailTrailingTimers.has(key)) return
+  const timer = setTimeout(() => {
+    trailTrailingTimers.delete(key)
+    void postWorkTrail(client, directory, sessionId)
+  }, TRAIL_POST_MIN_GAP_MS)
+  if (typeof timer === 'object' && timer && 'unref' in timer) {
+    ;(timer as NodeJS.Timeout).unref()
+  }
+  trailTrailingTimers.set(key, timer)
+}
+
+/**
+ * Serialize and post the current turn's trail, subject to the throttle.
+ *
+ * Only while a remote turn is actually in flight (`busy` or `awaitingRemoteReply`):
+ * a trail posted outside one would open a streaming bubble that nothing is going
+ * to close. Best-effort throughout — a failed trail post must never disturb the
+ * turn or the mirror that ends it.
+ */
+export async function postWorkTrail(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+  { force = false }: { force?: boolean } = {},
+): Promise<void> {
+  const bondKey = stateKeyForOpenCodeBond(sessionId)
+  const run = async () => {
+    const auth = resolveDevspecAuth(directory)
+    const state = readState(directory)
+    if (!auth.ok || !auth.token || !auth.mcp_url) return
+    if (!state?.sessionId || !state.connectionId) return
+    if (!state.busy && !state.awaitingRemoteReply) return
+
+    const key = mirrorGuardKey(directory, sessionId)
+    const guard = trailGuards.get(key) ?? { inFlight: false, pending: false }
+    if (guard.inFlight) {
+      // A trailing timer alone is not enough: if it fires while this post is
+      // still in flight it no-ops, and with no further message.updated the last
+      // chunk of a quiet stretch never leaves the laptop. Mark dirty and flush
+      // once the in-flight post clears.
+      guard.pending = true
+      trailGuards.set(key, guard)
+      return
+    }
+
+    let messages: any[]
+    try {
+      const res: any = await withTimeout(
+        (client as any).session.messages({ path: { id: sessionId } }),
+        OPENCODE_SESSION_API_TIMEOUT_MS,
+        'session.messages(trail)',
+      )
+      messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+    } catch (err) {
+      logPoll(`postWorkTrail: client.session.messages failed: ${err}`)
+      return
+    }
+
+    // Same baseline the mirror correlates on: everything after the pre-inject
+    // assistant is this remote turn's work. Without one, only the newest turn.
+    const trail = serializeTurnTrail(messages, {
+      afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
+    })
+    const trailHash = hashPostedContent(trail)
+    if (
+      !shouldPostTrail({
+        trail,
+        trailHash,
+        lastPostedTrailHash: state.lastTrailHash ?? null,
+        lastPostedAt: state.lastTrailPostedAt ?? null,
+        now: Date.now(),
+        force,
+      })
+    ) {
+      return
+    }
+
+    guard.inFlight = true
+    guard.pending = false
+    trailGuards.set(key, guard)
+    // Claim the throttle window before the round-trip so concurrent updates during
+    // it do not queue a second identical post behind this one.
+    patchState(directory, { lastTrailHash: trailHash, lastTrailPostedAt: Date.now() })
+    try {
+      const result = await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'post_session_message',
+        arguments: postMessageArgs(state, trail, { turn_kind: 'agent', phase: 'trail' }),
+        timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+      })
+      const messageId = extractPostedMessageId(result)
+      if (messageId && messageId !== readState(directory)?.activeTrailMessageId) {
+        patchState(directory, { activeTrailMessageId: messageId })
+        logPoll(`postWorkTrail: opened live trail turn ${messageId}`)
+      }
+    } catch (err) {
+      // Roll the hash back so the next update retries rather than assuming this
+      // body already landed.
+      patchState(directory, { lastTrailHash: state.lastTrailHash ?? null })
+      logPoll(`postWorkTrail: post_session_message(phase=trail) failed: ${err}`)
+    } finally {
+      const stillPending = guard.pending
+      guard.inFlight = false
+      guard.pending = false
+      trailGuards.set(key, guard)
+      if (stillPending) {
+        void postWorkTrail(client, directory, sessionId)
+      }
+    }
+  }
+  if (bondKey === undefined) {
+    await run()
+    return
+  }
+  await runWithBoundSessionAsync(bondKey, run)
+}
+
+/**
+ * DevSpec's `message_id` out of an MCP tool result (the tool returns a JSON body
+ * in a text content block). Returns null for any shape we don't recognise —
+ * the id is a convenience for failing an open turn, never required for a post.
+ */
+export function extractPostedMessageId(result: unknown): string | null {
+  const parsed = parsePostedToolJson(result)
+  const id = parsed?.message_id
+  return typeof id === 'string' && id ? id : null
+}
+
+/** Whether `phase:'error'|'answer'` actually closed a server-open trail turn. */
+export function extractClosedTrailTurn(result: unknown): boolean {
+  return parsePostedToolJson(result)?.closed_trail_turn === true
+}
+
+function parsePostedToolJson(result: unknown): Record<string, unknown> | null {
+  const content = (result as { content?: unknown } | null)?.content
+  for (const block of Array.isArray(content) ? content : []) {
+    const text = (block as { text?: unknown } | null)?.text
+    if (typeof text !== 'string') continue
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      // Not JSON (a plain error string) — nothing to extract.
+    }
+  }
+  return null
+}
+
+/** Forget this turn's trail bookkeeping once the turn has landed. */
+function clearTrailState(directory: string): void {
+  patchState(directory, {
+    activeTrailMessageId: null,
+    lastTrailHash: null,
+    lastTrailPostedAt: null,
+  })
+}
+
+/**
+ * Close an open live-trail bubble as FAILED.
+ *
+ * This is the whole reason the plugin tracks an open turn at all: a stall, a
+ * `session.error`, or an agent that simply dies would otherwise leave a bubble
+ * streaming for ever, which reads as "still working" to whoever is watching.
+ * Returns true when it closed a server-open turn, so callers can fall back to a
+ * plain notice when there was no live bubble to fail in the first place.
+ *
+ * Do NOT gate on local `activeTrailMessageId`. The server owns the open-turn
+ * pointer (`agent_connections.active_turn_message_id`); a trail may have opened
+ * on DevSpec even when the plugin never stored the returned message_id (parse
+ * miss, crash after write). Gating locally would leave that row streaming forever
+ * while the connection stays attached.
+ */
+async function failOpenTrailTurn(
+  auth: ReturnType<typeof resolveDevspecAuth>,
+  directory: string,
+  state: ConnectionState,
+  reason: string,
+): Promise<boolean> {
+  if (!auth.ok || !auth.token || !auth.mcp_url) return false
+  if (!state.connectionId || !state.sessionId) return false
+  let result: unknown
+  try {
+    result = await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: postMessageArgs(state, reason, { turn_kind: 'agent', phase: 'error' }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+  } catch (err) {
+    logPoll(`failOpenTrailTurn: post_session_message(phase=error) failed: ${err}`)
+    return false
+  }
+  const closed = extractClosedTrailTurn(result)
+  if (!closed) {
+    // Server had no open trail turn — leave the fallback notice path alone.
+    clearTrailState(directory)
+    return false
+  }
+  const messageId = extractPostedMessageId(result) ?? state.activeTrailMessageId ?? null
+  logRemoteControlStory({
+    phase: 'mirror_post',
+    outcome: 'failed_turn',
+    connectionId: state.connectionId,
+    sessionId: state.sessionId,
+    agent: AGENT_NAME,
+    codename: state.codename,
+    tool: 'post_session_message',
+    reason: 'work_trail_error',
+    data: { message_id: messageId, phase: 'error' },
+  })
+  clearTrailState(directory)
+  return true
+}
+
+/**
  * Mirror a completed OpenCode assistant reply into the attached DevSpec session.
  *
  * OpenCode has no separate skill post path — this plugin *is* the agent writer.
@@ -3080,6 +3369,17 @@ async function mirrorLatestReply(
       reason: 'operational_chrome',
       data: { message_id: last.info.id },
     })
+    // A live trail bubble opened by this turn would otherwise stream for ever:
+    // the answer that closes it is never coming, because there wasn't one. Fail
+    // it so the room shows a finished turn that produced no reply, with the work
+    // still readable, rather than a permanent "working…". Always attempt — the
+    // server owns the open-turn pointer, not local activeTrailMessageId.
+    await failOpenTrailTurn(
+      auth,
+      directory,
+      fresh,
+      '⚠️ The remote agent finished this turn without an answer — only operational output. The work above is what it did.',
+    )
     alreadyMirrored.add(last.info.id)
     patchState(directory, {
       lastMirroredMessageId: last.info.id,
@@ -3125,6 +3425,11 @@ async function mirrorLatestReply(
       recentPostedContentHashes: (fresh.recentPostedContentHashes ?? []).includes(contentHash)
         ? fresh.recentPostedContentHashes
         : [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
+      // The model's own post already closed any open trail turn server-side
+      // (a phase-less post takes the answer path) — just drop the local pointer.
+      activeTrailMessageId: null,
+      lastTrailHash: null,
+      lastTrailPostedAt: null,
     })
     await setBusy(directory, false)
     return
@@ -3181,12 +3486,23 @@ async function mirrorLatestReply(
     })
   }
 
+  // phase:'answer' closes the live work-trail bubble this turn has been growing
+  // (item bfca2495) by writing the chrome-filtered answer into the SAME row,
+  // instead of leaving it streaming under a second, duplicate message. With no
+  // open trail turn the server falls back to the historical insert, so every
+  // mirror can take this path unconditionally. complete_turn rides along so the
+  // Working dots clear with the bubble rather than one report_complete later.
   try {
     await mcpToolsCall({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'post_session_message',
-      arguments: postMessageArgs(fresh, preparedText, { turn_kind: 'agent', model }),
+      arguments: postMessageArgs(fresh, preparedText, {
+        turn_kind: 'agent',
+        model,
+        phase: 'answer',
+        complete_turn: true,
+      }),
       timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
   } catch (err) {
@@ -3219,6 +3535,11 @@ async function mirrorLatestReply(
     })
     return
   }
+
+  // Answer landed: the trail turn is closed server-side, so this connection has
+  // no open bubble any more. Clearing the pointer is what lets the NEXT turn open
+  // a fresh one instead of appending to a turn that already has an answer.
+  clearTrailState(directory)
 
   logPoll(
     `mirrorLatestReply: posted last.id=${last.info.id} via connection_id` +

@@ -12,6 +12,7 @@ import {
   recordRemoteControlSkillCommand,
   runWithBoundSessionAsync,
   scheduleMirrorNow,
+  scheduleWorkTrailPost,
   setBusy,
   shouldAutoAllowRemoteControlPermission,
   stateKeyForOpenCodeBond,
@@ -258,7 +259,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // post_session_message (against skill docs) can record its content hash
         // before we mirror — otherwise text lands first and we double-post.
         const target = sessionId ?? fallbackSessionId
-        if (target) scheduleMirrorNow(client, directory, target)
+        if (target) {
+          scheduleMirrorNow(client, directory, target)
+          // The live work trail (item bfca2495) rides the SAME event but must not
+          // wait for the mirror's settle debounce: the whole point is that the
+          // room sees progress while the turn is still running, so this publishes
+          // on its own throttle and closes nothing.
+          scheduleWorkTrailPost(client, directory, target)
+        }
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the
