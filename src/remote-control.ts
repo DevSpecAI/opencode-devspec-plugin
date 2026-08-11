@@ -2633,6 +2633,47 @@ export async function pollAndDeliver(
     return { delayMs: backoff, stop: false }
   }
 
+  // Out-of-band context wipe (archive/delete / attach-nonempty — items 37a7487b /
+  // 8a55a89b). Run BEFORE adopt/inject so the SDK scratchpad is blank before the
+  // next owner message, and ack immediately so the server waiter unblocks.
+  if (res?.pending_context_wipe === true) {
+    const reason =
+      typeof res.pending_context_wipe_reason === 'string'
+        ? res.pending_context_wipe_reason
+        : 'unspecified'
+    logPoll(`pending_context_wipe (${reason}) — wiping OpenCode context in place`)
+    try {
+      await wipeOpenCodeContextInPlace({
+        client,
+        directory,
+        opencodeSessionId: sessionId,
+      })
+    } catch (err) {
+      logPoll(`pending_context_wipe failed: ${err}`)
+    }
+    try {
+      await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'poll_connection',
+        arguments: {
+          connection_id: state.connectionId,
+          agent_name: AGENT_NAME,
+          wait_ms: 0,
+          context_wipe_ack: true,
+          busy: false,
+        },
+        timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+      })
+      logPoll('pending_context_wipe acked')
+    } catch (err) {
+      logPoll(`pending_context_wipe ack failed: ${err}`)
+    }
+    // Bond may have rebound to a new OpenCode session id — stop this pump
+    // iteration; the multi-bond loop will pick up the new id next tick.
+    return { delayMs: 0, stop: false }
+  }
+
   // Teardown (UI End, /devspec.remote-stop elsewhere, already-ended row). One check now
   // covers what the separate heartbeat used to: the poll IS the heartbeat.
   const terminal = pollTerminalReason(res)
