@@ -4,6 +4,7 @@
  * false-stall on empty reply text alone.
  * Permission-ask path (item bb633917) — hung permission.asked is not progress.
  * Baseline-scoped stall + inject-turn cleanup (item 40279ae0).
+ * Reasoning growth (item 10bdce1c) — MiniMax-style long thinks count as progress.
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -17,6 +18,7 @@ import {
   messageHasActiveToolWork,
   messageHasPendingPermissionAsk,
   assistantTextFromMessage,
+  assistantReasoningFingerprint,
   readState,
   resetBoundSessionIdForTests,
   scopeAssistantsAfterBaseline,
@@ -304,6 +306,94 @@ describe('decideBusyStall', () => {
     })
     assert.equal(d.action, 'slide')
     assert.equal(d.reason, 'active_tool')
+  })
+
+  it('slides when reasoning grows on the same assistant (MiniMax long think)', () => {
+    const early = assistant('m1', [{ type: 'reasoning', text: 'planning…' }])
+    const earlyFp = assistantReasoningFingerprint(early)
+    assert.ok(earlyFp)
+    const later = assistant('m1', [
+      { type: 'reasoning', text: 'planning… then checking the stall path in detail…' },
+    ])
+    const laterFp = assistantReasoningFingerprint(later)
+    assert.ok(laterFp)
+    assert.notEqual(earlyFp, laterFp)
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 11_000,
+      timeoutMs: TIMEOUT,
+      lastAssistant: later,
+      previousProgressAssistantId: 'm1',
+      previousReasoningFingerprint: earlyFp,
+    })
+    assert.equal(d.action, 'slide')
+    assert.equal(d.reason, 'reasoning_growth')
+    assert.equal(d.assistantId, 'm1')
+    assert.equal(d.reasoningFingerprint, laterFp)
+  })
+
+  it('slides on first seen reasoning fingerprint even when assistant id already tracked', () => {
+    const msg = assistant('m1', [{ type: 'thinking', text: 'deep think' }])
+    const fp = assistantReasoningFingerprint(msg)
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: msg,
+      previousProgressAssistantId: 'm1',
+      previousReasoningFingerprint: null,
+    })
+    assert.equal(d.action, 'slide')
+    assert.equal(d.reason, 'reasoning_growth')
+    assert.equal(d.reasoningFingerprint, fp)
+  })
+
+  it('stalls when reasoning is frozen on the same assistant past timeout', () => {
+    const msg = assistant('m1', [{ type: 'reasoning', text: 'stuck mid-thought' }])
+    const fp = assistantReasoningFingerprint(msg)
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: msg,
+      previousProgressAssistantId: 'm1',
+      previousReasoningFingerprint: fp,
+    })
+    assert.equal(d.action, 'stall')
+    assert.equal(d.reason, 'empty_assistant_timeout')
+  })
+
+  it('prefers active_tool over reasoning_growth when a tool is in flight', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [
+        { type: 'reasoning', text: 'still thinking while tool runs…' },
+        { type: 'tool', state: { status: 'running' } },
+      ]),
+      previousProgressAssistantId: 'm1',
+      previousReasoningFingerprint: '1:deadbeef',
+      sameAssistantActiveToolSlides: 0,
+      maxActiveToolSlides: 2,
+    })
+    assert.equal(d.action, 'slide')
+    assert.equal(d.reason, 'active_tool')
+  })
+})
+
+describe('assistantReasoningFingerprint', () => {
+  it('returns null without reasoning/thinking parts', () => {
+    assert.equal(assistantReasoningFingerprint(assistant('m1', [{ type: 'text', text: 'hi' }])), null)
+    assert.equal(
+      assistantReasoningFingerprint(
+        assistant('m1', [{ type: 'tool', state: { status: 'completed' } }]),
+      ),
+      null,
+    )
+  })
+
+  it('changes when reasoning text grows', () => {
+    const a = assistantReasoningFingerprint(assistant('m1', [{ type: 'reasoning', text: 'a' }]))
+    const b = assistantReasoningFingerprint(assistant('m1', [{ type: 'reasoning', text: 'ab' }]))
+    assert.ok(a && b)
+    assert.notEqual(a, b)
   })
 })
 

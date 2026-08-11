@@ -302,6 +302,13 @@ interface ConnectionState {
    */
   stallActiveToolSlides?: number | null
   /**
+   * Fingerprint of reasoning/thinking parts on the last progress slide
+   * (`length:hash`). Growing reasoning on the same assistant (MiniMax-style
+   * long thinks with no tool yet) slides `busySince` — a frozen fingerprint
+   * past the timeout is a true stall. Cleared when busy flips.
+   */
+  stallReasoningFingerprint?: string | null
+  /**
    * True while OpenCode is waiting on a permission prompt (`permission.asked`
    * or equivalent). Cleared when the ask is resolved/denied or busy clears.
    * Stall policy treats this as non-progress — never an `active_tool` slide.
@@ -452,6 +459,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
       stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
       stallActiveToolSlides: busy ? 0 : null,
+      stallReasoningFingerprint: null,
       // Permission wait is turn-scoped — clear on both busy edges so a stale
       // ask cannot poison the next turn or linger after we clear busy.
       permissionAskedPending: false,
@@ -699,6 +707,36 @@ export function messageHasActiveToolWork(message: { parts?: unknown } | null | u
     if (status === 'pending' || status === 'running') return true
   }
   return false
+}
+
+/**
+ * Stable fingerprint of assistant reasoning/thinking parts. Used by the
+ * busy-stall watchdog so a growing MiniMax-style think stream counts as
+ * progress even when there is no reply text and no in-flight tool yet.
+ * Returns null when the message has no reasoning content.
+ */
+export function assistantReasoningFingerprint(
+  message: { parts?: unknown } | null | undefined,
+): string | null {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  const chunks: string[] = []
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue
+    const part = p as Record<string, unknown>
+    const type = String(part.type ?? '').toLowerCase()
+    if (type !== 'reasoning' && type !== 'thinking' && type !== 'thought') continue
+    if (typeof part.text === 'string' && part.text.length > 0) {
+      chunks.push(part.text)
+      continue
+    }
+    if (typeof part.content === 'string' && part.content.length > 0) {
+      chunks.push(part.content)
+    }
+  }
+  if (chunks.length === 0) return null
+  const joined = chunks.join('\n')
+  const hash = crypto.createHash('sha256').update(joined, 'utf8').digest('hex').slice(0, 12)
+  return `${joined.length}:${hash}`
 }
 
 /**
@@ -999,7 +1037,13 @@ export async function rejectPendingQuestion(input: {
 export type BusyStallDecision =
   | { action: 'under_timeout' }
   | { action: 'has_text' }
-  | { action: 'slide'; reason: 'active_tool' | 'new_assistant'; assistantId: string | null }
+  | {
+      action: 'slide'
+      reason: 'active_tool' | 'new_assistant' | 'reasoning_growth'
+      assistantId: string | null
+      /** Present on reasoning_growth so callers can persist the new fingerprint. */
+      reasoningFingerprint?: string | null
+    }
   | {
       action: 'stall'
       assistantId: string | null
@@ -1020,6 +1064,8 @@ export function decideBusyStall(input: {
   /** Slides already granted for the current `previousProgressAssistantId` via active_tool. */
   sameAssistantActiveToolSlides?: number
   maxActiveToolSlides?: number
+  /** Prior reasoning fingerprint from state — growth slides; frozen stalls. */
+  previousReasoningFingerprint?: string | null
   /** Hung permission wait — never treated as active_tool progress. */
   permissionAskPending?: boolean
   /** ms since `permissionAskedAt` (0 if pending but clock unknown). */
@@ -1059,6 +1105,17 @@ export function decideBusyStall(input: {
       return { action: 'stall', assistantId: lastId, reason: 'active_tool_cap' }
     }
     return { action: 'slide', reason: 'active_tool', assistantId: lastId }
+  }
+
+  const reasoningFp = assistantReasoningFingerprint(input.lastAssistant)
+  const prevReasoning = input.previousReasoningFingerprint ?? null
+  if (reasoningFp && reasoningFp !== prevReasoning) {
+    return {
+      action: 'slide',
+      reason: 'reasoning_growth',
+      assistantId: lastId,
+      reasoningFingerprint: reasoningFp,
+    }
   }
 
   const prev = input.previousProgressAssistantId ?? null
@@ -1260,11 +1317,11 @@ async function postSessionNotice(
 
 /**
  * If we've been busy longer than STALL_TIMEOUT_MS with no observable progress
- * (no reply text, no new assistant step, no in-flight tool), clear busy and
- * warn in the DevSpec session. Healthy tool-heavy turns slide `busySince`
- * instead of false-stalling. A pending `permission.asked` is NOT progress —
- * it never slides and stalls after PERMISSION_ASK_STALL_MS. Called every poll
- * while busy.
+ * (no reply text, no new assistant step, no in-flight tool, no growing
+ * reasoning), clear busy and warn in the DevSpec session. Healthy tool-heavy
+ * and long-think turns slide `busySince` instead of false-stalling. A pending
+ * `permission.asked` is NOT progress — it never slides and stalls after
+ * PERMISSION_ASK_STALL_MS. Called every poll while busy.
  */
 export async function checkBusyStall(
   client: Parameters<Plugin>[0]['client'],
@@ -1378,6 +1435,7 @@ export async function checkBusyStall(
     previousProgressAssistantId: state.stallProgressAssistantId,
     sameAssistantActiveToolSlides: state.stallActiveToolSlides ?? 0,
     maxActiveToolSlides: MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES,
+    previousReasoningFingerprint: state.stallReasoningFingerprint ?? null,
     permissionAskPending,
     permissionAskElapsedMs,
     permissionAskStallMs: PERMISSION_ASK_STALL_MS,
@@ -1407,14 +1465,22 @@ export async function checkBusyStall(
       decision.assistantId != null &&
       decision.assistantId === (state.stallProgressAssistantId ?? null)
     const nextSlides = decision.reason === 'active_tool' ? (sameAssistant ? (state.stallActiveToolSlides ?? 0) + 1 : 1) : 0
+    const nextReasoningFp =
+      decision.reason === 'reasoning_growth'
+        ? (decision.reasoningFingerprint ?? assistantReasoningFingerprint(last))
+        : decision.reason === 'new_assistant'
+          ? assistantReasoningFingerprint(last)
+          : (state.stallReasoningFingerprint ?? null)
     patchState(directory, {
       busySince: now,
       stallProgressAssistantId: decision.assistantId,
       stallActiveToolSlides: nextSlides,
+      stallReasoningFingerprint: nextReasoningFp,
     })
     logPoll(
       `stall check: progress (${decision.reason}) on ${decision.assistantId ?? 'none'} — slid busySince after ${elapsed}ms` +
-        (decision.reason === 'active_tool' ? ` (active_tool slides=${nextSlides})` : ''),
+        (decision.reason === 'active_tool' ? ` (active_tool slides=${nextSlides})` : '') +
+        (decision.reason === 'reasoning_growth' ? ` (reasoning=${nextReasoningFp})` : ''),
     )
     return
   }
