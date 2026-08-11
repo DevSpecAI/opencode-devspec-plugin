@@ -1,7 +1,9 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import {
   clearPermissionAsked,
+  clearPendingQuestion,
   flushMirrorNow,
+  handleQuestionAsked,
   handleSessionError,
   listOpenCodeBondSessions,
   logPoll,
@@ -10,9 +12,12 @@ import {
   recordConnectionEventFromTool,
   recordManualPostSessionMessage,
   recordRemoteControlSkillCommand,
+  rejectPendingQuestion,
   runWithBoundSessionAsync,
   scheduleMirrorNow,
+  scheduleWorkTrailPost,
   setBusy,
+  shouldAutoAllowRemoteControlPermission,
   stateKeyForOpenCodeBond,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
@@ -53,6 +58,19 @@ function isPermissionResolvedEvent(type: string): boolean {
     type === 'permission.denied' ||
     type === 'permission.answered' ||
     type === 'permission.reply'
+  )
+}
+
+function isQuestionAskedEvent(type: string): boolean {
+  return type === 'question.asked' || type === 'question.v2.asked'
+}
+
+function isQuestionResolvedEvent(type: string): boolean {
+  return (
+    type === 'question.replied' ||
+    type === 'question.rejected' ||
+    type === 'question.v2.replied' ||
+    type === 'question.v2.rejected'
   )
 }
 
@@ -193,6 +211,26 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
 
   return {
     /**
+     * Unattended remote-control yolo: later owner commands arrive via
+     * `promptAsync` and never inherit cold-launch `opencode run --auto`.
+     * Auto-allow only while a DevSpec bond is live in this process.
+     */
+    'permission.ask': async (input, output) => {
+      if (!shouldAutoAllowRemoteControlPermission()) return
+      output.status = 'allow'
+      const kind = typeof input?.type === 'string' ? input.type : 'unknown'
+      const patterns = input?.pattern
+      const patternPreview = Array.isArray(patterns)
+        ? patterns.slice(0, 3).join(', ')
+        : typeof patterns === 'string'
+          ? patterns
+          : ''
+      logPoll(
+        `permission.ask auto-allow (remote-control bond active) type=${kind}` +
+          (patternPreview ? ` patterns=${patternPreview}` : ''),
+      )
+    },
+    /**
      * Verified present on the Hooks type: `dispose?: () => Promise<void>`. Aborting the
      * in-flight hold here is what keeps a 25s held request from delaying host shutdown.
      */
@@ -237,7 +275,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // post_session_message (against skill docs) can record its content hash
         // before we mirror — otherwise text lands first and we double-post.
         const target = sessionId ?? fallbackSessionId
-        if (target) scheduleMirrorNow(client, directory, target)
+        if (target) {
+          scheduleMirrorNow(client, directory, target)
+          // The live work trail (item bfca2495) rides the SAME event but must not
+          // wait for the mirror's settle debounce: the whole point is that the
+          // room sees progress while the turn is still running, so this publishes
+          // on its own throttle and closes nothing.
+          scheduleWorkTrailPost(client, directory, target)
+        }
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the
@@ -269,6 +314,47 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         const target = sessionId ?? fallbackSessionId
         const clear = async () => {
           clearPermissionAsked(directory)
+        }
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, clear)
+          } else {
+            await clear()
+          }
+        } else {
+          await clear()
+        }
+      } else if (isQuestionAskedEvent(event.type)) {
+        const target = sessionId ?? fallbackSessionId
+        const ask = async () => {
+          await handleQuestionAsked(directory, props ?? null)
+        }
+        if (target) {
+          const stateKey = stateKeyForOpenCodeBond(target)
+          if (stateKey !== undefined) {
+            await runWithBoundSessionAsync(stateKey, ask)
+          } else {
+            await ask()
+          }
+        } else {
+          await ask()
+        }
+      } else if (isQuestionResolvedEvent(event.type)) {
+        const target = sessionId ?? fallbackSessionId
+        const clear = async () => {
+          // Terminal dismiss without our reply: fail the open trail so the room
+          // does not sit at Needs your input forever. A successful question.reply
+          // already cleared pendingQuestion before this event arrives.
+          if (event.type.includes('rejected')) {
+            await rejectPendingQuestion({
+              client,
+              directory,
+              reason: 'OpenCode question was dismissed before an answer arrived.',
+            })
+          } else {
+            clearPendingQuestion(directory)
+          }
         }
         if (target) {
           const stateKey = stateKeyForOpenCodeBond(target)

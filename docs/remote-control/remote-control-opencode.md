@@ -14,8 +14,9 @@
 5. **After changing `dist/`:** fully quit and relaunch OpenCode (or reinstall the local package). Partial reloads leave a stale pump in memory.
 6. **Verify with** `npm test` from the plugin root (see [Running tests](#running-tests-after-a-remote-control-change)). Unit suite uses harness doubles — it does not launch a live TUI bond.
 7. **Act, don’t dump.** `commands/devspec.remote.md` must keep an **Act on owner commands** section (do the work in this repo / verify with tools) — parity with Cursor/Claude. Do not reintroduce “you do not need to go and read anything” / “grounded in the transcript” wording that licenses answering from the injected dump alone (Obsidian Gecko / Restless Ocelot, session `a2a262cd`).
-8. **Attach transcript is budgeted.** Skill attach uses `get_session_transcript` with `since_created_at` (~48h window), not an uncapped seed. Instruction tiers come from `attach_connection`. Do not tell the model to call uncapped `get_session_transcript` on every attach.
-9. **Model stamp is never silent.** `resolveOpenCodeAssistantModel` (flat `info.providerID`/`modelID` first, then nested `info.model`, then legacy `metadata.assistant`) + `mirror_post`/`model_missing` (and inject `dispatch_model` rejects via `extractOpenCodeReplyModel`) must log a story with the raw shape snippet when `providerID`/`modelID` cannot be stamped — DevSpec otherwise has no record of which model answered. Assistant turns (e.g. MiniMax) store the stamp flat on `info`; reading only nested `info.model` falsely logs `model_missing`.
+8. **Attach transcript is budgeted + full UUID.** Skill attach uses `get_session_transcript` with `since_created_at` (~48h window), not an uncapped seed. Instruction tiers come from `attach_connection`. **Always pass the full `session_id` returned by `attach_connection`** — attach accepts an 8-char short code; transcript does not (live: Dashing Osprey / `7976fffb` → "Session not found"). Do not tell the model to call uncapped `get_session_transcript` on every attach.
+9. **Connect status chrome must never land in the room.** `prepareMirrorText` / `isOperationalChrome` strip the canonical `REMOTE_STATUS_BANNER` **and** variant field blocks (rule-only openers + Agent/Connection/Session lines) plus labelled `Internal note (not mirrored)` orientation. Do not rely on exact title string alone — models invent box-drawing variants. Real answers after a pasted block still post once chrome is stripped.
+10. **Model stamp is never silent.** `resolveOpenCodeAssistantModel` (flat `info.providerID`/`modelID` first, then nested `info.model`, then legacy `metadata.assistant`) + `mirror_post`/`model_missing` (and inject `dispatch_model` rejects via `extractOpenCodeReplyModel`) must log a story with the raw shape snippet when `providerID`/`modelID` cannot be stamped — DevSpec otherwise has no record of which model answered. Assistant turns (e.g. MiniMax) store the stamp flat on `info`; reading only nested `info.model` falsely logs `model_missing`.
 
 ## Architecture (how it works today)
 
@@ -110,12 +111,28 @@ OpenCode SDK also documents `session.command` and session create/delete. Those a
 
 OpenCode exposes an in-process session API. Poller+wait is a workaround for hosts that cannot push into their own chat. Do not force OpenCode onto Claude’s scripts; do not assume other hosts can `promptAsync`.
 
+## Work trail / Show work (plugin-owned)
+
+While a remote turn runs, the plugin grows a live DevSpec bubble via `post_session_message({ phase: 'trail' })`. The owner expands it under **Show work**. This is **plugin-owned**, not model play-by-play — the skill forbids interim “still working…” posts; the trail already serializes what the session is producing.
+
+| Piece | Behaviour |
+|---|---|
+| Module | `src/work-trail.ts` (pure serialize) + publish helpers in `src/remote-control.ts` |
+| Seed | `TRAIL_SEED_TEXT` (`Working…`) the instant the turn starts (item `05a88ed5`) so the room is not busy-dots-only while the model thinks |
+| Growth | Full replace of the cumulative trail on each post (never append). Throttled (`TRAIL_POST_MIN_GAP_MS` ≈ 1s) + hash-skip identical bodies |
+| Content | **Unfiltered on purpose** — tool calls, reasoning, failures, and tool output. Opposite of answer mirror chrome strip (`prepareMirrorText`). Only enormous single parts are mid-elided; total capped at `TRAIL_MAX_CHARS` (100k) |
+| Close | When the answer posts with `phase: 'answer'` (+ `complete_turn` as applicable), the live trail collapses under **Show work** |
+
+**Vs Cursor:** Cursor is local-poller — IDE mid-turn hooks and/or a **CLI transcript watcher** feed trail because Agents `--resume` often skips hooks. OpenCode already sits inside the session API, so it serializes the in-flight turn directly. Do **not** port Cursor’s wait/inbox/transcript-watcher stack into OpenCode for Show work.
+
 ## What not to change lightly
 
 - Full `writeState({ ...stale })` that clobbers mirror claims → **double bubbles** (live regression).
 - Injecting slash-looking text expecting host commands.
 - Dropping mirror dedup while also letting the model `post_session_message`.
 - Reintroducing a detached wait “for consistency” with Claude.
+- Making the **model** drive `phase: 'trail'` (or narrating progress into the room) — trail is plugin-owned from the OpenCode transcript.
+- Filtering trail the same way as answer chrome — Show work is meant to look like the terminal, not a cleaned reply.
 - **Replacing multi-bond with a single `lastKnownSessionId` pin** — second attach starves the first → `idle_timeout`.
 - **Awaiting inject or stall before the next `poll_connection`** — presence starve → `idle_timeout`.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
@@ -136,6 +153,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 - Double reply: mirror + model both post the same answer.
 - Stall: busy with **no observable progress** for the stall timeout (empty reply text *and* no new assistant step *and* no in-flight tool). Active tool loops slide the timer — text-only emptiness is not enough to stall (Tembo / Racing Heron false positives). See `decideBusyStall` / `checkBusyStall` and `poll.log`. Eternal “running” tool parts are capped by `MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES`.
 - **Hung `permission.asked`** (item bb633917): a permission wait is **not** progress. `permission.asked` (plugin event) sets `permissionAskedPending` / `permissionAskedAt`; `decideBusyStall` never returns `slide`/`active_tool` while that is set, and stalls with story reason `permission_asked` after `PERMISSION_ASK_STALL_MS` (~15s) — sooner than the empty-assistant / multi-slide path (~minutes). Message-part detection (`messageHasPendingPermissionAsk`) is a belt-and-suspenders when the event is missed. Cleared on permission resolved/denied and whenever busy clears.
+- **Auto-allow while bonded** (item 1514baa3): cold-launch `opencode run --auto` only covers the first connect turn. Later owner commands use `promptAsync` and do not inherit `--auto`. The plugin `permission.ask` hook sets `output.status = 'allow'` whenever any DevSpec remote-control bond is active in the process (unattended yolo for remote turns). Plain interactive TUI without a bond still prompts.
 - **Presence starve → idle_timeout** (sessions Gentle Weasel / Crimson Osprey, 2026-08-07): poll never reached within ~90s after pickup or after a healthy turn. Look for client story `pickup` → silence → `ended`/`idle_timeout` with large `last_poll_age_ms`, or `poll_error`/`presence_gap`. Guard: fire-and-forget inject + non-blocking stall + session API timeouts.
 - State lost-update between idle handler and mirror path.
 - Fenced status banner → empty markdown-fence leftover posted as a blank bubble → seed-window treats it as a reply and settles a prior owner command (session `0ffe97cb`; fixed in `d9711ed` via fence-aware strip + chrome-aware `unansweredCommands`).
@@ -153,6 +171,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 | `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state, `extractOpenCodeReplyModel`, `resolveOpenCodeAssistantModel` |
 | `src/poll-turn.ts` | Pure hold tiers, command gate, `renderInjectedTurn`, `unansweredCommands`, cursor advance rules |
 | `src/mirror-chrome.ts` | Fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` |
+| `src/work-trail.ts` | Serialize in-flight turn → trail text (seed, throttle helpers, unfiltered parts) |
 | `src/agent-identity.ts` | `AGENT_NAME = 'OpenCode'` |
 | `src/devspec-client.ts` | MCP `tools/call` with timeouts |
 | `commands/devspec.remote.md` / `devspec.remote-stop.md` | Skill steps for register/attach (act section, budgeted transcript, terminal-only chrome) |
@@ -182,6 +201,7 @@ Do **not** ship a remote-control change without that suite passing. Prefer also 
 - `test/mcp-short-timeout.test.mjs` — hung MCP abort on the pump path
 - `test/poll-turn.test.mjs` / `test/busy-stall.test.mjs` — hold tiers, stall policy
 - `test/model-stamp.test.mjs` — `extractOpenCodeReplyModel` aliases, `resolveOpenCodeAssistantModel` (MiniMax flat + nested), loud `mirror_post`/`model_missing` story shape
+- `test/work-trail.test.mjs` — serialize / seed / throttle / clamp for live Show work
 
 ### Optional live smell-test (after ship)
 

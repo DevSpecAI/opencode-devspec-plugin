@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### The `/autopilot.*` commands are gone — staged batches arrive at any idle connection
+
+**Migration:** if you used `/autopilot.start` (or its queue flags), stage the items in DevSpec instead (**Stage for Autopilot** / approve a plan) and keep an ordinary remote-control session idle — DevSpec hands the batch to it. Status is the Agents page; stop is `devspec.remote-stop`; history is the assignment and item record.
+
+- **The plugin no longer chooses its own work.** The old commands pulled a global queue and decided locally what to take; the server now routes a staged batch to a connection and the plugin only works what it was handed.
+- **Unattended is a mode, not a command.** The assignment-dispatch text the plugin injects now says so explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
+- No replacement command or flag is created. Same deletion across the Claude Code, Cursor, Grok, Antigravity and Codex plugins under the same item (`3f2f390c`).
+
+### Remote control — OpenCode control slashes via SDK (not promptAsync)
+
+Exact owner tokens `/compact` (`/summarize`), `/abort`, `/new` (`/clear`), `/undo`, `/redo` are intercepted before `promptAsync` and executed with `session.summarize` / `abort` / `create`+rebond / `revert` / `unrevert`. Posts a short DevSpec answer with `complete_turn` and clears busy so Working never hangs on abort.
+
+Item `b315fe42`. Requires plugin rebuild/reload (**0.3.11**).
+
+### Remote control — auto-allow permission.ask while bonded (yolo for promptAsync)
+
+Live stall (session `1187956b`, 2026-08-10): OpenCode asked `external_directory` for `~/.config/opencode` on a later remote turn and never got a reply. Cold-launch `opencode run --auto` only covers the first connect message; subsequent owner commands are injected via `promptAsync`, so they never inherit `--auto`.
+
+- New `permission.ask` hook: while any DevSpec remote-control bond is active in the process, set `output.status = 'allow'`.
+- Interactive TUI with no `/devspec.remote` bond still prompts as before.
+- `shouldAutoAllowRemoteControlPermission()` + unit tests.
+
+Item `1514baa3`. Requires plugin rebuild/reload (**0.3.8**).
+
+### Remote control — full session UUID for transcript + broader status chrome strip
+
+Live (OpenCode · Dashing Osprey / session `7976fffb`): `/devspec.remote --session <short>` attached fine, then `get_session_transcript` with the same short code failed ("Session not found"). Separately, a variant status block (box-drawing rule without the exact `━━━ DevSpec Remote Control ━━━` title) plus an `Internal note (not mirrored)` orientation paragraph was mirrored into the DevSpec room.
+
+- Skill (`commands/devspec.remote.md`): after `attach_connection`, always use the **returned full `session_id`** for transcript — never the CLI short code alone.
+- `prepareMirrorText` / `isOperationalChrome`: strip variant Agent/Connection/Session field blocks and labelled Internal-note chrome, not only the canonical banner title.
+- Tests cover the live variant sample; real answers after a pasted block still post.
+
+Item `6d008352`.
+
 ## 0.3.5 - 2026-08-04
 
 ### Read a memory before superseding it — search now returns a card

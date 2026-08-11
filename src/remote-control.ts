@@ -54,9 +54,21 @@ import {
   isDevspecRemoteControlCommand,
   prepareMirrorText,
   shouldClaimConnectTurnSuppress,
+  shouldDeferInjectDuringConnect,
   shouldSkipConnectTurnMirror,
 } from './mirror-chrome.js'
 import { logRemoteControlStory } from './remote-control-story.js'
+import {
+  TRAIL_POST_MIN_GAP_MS,
+  TRAIL_SEED_TEXT,
+  serializeTurnTrail,
+  shouldPostTrail,
+} from './work-trail.js'
+import {
+  controlSlashSuccessMessage,
+  resolveOwnerControlSlash,
+  type OpencodeControlSlash,
+} from './opencode-control-slash.js'
 
 export {
   REMOTE_STATUS_BANNER,
@@ -65,6 +77,7 @@ export {
   isOperationalChrome,
   prepareMirrorText,
   shouldClaimConnectTurnSuppress,
+  shouldDeferInjectDuringConnect,
   shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
@@ -140,6 +153,16 @@ export const MCP_HEARTBEAT_TIMEOUT_MS = 5_000
  * the same way hung MCP did (item 875d75b5 — Crimson Osprey / Gentle Weasel).
  */
 export const OPENCODE_SESSION_API_TIMEOUT_MS = 5_000
+
+/** Compact/summarize can run a model turn — don't use the short session API ceiling. */
+export const OPENCODE_CONTROL_COMPACT_TIMEOUT_MS = 120_000
+
+function unwrapSdkData<T>(res: unknown): T {
+  if (res && typeof res === 'object' && 'data' in (res as object)) {
+    return (res as { data: T }).data
+  }
+  return res as T
+}
 
 /**
  * Warn (story `presence_gap`) when this many ms pass without a successful
@@ -239,6 +262,21 @@ interface ConnectionState {
    * the delivery loop — only needs to cover recent history.
    */
   deliveredMessageIds?: string[]
+  /**
+   * DevSpec message ids injected for the turn CURRENTLY in flight (bounded,
+   * cleared once the turn ends). Distinct from `deliveredMessageIds` — that
+   * set is permanent (never delivered twice, ever), while this one exists so
+   * an abnormal end (stall / `session.error`) can unclaim exactly this
+   * turn's ids from `deliveredMessageIds` and let them re-inject, without
+   * touching anything an earlier, already-answered turn delivered. Real bug
+   * found live: a stalled turn's command stayed marked delivered forever, so
+   * `shouldAdvanceMessageCursor` held the poll cursor in place (seedKept>0,
+   * inject=0) with no way to ever make progress — see `clearInjectTurnState`.
+   * Populated in `pollAndDeliver` alongside `deliveredMessageIds`; cleared
+   * (without unclaiming) on a genuine answer, or unclaimed via
+   * `clearInjectTurnState` on stall/error.
+   */
+  currentTurnMessageIds?: string[] | null
   /** Assignment ids already injected into OpenCode (sessionless + attached). */
   deliveredAssignmentIds?: string[]
   /**
@@ -279,6 +317,13 @@ interface ConnectionState {
    */
   stallActiveToolSlides?: number | null
   /**
+   * Fingerprint of reasoning/thinking parts on the last progress slide
+   * (`length:hash`). Growing reasoning on the same assistant (MiniMax-style
+   * long thinks with no tool yet) slides `busySince` — a frozen fingerprint
+   * past the timeout is a true stall. Cleared when busy flips.
+   */
+  stallReasoningFingerprint?: string | null
+  /**
    * True while OpenCode is waiting on a permission prompt (`permission.asked`
    * or equivalent). Cleared when the ask is resolved/denied or busy clears.
    * Stall policy treats this as non-progress — never an `active_tool` slide.
@@ -313,6 +358,16 @@ interface ConnectionState {
    */
   recentPostedContentHashes?: string[]
   /**
+   * True once the model has itself called `post_session_message` during the
+   * CURRENT `awaitingRemoteReply` turn (item 5f75c2cb). A message-id-independent
+   * double-post guard alongside the hash/tool-part checks in `mirrorLatestReply` —
+   * it survives even if the posting assistant message is not (or is no longer)
+   * the candidate `mirrorLatestReply` is evaluating. Set by
+   * `recordManualPostSessionMessage`; reset to false whenever a turn ends
+   * (answer landed, chrome-only, stalled, errored) or a new one is injected.
+   */
+  manualAnswerPostedThisTurn?: boolean
+  /**
    * OpenCode assistant message ids that must never be mirrored — filled from
    * `command.executed` for `/devspec.remote` / `/devspec.remote-stop` so the
    * connect skill turn cannot settle a pending owner dispatch (e7ecc1de).
@@ -325,6 +380,30 @@ interface ConnectionState {
    * session (avoids eating a normal TUI reply after a mid-session reattach).
    */
   connectMirrorSuppressed?: boolean
+  /**
+   * DevSpec `session_messages.id` of the live work-trail turn currently open for
+   * this connection (item bfca2495). Set from the first `phase:'trail'` post of a
+   * turn, cleared when the answer or an error closes it. Its real purpose is
+   * knowing whether there IS an open bubble to fail: without it a stalled or dead
+   * turn leaves a bubble streaming for ever, which is the one outcome the live
+   * trail must never produce. The SERVER still resolves which row to write from
+   * the connection itself — this is never sent as a target.
+   */
+  activeTrailMessageId?: string | null
+  /** Hash of the last trail body posted — skips updates that would change nothing. */
+  lastTrailHash?: string | null
+  /** Epoch ms of the last trail post (throttle floor, TRAIL_POST_MIN_GAP_MS). */
+  lastTrailPostedAt?: number | null
+  /**
+   * OpenCode question the turn is blocked on (item 7b4090e4). While set, the next
+   * owner `local_agent_dispatch` is delivered via `client.question.reply` instead
+   * of `promptAsync`, and busy-stall does not fire — a human may take minutes.
+   */
+  pendingQuestion?: {
+    requestId: string
+    questionCount: number
+    postedAt: number
+  } | null
 }
 
 /**
@@ -395,6 +474,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
       stallProgressAssistantId: busy ? null : state.stallProgressAssistantId ?? null,
       stallActiveToolSlides: busy ? 0 : null,
+      stallReasoningFingerprint: null,
       // Permission wait is turn-scoped — clear on both busy edges so a stale
       // ask cannot poison the next turn or linger after we clear busy.
       permissionAskedPending: false,
@@ -645,6 +725,36 @@ export function messageHasActiveToolWork(message: { parts?: unknown } | null | u
 }
 
 /**
+ * Stable fingerprint of assistant reasoning/thinking parts. Used by the
+ * busy-stall watchdog so a growing MiniMax-style think stream counts as
+ * progress even when there is no reply text and no in-flight tool yet.
+ * Returns null when the message has no reasoning content.
+ */
+export function assistantReasoningFingerprint(
+  message: { parts?: unknown } | null | undefined,
+): string | null {
+  const parts = Array.isArray(message?.parts) ? message.parts : []
+  const chunks: string[] = []
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue
+    const part = p as Record<string, unknown>
+    const type = String(part.type ?? '').toLowerCase()
+    if (type !== 'reasoning' && type !== 'thinking' && type !== 'thought') continue
+    if (typeof part.text === 'string' && part.text.length > 0) {
+      chunks.push(part.text)
+      continue
+    }
+    if (typeof part.content === 'string' && part.content.length > 0) {
+      chunks.push(part.content)
+    }
+  }
+  if (chunks.length === 0) return null
+  const joined = chunks.join('\n')
+  const hash = crypto.createHash('sha256').update(joined, 'utf8').digest('hex').slice(0, 12)
+  return `${joined.length}:${hash}`
+}
+
+/**
  * True when the latest assistant message indicates OpenCode is waiting on a
  * permission prompt (hung `permission.asked`). Defensive across part shapes
  * OpenCode has used: dedicated permission parts, tool state ask/waiting/
@@ -750,10 +860,205 @@ export function clearPermissionAsked(directory: string): void {
   logPoll('clearPermissionAsked: cleared pending permission ask')
 }
 
+/** Format OpenCode question.asked properties into a DevSpec-readable prompt. */
+export function formatQuestionPrompt(props: {
+  questions?: Array<{
+    question?: string
+    header?: string
+    options?: Array<{ label?: string; description?: string }>
+  }>
+}): string {
+  const questions = Array.isArray(props.questions) ? props.questions : []
+  if (questions.length === 0) return 'OpenCode needs your input.'
+  const blocks = questions.map((q, i) => {
+    const header = typeof q.header === 'string' && q.header.trim() ? q.header.trim() : null
+    const body = typeof q.question === 'string' && q.question.trim() ? q.question.trim() : 'Question'
+    const opts = Array.isArray(q.options)
+      ? q.options
+          .map((o) => {
+            const label = typeof o?.label === 'string' ? o.label.trim() : ''
+            if (!label) return null
+            const desc = typeof o?.description === 'string' && o.description.trim() ? ` — ${o.description.trim()}` : ''
+            return `- ${label}${desc}`
+          })
+          .filter(Boolean)
+      : []
+    const title = questions.length > 1 ? `${i + 1}. ${header ? `${header}: ` : ''}${body}` : `${header ? `${header}: ` : ''}${body}`
+    return opts.length > 0 ? `${title}\n${opts.join('\n')}` : title
+  })
+  return blocks.join('\n\n')
+}
+
+/**
+ * Surface an OpenCode question.asked event as DevSpec needs-your-input on the
+ * open live trail turn. Idempotent on the same request id.
+ */
+export async function handleQuestionAsked(
+  directory: string,
+  props: Record<string, unknown> | null | undefined,
+): Promise<void> {
+  const requestId = typeof props?.id === 'string' ? props.id.trim() : ''
+  if (!requestId) {
+    logPoll('handleQuestionAsked: missing request id — ignored')
+    return
+  }
+  const state = readState(directory)
+  if (!state?.connectionId) {
+    logPoll(`handleQuestionAsked: no connection for request ${requestId}`)
+    return
+  }
+  if (state.pendingQuestion?.requestId === requestId) {
+    logPoll(`handleQuestionAsked: already pending ${requestId}`)
+    return
+  }
+
+  const questions = Array.isArray(props?.questions) ? (props!.questions as Array<Record<string, unknown>>) : []
+  const prompt = formatQuestionPrompt({ questions: questions as any })
+  const auth = resolveDevspecAuth(directory)
+  if (!auth.ok || !auth.token || !auth.mcp_url) return
+
+  try {
+    const result = await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: postMessageArgs(state, prompt, {
+        turn_kind: 'agent',
+        phase: 'needs_input',
+        needs_input: {
+          kind: 'question',
+          request_id: requestId,
+          prompt,
+          options: questions,
+        },
+      }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+    const messageId = extractPostedMessageId(result)
+    patchState(directory, {
+      pendingQuestion: {
+        requestId,
+        questionCount: Math.max(1, questions.length),
+        postedAt: Date.now(),
+      },
+      ...(messageId ? { activeTrailMessageId: messageId } : {}),
+    })
+    logPoll(`handleQuestionAsked: posted needs_input request=${requestId} message=${messageId ?? 'n/a'}`)
+    logRemoteControlStory({
+      phase: 'mirror_post',
+      outcome: 'posted',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'post_session_message',
+      reason: 'needs_input',
+      data: { request_id: requestId, question_count: questions.length },
+    })
+  } catch (err) {
+    logPoll(`handleQuestionAsked: post failed: ${err}`)
+  }
+}
+
+/** Clear a pending question after reply/reject/disconnect. */
+export function clearPendingQuestion(directory: string): void {
+  const state = readState(directory)
+  if (!state?.pendingQuestion) return
+  patchState(directory, { pendingQuestion: null })
+  logPoll('clearPendingQuestion: cleared')
+}
+
+/**
+ * Deliver an owner command into a waiting OpenCode question (not a new prompt).
+ * Returns true when the reply was sent (caller should not also promptAsync).
+ */
+export async function replyPendingQuestion(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  answerText: string
+}): Promise<boolean> {
+  const { client, directory, answerText } = input
+  const state = readState(directory)
+  const pending = state?.pendingQuestion
+  if (!state || !pending?.requestId) return false
+  const text = answerText.trim()
+  if (!text) {
+    logPoll('replyPendingQuestion: empty answer — not sending')
+    return false
+  }
+  const answers = Array.from({ length: Math.max(1, pending.questionCount) }, () => [text])
+  try {
+    await withTimeout(
+      (client as any).question.reply({
+        requestID: pending.requestId,
+        answers,
+      }),
+      OPENCODE_SESSION_API_TIMEOUT_MS,
+      'question.reply',
+    )
+    clearPendingQuestion(directory)
+    logPoll(`replyPendingQuestion: replied to ${pending.requestId}`)
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'queued',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'question.reply',
+      reason: 'needs_input_answer',
+      data: { request_id: pending.requestId },
+    })
+    return true
+  } catch (err) {
+    logPoll(`replyPendingQuestion: failed: ${err}`)
+    return false
+  }
+}
+
+/**
+ * Reject a pending OpenCode question (terminal dismiss / disconnect path).
+ */
+export async function rejectPendingQuestion(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  reason?: string
+}): Promise<void> {
+  const { client, directory, reason } = input
+  const state = readState(directory)
+  const pending = state?.pendingQuestion
+  if (!state || !pending?.requestId) return
+  try {
+    await withTimeout(
+      (client as any).question.reject({ requestID: pending.requestId }),
+      OPENCODE_SESSION_API_TIMEOUT_MS,
+      'question.reject',
+    )
+  } catch (err) {
+    logPoll(`rejectPendingQuestion: reject call failed: ${err}`)
+  }
+  clearPendingQuestion(directory)
+  const auth = resolveDevspecAuth(directory)
+  if (auth.ok && auth.token && auth.mcp_url) {
+    await failOpenTrailTurn(
+      auth,
+      directory,
+      state,
+      reason ?? 'OpenCode question was dismissed before an answer arrived.',
+    )
+  }
+}
+
 export type BusyStallDecision =
   | { action: 'under_timeout' }
   | { action: 'has_text' }
-  | { action: 'slide'; reason: 'active_tool' | 'new_assistant'; assistantId: string | null }
+  | {
+      action: 'slide'
+      reason: 'active_tool' | 'new_assistant' | 'reasoning_growth'
+      assistantId: string | null
+      /** Present on reasoning_growth so callers can persist the new fingerprint. */
+      reasoningFingerprint?: string | null
+    }
   | {
       action: 'stall'
       assistantId: string | null
@@ -774,6 +1079,8 @@ export function decideBusyStall(input: {
   /** Slides already granted for the current `previousProgressAssistantId` via active_tool. */
   sameAssistantActiveToolSlides?: number
   maxActiveToolSlides?: number
+  /** Prior reasoning fingerprint from state — growth slides; frozen stalls. */
+  previousReasoningFingerprint?: string | null
   /** Hung permission wait — never treated as active_tool progress. */
   permissionAskPending?: boolean
   /** ms since `permissionAskedAt` (0 if pending but clock unknown). */
@@ -813,6 +1120,17 @@ export function decideBusyStall(input: {
       return { action: 'stall', assistantId: lastId, reason: 'active_tool_cap' }
     }
     return { action: 'slide', reason: 'active_tool', assistantId: lastId }
+  }
+
+  const reasoningFp = assistantReasoningFingerprint(input.lastAssistant)
+  const prevReasoning = input.previousReasoningFingerprint ?? null
+  if (reasoningFp && reasoningFp !== prevReasoning) {
+    return {
+      action: 'slide',
+      reason: 'reasoning_growth',
+      assistantId: lastId,
+      reasoningFingerprint: reasoningFp,
+    }
   }
 
   const prev = input.previousProgressAssistantId ?? null
@@ -883,6 +1201,18 @@ function rememberPostedContentHash(directory: string, hash: string): void {
 /**
  * Record a successful model-initiated `post_session_message` so the auto-mirror
  * skips the same body. Wired from `tool.execute.after` in plugin.ts.
+ *
+ * Item 5f75c2cb / turn-scoped tool detection: `tool.execute.after` carries no
+ * `messageID` (verified against the plugin's own hook signature), so this
+ * cannot correlate the call back to a specific OpenCode assistant message —
+ * the content-hash remembered below is the mechanical guard for that. This
+ * also sets `manualAnswerPostedThisTurn`, a second, message-id-independent
+ * guard scoped to "did the model post at all during THIS remote turn" —
+ * `mirrorLatestReply` checks both, so a manual post cannot double up with the
+ * mirror even in a shape neither the hash nor the tool-part scan catches.
+ * Only set while `awaitingRemoteReply`: a manual post during a plain local
+ * OpenCode turn (not remote-injected) has no turn to scope it to, and this
+ * flag must never suppress an unrelated later remote turn's mirror.
  */
 export function recordManualPostSessionMessage(directory: string, toolName: string, args: unknown): void {
   const lower = String(toolName ?? '').toLowerCase()
@@ -896,10 +1226,23 @@ export function recordManualPostSessionMessage(directory: string, toolName: stri
   }
   const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
   const message = typeof argsObj.message === 'string' ? argsObj.message : null
-  if (!message || !normalizePostedContent(message)) return
+  if (!message || !normalizePostedContent(message)) {
+    logPoll(
+      `recordManualPostSessionMessage: model called post_session_message with an empty/whitespace ` +
+        `message — nothing to dedup, not recording a hash`,
+    )
+    return
+  }
   const hash = hashPostedContent(message)
   rememberPostedContentHash(directory, hash)
-  logPoll(`recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}…`)
+  const state = readState(directory)
+  if (state?.awaitingRemoteReply && !state.manualAnswerPostedThisTurn) {
+    patchState(directory, { manualAnswerPostedThisTurn: true })
+  }
+  logPoll(
+    `recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}… ` +
+      `awaitingRemoteReply=${Boolean(state?.awaitingRemoteReply)}`,
+  )
 }
 
 /**
@@ -937,13 +1280,29 @@ export function materializeLargeAttachmentToDisk(input: {
 function postMessageArgs(
   state: ConnectionState,
   message: string,
-  extras?: { turn_kind?: 'agent' | 'local_prompt'; model?: { providerID: string; modelID: string } },
+  extras?: {
+    turn_kind?: 'agent' | 'local_prompt'
+    model?: { providerID: string; modelID: string }
+    /** Live-trail lifecycle (items bfca2495 / 7b4090e4). Omitted = the historical answer post. */
+    phase?: 'trail' | 'needs_input' | 'answer' | 'error'
+    needs_input?: {
+      kind: 'question' | 'permission'
+      request_id: string
+      prompt: string
+      options?: unknown
+    }
+    /** End the connection's Working attempt in the same request as the bubble. */
+    complete_turn?: boolean
+  },
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {
     message,
     agent_name: AGENT_NAME,
     ...(extras?.turn_kind ? { turn_kind: extras.turn_kind } : {}),
     ...(extras?.model ? { model: extras.model } : {}),
+    ...(extras?.phase ? { phase: extras.phase } : {}),
+    ...(extras?.needs_input ? { needs_input: extras.needs_input } : {}),
+    ...(extras?.complete_turn ? { complete_turn: true } : {}),
   }
   if (state.connectionId) args.connection_id = state.connectionId
   else if (state.sessionId) args.session_id = state.sessionId
@@ -973,11 +1332,11 @@ async function postSessionNotice(
 
 /**
  * If we've been busy longer than STALL_TIMEOUT_MS with no observable progress
- * (no reply text, no new assistant step, no in-flight tool), clear busy and
- * warn in the DevSpec session. Healthy tool-heavy turns slide `busySince`
- * instead of false-stalling. A pending `permission.asked` is NOT progress —
- * it never slides and stalls after PERMISSION_ASK_STALL_MS. Called every poll
- * while busy.
+ * (no reply text, no new assistant step, no in-flight tool, no growing
+ * reasoning), clear busy and warn in the DevSpec session. Healthy tool-heavy
+ * and long-think turns slide `busySince` instead of false-stalling. A pending
+ * `permission.asked` is NOT progress — it never slides and stalls after
+ * PERMISSION_ASK_STALL_MS. Called every poll while busy.
  */
 export async function checkBusyStall(
   client: Parameters<Plugin>[0]['client'],
@@ -987,6 +1346,15 @@ export async function checkBusyStall(
   const auth = resolveDevspecAuth(directory)
   let state = readState(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state?.busy || !state.sessionId) return
+
+  // Waiting on a DevSpec-surfaced OpenCode question is not a stall — the human
+  // may answer from phone/web minutes later (item 7b4090e4).
+  if (state.pendingQuestion?.requestId) {
+    logPoll(
+      `stall check: pending question ${state.pendingQuestion.requestId} — waiting on owner, not stalling`,
+    )
+    return
+  }
 
   // Older state files may have busy:true with no busySince — seed now so we
   // don't immediately treat a mid-flight upgrade as already timed out.
@@ -1028,7 +1396,32 @@ export async function checkBusyStall(
   }
 
   const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant')
-  const last = assistantMessages[assistantMessages.length - 1]
+  // Item 40279ae0: scope progress to assistants AFTER the pre-inject baseline,
+  // not the global last assistant. The old global-last version had a real bug:
+  // a freshly-injected turn's stall check could see the PRE-inject assistant's
+  // old text — from a completely different, already-answered turn — and report
+  // "last assistant has text — not a stall" even though THIS turn had produced
+  // nothing at all yet. Mirrors the same correlation `mirrorLatestReply` uses.
+  const baselineDecision = decideAwaitingBaseline({
+    baseline: state.replyAfterOpenCodeMessageId ?? null,
+    baselineCaptured: state.replyBaselineCaptured,
+    assistantIds: assistantMessages.map((m) => m?.info?.id).filter(Boolean) as string[],
+  })
+  if (baselineDecision.action === 'clear_abandoned') {
+    // The pre-inject baseline id is gone from the current OpenCode session
+    // (session rotated under an abandoned turn — 8d0f1726). There is nothing
+    // to evaluate progress against; recover immediately instead of waiting
+    // out the stall timeout on a cursor that can never resolve.
+    clearAbandonedInjectCursor(directory, baselineDecision.baseline)
+    clearInjectTurnState(directory, { unclaim: true })
+    logPoll(
+      `stall check: abandoned inject cursor (baseline ${baselineDecision.baseline} not in current ` +
+        `session) — cleared busy/awaiting immediately`,
+    )
+    return
+  }
+  const scopedAssistants = scopeAssistantsAfterBaseline(assistantMessages, baselineDecision)
+  const last = scopedAssistants[scopedAssistants.length - 1]
   const fromMessage = messageHasPendingPermissionAsk(last)
   const permissionAskPending = permissionPendingFromState || fromMessage
   // Late message-only detection (no event): treat the ask window as already
@@ -1057,6 +1450,7 @@ export async function checkBusyStall(
     previousProgressAssistantId: state.stallProgressAssistantId,
     sameAssistantActiveToolSlides: state.stallActiveToolSlides ?? 0,
     maxActiveToolSlides: MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES,
+    previousReasoningFingerprint: state.stallReasoningFingerprint ?? null,
     permissionAskPending,
     permissionAskElapsedMs,
     permissionAskStallMs: PERMISSION_ASK_STALL_MS,
@@ -1086,14 +1480,22 @@ export async function checkBusyStall(
       decision.assistantId != null &&
       decision.assistantId === (state.stallProgressAssistantId ?? null)
     const nextSlides = decision.reason === 'active_tool' ? (sameAssistant ? (state.stallActiveToolSlides ?? 0) + 1 : 1) : 0
+    const nextReasoningFp =
+      decision.reason === 'reasoning_growth'
+        ? (decision.reasoningFingerprint ?? assistantReasoningFingerprint(last))
+        : decision.reason === 'new_assistant'
+          ? assistantReasoningFingerprint(last)
+          : (state.stallReasoningFingerprint ?? null)
     patchState(directory, {
       busySince: now,
       stallProgressAssistantId: decision.assistantId,
       stallActiveToolSlides: nextSlides,
+      stallReasoningFingerprint: nextReasoningFp,
     })
     logPoll(
       `stall check: progress (${decision.reason}) on ${decision.assistantId ?? 'none'} — slid busySince after ${elapsed}ms` +
-        (decision.reason === 'active_tool' ? ` (active_tool slides=${nextSlides})` : ''),
+        (decision.reason === 'active_tool' ? ` (active_tool slides=${nextSlides})` : '') +
+        (decision.reason === 'reasoning_growth' ? ` (reasoning=${nextReasoningFp})` : ''),
     )
     return
   }
@@ -1138,7 +1540,18 @@ export async function checkBusyStall(
       : `⚠️ OpenCode turn stalled after ${Math.round(elapsed / 1000)}s with no reply text ` +
         `(assistant message \`${lastId}\`). Cleared the busy indicator — check ` +
         `~/.devspec/opencode-remote-control/poll.log if this keeps happening.`
-  await postSessionNotice(auth, state, notice)
+  // A stall is exactly the case a live trail bubble cannot survive: the turn is
+  // over and no answer is coming, so failing the open bubble (which keeps the
+  // trail readable under error chrome) says more than a separate notice under a
+  // turn still claiming to stream. Fall back to the notice when none is open.
+  const failedTrail = await failOpenTrailTurn(auth, directory, readState(directory) ?? state, notice)
+  if (!failedTrail) await postSessionNotice(auth, state, notice)
+  // Item 40279ae0: this IS the abnormal end — unclaim this turn's command ids
+  // from `deliveredMessageIds` so they are eligible to re-inject, breaking the
+  // seedKept>0/inject=0 hold loop a stalled-but-never-answered command used to
+  // cause. `failOpenTrailTurn` above already cleared the non-unclaiming parts
+  // of inject-turn state; this call additionally unclaims.
+  clearInjectTurnState(directory, { unclaim: true })
   await setBusy(directory, false)
 }
 
@@ -1161,12 +1574,17 @@ export async function handleSessionError(directory: string, event: unknown): Pro
   logPoll(`session.error handled: ${detail}`)
 
   if (state && auth.ok && (state.sessionId || state.connectionId)) {
-    await postSessionNotice(
-      auth,
-      state,
-      `⚠️ OpenCode reported \`session.error\`. Busy cleared. Detail: ${detail}`,
-    )
+    const notice = `⚠️ OpenCode reported \`session.error\`. Busy cleared. Detail: ${detail}`
+    // Same reasoning as the stall path: close the open live-trail bubble as
+    // failed so it stops streaming, keeping the trail visible; only post a
+    // standalone notice when this turn never opened one.
+    const failedTrail = await failOpenTrailTurn(auth, directory, state, notice)
+    if (!failedTrail) await postSessionNotice(auth, state, notice)
   }
+  // Item 40279ae0: a session.error is an abnormal end for whatever turn was
+  // in flight — unclaim its command ids so they can re-inject instead of
+  // being silently swallowed forever by the delivery dedup set.
+  clearInjectTurnState(directory, { unclaim: true })
   await setBusy(directory, false)
 }
 
@@ -1241,6 +1659,23 @@ export function forgetOpenCodeBond(opencodeSessionId: string): void {
 
 export function listOpenCodeBondSessions(): string[] {
   return [...openCodeBonds.keys()]
+}
+
+/**
+ * Whether OpenCode's `permission.ask` hook should auto-allow.
+ *
+ * Cold-launch `opencode run --auto` only covers the first connect turn.
+ * Later owner commands are injected via `promptAsync` into the live session,
+ * so they never inherit `--auto`. Live stall 2026-08-10 (session 1187956b):
+ * `external_directory` for `~/.config/opencode` got `permission.asked` with
+ * no `permission.replied`, then hung until empty_assistant_timeout ~131s.
+ *
+ * While any DevSpec remote-control bond is active in this process, auto-allow
+ * — that is the unattended equivalent of Claude/Cursor yolo for remote turns.
+ * Plain interactive TUI with no `/devspec.remote` bond still prompts.
+ */
+export function shouldAutoAllowRemoteControlPermission(): boolean {
+  return listOpenCodeBondSessions().length > 0
 }
 
 export function stateKeyForOpenCodeBond(opencodeSessionId: string): string | null | undefined {
@@ -2198,6 +2633,47 @@ export async function pollAndDeliver(
     return { delayMs: backoff, stop: false }
   }
 
+  // Out-of-band context wipe (archive/delete / attach-nonempty — items 37a7487b /
+  // 8a55a89b). Run BEFORE adopt/inject so the SDK scratchpad is blank before the
+  // next owner message, and ack immediately so the server waiter unblocks.
+  if (res?.pending_context_wipe === true) {
+    const reason =
+      typeof res.pending_context_wipe_reason === 'string'
+        ? res.pending_context_wipe_reason
+        : 'unspecified'
+    logPoll(`pending_context_wipe (${reason}) — wiping OpenCode context in place`)
+    try {
+      await wipeOpenCodeContextInPlace({
+        client,
+        directory,
+        opencodeSessionId: sessionId,
+      })
+    } catch (err) {
+      logPoll(`pending_context_wipe failed: ${err}`)
+    }
+    try {
+      await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'poll_connection',
+        arguments: {
+          connection_id: state.connectionId,
+          agent_name: AGENT_NAME,
+          wait_ms: 0,
+          context_wipe_ack: true,
+          busy: false,
+        },
+        timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+      })
+      logPoll('pending_context_wipe acked')
+    } catch (err) {
+      logPoll(`pending_context_wipe ack failed: ${err}`)
+    }
+    // Bond may have rebound to a new OpenCode session id — stop this pump
+    // iteration; the multi-bond loop will pick up the new id next tick.
+    return { delayMs: 0, stop: false }
+  }
+
   // Teardown (UI End, /devspec.remote-stop elsewhere, already-ended row). One check now
   // covers what the separate heartbeat used to: the poll IS the heartbeat.
   const terminal = pollTerminalReason(res)
@@ -2334,6 +2810,12 @@ export async function pollAndDeliver(
           `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
           `claim_work_item (each member, in position order) → implement → record_implementation → ` +
           `resolve_assignment.\n` +
+          `Until resolve_assignment lands, batch mode overrides conversation mode: do not answer ` +
+          `the room, do not react to ambient chatter, do not pause for clarification — there may ` +
+          `be nobody watching. A member that cannot be implemented safely is failed loudly with ` +
+          `fail_work_item (precise error + partial_work_notes), then CONTINUE with the next member — ` +
+          `a blocked member fails the member, not the batch. When the batch resolves you are ` +
+          `ordinary available capacity again; nothing about the connection changed.\n` +
           `While sessionless, report progress with report_progress / item notes — do not invent a chat room.`
         )
     return {
@@ -2401,9 +2883,33 @@ export async function pollAndDeliver(
   // Dedup against what we have already injected (a bounded set — the cursor alone is not
   // enough, as a racing/stale cursor read has caused triple-delivery in this file before).
   const deliveredIds = new Set(state.deliveredMessageIds ?? [])
-  const commands = [...dispatchCommands, ...liveRoomCommands].filter(
+  const pendingCommands = [...dispatchCommands, ...liveRoomCommands].filter(
     (m) => !(typeof m?.id === 'string' && deliveredIds.has(m.id)),
   )
+  // Item 6990fd9e: never inject owner commands into a still-settling connect turn.
+  // Hold the cursor until connectMirrorSuppressed clears, then deliver on a later poll.
+  const deferInject = shouldDeferInjectDuringConnect({
+    connectMirrorSuppressed: state.connectMirrorSuppressed,
+    awaitingRemoteReply: state.awaitingRemoteReply,
+  })
+  const commands = deferInject ? [] : pendingCommands
+  if (deferInject && pendingCommands.length > 0) {
+    logPoll(
+      `deferring inject of ${pendingCommands.length} command(s) — connect handshake still settling ` +
+        `(connectMirrorSuppressed); will retry after suppress clears`,
+    )
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'deferred',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'promptAsync',
+      reason: 'connect_handshake',
+      data: { commands: pendingCommands.length },
+    })
+  }
 
   if (typeof res.dispatch_cursor === 'string') pump.dispatchCursor = res.dispatch_cursor
   // Advance the message cursor only when the packaged turn was fully consumed.
@@ -2431,12 +2937,21 @@ export async function pollAndDeliver(
     logPoll(
       `holding message cursor — deliverable work not injected ` +
         `(room=${roomCommands.length}, seedKept=${liveRoomCommands.length}, ` +
-        `dispatch=${dispatchCommands.length}, inject=${commands.length}); will retry`,
+        `dispatch=${dispatchCommands.length}, inject=${commands.length}` +
+        `${deferInject ? ', deferred=connect_handshake' : ''}); will retry`,
     )
     // Keep seed semantics so the next poll still asks for catch-up.
     if (wasSeed || liveRoomCommands.length > 0 || dispatchCommands.length > 0) {
       pump.needsSeed = true
     }
+  }
+
+  // Deferred mid-connect inject: do not fall into empty-change backoff — the
+  // package had real owner work; we deliberately held it.
+  if (deferInject && pendingCommands.length > 0) {
+    pump.consecutiveEmpty = 0
+    await mirrorNow(client, directory, sessionId)
+    return { delayMs: 0, stop: false }
   }
 
   if (commands.length === 0) {
@@ -2478,9 +2993,10 @@ export async function pollAndDeliver(
   }
   pump.consecutiveEmpty = 0
 
-  for (const m of commands) {
-    if (typeof m?.id === 'string') deliveredIds.add(m.id)
-  }
+  const commandIds = commands
+    .map((m) => (typeof m?.id === 'string' ? m.id : null))
+    .filter((id): id is string => id != null)
+  for (const id of commandIds) deliveredIds.add(id)
   for (const d of freshDispatches) pump.deliveredDispatchIds.add(d.id)
   // Claim BEFORE injecting and persist immediately, so a concurrent poll — or a restarted
   // process — sees these ids as delivered rather than independently delivering them again.
@@ -2488,11 +3004,84 @@ export async function pollAndDeliver(
   {
     const deliveryPatch: Partial<ConnectionState> = {
       deliveredMessageIds: Array.from(deliveredIds).slice(-50),
+      // Item 40279ae0: also track which ids belong to the turn currently in
+      // flight (unioned, not replaced — a needs_input answer can extend an
+      // already-open turn) so an abnormal end can unclaim exactly these ids
+      // from deliveredMessageIds via clearInjectTurnState, without touching
+      // anything an earlier, already-answered turn delivered.
+      currentTurnMessageIds: Array.from(
+        new Set([...(state.currentTurnMessageIds ?? []), ...commandIds]),
+      ).slice(-50),
     }
     if (freshDispatches.length > 0) {
       deliveryPatch.deliveredAssignmentIds = Array.from(pump.deliveredDispatchIds).slice(-50)
     }
     state = patchState(directory, deliveryPatch) ?? { ...state, ...deliveryPatch }
+  }
+
+  // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
+  // question, the next owner command answers THAT question — it must not start
+  // a fresh promptAsync turn. Advisory chatter never reaches this branch
+  // (commands are local_agent_dispatch only).
+  if (state.pendingQuestion?.requestId) {
+    const pendingRequestId = state.pendingQuestion.requestId
+    const answerText = commands
+      .map((c: any) => (typeof c?.content === 'string' ? c.content : typeof c?.text === 'string' ? c.text : ''))
+      .filter((t: string) => t.trim())
+      .join('\n\n')
+    const replied = await replyPendingQuestion({ client, directory, answerText })
+    if (replied) {
+      pump.carry.take() // discard carried advisory — it must not become the answer
+      logPoll(`needs_input: delivered owner reply to question ${pendingRequestId}`)
+      return { delayMs: 0, stop: false }
+    }
+    logPoll('needs_input: question.reply failed — will retry owner command on next poll')
+    // Un-claim so the same dispatch is retried (ids already in delivered set would
+    // otherwise soft-drop). Drop only the last batch from the set.
+    for (const id of commandIds) deliveredIds.delete(id)
+    const stillCurrent = new Set(commandIds)
+    patchState(directory, {
+      deliveredMessageIds: Array.from(deliveredIds).slice(-50),
+      currentTurnMessageIds: (state.currentTurnMessageIds ?? []).filter((id) => !stillCurrent.has(id)),
+    })
+    return { delayMs: 2000, stop: false }
+  }
+
+  // OpenCode control slashes (item b315fe42): exact `/compact` etc. run via SDK,
+  // never promptAsync of the slash text. Advisory context is discarded — control
+  // is not a model turn.
+  const controlSlash = resolveOwnerControlSlash(commands)
+  if (controlSlash) {
+    pump.carry.take()
+    const rawDispatchModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
+    const dispatchModelExtract = extractOpenCodeReplyModel(rawDispatchModel)
+    const model = dispatchModelExtract.model
+    logPoll(`control slash: /${controlSlash.kind} via SDK (not promptAsync)`)
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'queued',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'session.control',
+      reason: `/${controlSlash.kind}`,
+      data: { commands: commands.length, ...modelStoryData(model) },
+    })
+    const injectStateKey = effectiveBoundSessionId()
+    void runWithBoundSessionAsync(injectStateKey, () =>
+      executeOwnerControlSlash({
+        client,
+        directory,
+        sessionId,
+        auth,
+        command: controlSlash,
+        model,
+      }),
+    ).catch((err) => {
+      logPoll(`executeOwnerControlSlash failed: ${err}`)
+    })
+    return { delayMs: 0, stop: false }
   }
 
   // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
@@ -2564,7 +3153,14 @@ export async function pollAndDeliver(
   // Mark awaiting BEFORE fire-and-forget deliverInjectedTurn. Baseline capture
   // used to set this only after session.messages — during that window a late
   // command.executed / connect suppress could poison the answer id (b156e680).
-  patchState(directory, { awaitingRemoteReply: true })
+  // Turn-scope the content-hash ring (item 4f9515a4): a prior turn's "7." must
+  // not suppress this turn's identical short answer, or the live Working trail
+  // stays streaming forever with empty content.
+  patchState(directory, {
+    awaitingRemoteReply: true,
+    recentPostedContentHashes: [],
+    manualAnswerPostedThisTurn: false,
+  })
   logRemoteControlStory({
     phase: 'pickup',
     outcome: 'started',
@@ -2598,6 +3194,261 @@ export async function pollAndDeliver(
   })
 
   return { delayMs: 0, stop: false }
+}
+
+async function listSessionMessages(
+  client: Parameters<Plugin>[0]['client'],
+  sessionId: string,
+): Promise<Array<{ info?: { id?: string; role?: string; model?: unknown } }>> {
+  const snap: unknown = await withTimeout(
+    (client as any).session.messages({ path: { id: sessionId } }),
+    OPENCODE_SESSION_API_TIMEOUT_MS,
+    'session.messages(control-slash)',
+  )
+  const data = unwrapSdkData<unknown>(snap)
+  return Array.isArray(data) ? (data as any[]) : []
+}
+
+async function resolveControlSlashModel(
+  client: Parameters<Plugin>[0]['client'],
+  sessionId: string,
+  preferred?: OpenCodeModelStamp,
+): Promise<OpenCodeModelStamp | null> {
+  if (preferred?.providerID && preferred?.modelID) return preferred
+  try {
+    const msgs = await listSessionMessages(client, sessionId)
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const row = msgs[i]
+      if (row?.info?.role !== 'assistant') continue
+      const extracted = resolveOpenCodeAssistantModel(row as any)
+      if (extracted.model) return extracted.model
+    }
+  } catch (err) {
+    logPoll(`resolveControlSlashModel: messages failed: ${err}`)
+  }
+  return null
+}
+
+async function postControlSlashAnswer(
+  directory: string,
+  auth: { ok: boolean; token?: string; mcp_url?: string },
+  message: string,
+): Promise<void> {
+  const state = readState(directory)
+  if (!state || !auth.ok || !auth.token || !auth.mcp_url) return
+  if (!state.sessionId && !state.connectionId) return
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: postMessageArgs(state, message, {
+        turn_kind: 'agent',
+        phase: 'answer',
+        complete_turn: true,
+      }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+  } catch (err) {
+    logPoll(`postControlSlashAnswer failed: ${err}`)
+  }
+}
+
+/**
+ * Reset OpenCode LLM context in place (item 8718be5a + siblings 37a7487b / 8a55a89b).
+ *
+ * Creates a fresh OpenCode SDK session and rebinds the remote-control bond so
+ * the pump injects into the blank chat — WITHOUT changing the DevSpec room
+ * (`ConnectionState.sessionId`), calling `create_session` / `attach_connection`,
+ * or posting chrome into the DevSpec transcript.
+ *
+ * The previous bug called `bindSessionState(directory, newOpenCodeId)`, which
+ * treated the OpenCode session id as the DevSpec session key and briefly
+ * rewrote `state.sessionId` — that looked like a new DevSpec room and could
+ * trip server-attachment adopt / re-delivery.
+ */
+export async function wipeOpenCodeContextInPlace(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  /** Current OpenCode session id (the one the bond / pump is on). */
+  opencodeSessionId: string
+}): Promise<{ newOpenCodeSessionId: string; preservedDevspecSessionId: string | null }> {
+  const { client, directory, opencodeSessionId } = input
+  const before = readState(directory)
+  const preservedDevspecSessionId = before?.sessionId ?? null
+
+  const created = await withTimeout(
+    (client as any).session.create({
+      body: { title: 'DevSpec remote' },
+    }),
+    OPENCODE_SESSION_API_TIMEOUT_MS,
+    'session.create',
+  )
+  const session = unwrapSdkData<{ id?: string }>(created)
+  const newId = typeof session?.id === 'string' ? session.id : null
+  if (!newId) throw new Error('session.create returned no id')
+
+  // Prefer the bond's DevSpec state key (session UUID or null folder-only).
+  // Fall back to the ALS / process bind or the on-disk DevSpec session id —
+  // never to the OpenCode session id (that was the old bindSessionState bug).
+  const priorKey = stateKeyForOpenCodeBond(opencodeSessionId)
+  const stateKey: string | null =
+    priorKey !== undefined
+      ? priorKey
+      : (effectiveBoundSessionId() ?? preservedDevspecSessionId)
+
+  forgetOpenCodeBond(opencodeSessionId)
+  rememberOpenCodeBond(newId, stateKey)
+
+  // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery cursors
+  // (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room transcript
+  // is not re-injected into the blank chat.
+  patchState(directory, {
+    lastMirroredMessageId: null,
+    replyAfterOpenCodeMessageId: null,
+    replyBaselineCaptured: undefined,
+    awaitingRemoteReply: false,
+    pendingQuestion: null,
+  })
+
+  // Explicitly do NOT call bindSessionState with newId — DevSpec session_id
+  // and the state-file key stay on the prior room.
+  const after = readState(directory)
+  if (
+    preservedDevspecSessionId &&
+    after?.sessionId &&
+    after.sessionId !== preservedDevspecSessionId
+  ) {
+    patchState(directory, { sessionId: preservedDevspecSessionId })
+  }
+
+  logPoll(
+    `wipeOpenCodeContextInPlace: ${opencodeSessionId} → ${newId} ` +
+      `(devspecSession=${preservedDevspecSessionId ?? '(none)'}, stateKey=${stateKey ?? '(folder-only)'})`,
+  )
+  return { newOpenCodeSessionId: newId, preservedDevspecSessionId }
+}
+
+/**
+ * Run a native OpenCode control slash via SDK (item b315fe42).
+ * Posts a short DevSpec answer for most commands; `/new` is silent (8718be5a).
+ * Always clears busy so Working never hangs.
+ */
+export async function executeOwnerControlSlash(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  sessionId: string
+  auth: { ok: boolean; token?: string; mcp_url?: string }
+  command: OpencodeControlSlash
+  model?: OpenCodeModelStamp
+}): Promise<void> {
+  const { client, directory, sessionId, auth, command, model } = input
+  const label = command.kind
+  /** `/new` must not append a chat row (acceptance: transcript unchanged). */
+  const silentSuccess = command.kind === 'new'
+  try {
+    switch (command.kind) {
+      case 'abort': {
+        await withTimeout(
+          (client as any).session.abort({ path: { id: sessionId } }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.abort',
+        )
+        break
+      }
+      case 'compact': {
+        const stamp = await resolveControlSlashModel(client, sessionId, model)
+        if (!stamp) {
+          throw new Error('No provider/model available to compact this session')
+        }
+        await withTimeout(
+          (client as any).session.summarize({
+            path: { id: sessionId },
+            body: { providerID: stamp.providerID, modelID: stamp.modelID },
+          }),
+          OPENCODE_CONTROL_COMPACT_TIMEOUT_MS,
+          'session.summarize',
+        )
+        break
+      }
+      case 'new': {
+        await wipeOpenCodeContextInPlace({
+          client,
+          directory,
+          opencodeSessionId: sessionId,
+        })
+        break
+      }
+      case 'undo': {
+        const msgs = await listSessionMessages(client, sessionId)
+        let messageID: string | null = null
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const info = msgs[i]?.info
+          if (info?.role === 'user' && typeof info.id === 'string' && info.id) {
+            messageID = info.id
+            break
+          }
+        }
+        if (!messageID) throw new Error('Nothing to undo')
+        await withTimeout(
+          (client as any).session.revert({
+            path: { id: sessionId },
+            body: { messageID },
+          }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.revert',
+        )
+        break
+      }
+      case 'redo': {
+        await withTimeout(
+          (client as any).session.unrevert({ path: { id: sessionId } }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.unrevert',
+        )
+        break
+      }
+    }
+    if (!silentSuccess) {
+      await postControlSlashAnswer(directory, auth, controlSlashSuccessMessage(command))
+    }
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'kicked',
+      connectionId: readState(directory)?.connectionId ?? null,
+      sessionId: readState(directory)?.sessionId ?? null,
+      agent: AGENT_NAME,
+      codename: readState(directory)?.codename ?? null,
+      tool: 'session.control',
+      reason: `/${label}`,
+      data: { ok: true, silent: silentSuccess },
+    })
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    logPoll(`control slash /${label} failed: ${reason}`)
+    // Failures still surface — silent only applies to a successful /new wipe.
+    await postControlSlashAnswer(
+      directory,
+      auth,
+      `⚠️ \`/${label}\` failed: ${reason}`,
+    )
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'failed',
+      connectionId: readState(directory)?.connectionId ?? null,
+      sessionId: readState(directory)?.sessionId ?? null,
+      agent: AGENT_NAME,
+      codename: readState(directory)?.codename ?? null,
+      tool: 'session.control',
+      reason: `/${label}`,
+      data: { error: reason },
+    })
+  } finally {
+    // Abort (and any mid-busy control) must clear Working without waiting for
+    // a model reply that will never arrive.
+    await setBusy(directory, false)
+    clearInjectTurnState(directory)
+  }
 }
 
 /**
@@ -2637,16 +3488,32 @@ export async function deliverInjectedTurn(input: {
       logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`)
       baselineCaptured = false
     }
+    // A new turn starts with no bubble of its own: dropping the previous turn's
+    // trail pointer here is what stops the first chunk of THIS turn from being
+    // appended to the last turn's already-answered row.
+    const freshTurnTrail = {
+      activeTrailMessageId: null,
+      lastTrailHash: null,
+      lastTrailPostedAt: null,
+    } as const
     state =
       patchState(directory, {
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
+        // Reaffirm turn-scoped hash ring (item 4f9515a4) — inject may have
+        // already cleared it; baseline patch must not reintroduce prior hashes.
+        recentPostedContentHashes: [],
+        manualAnswerPostedThisTurn: false,
+        ...freshTurnTrail,
       }) ?? {
         ...state,
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
+        recentPostedContentHashes: [],
+        manualAnswerPostedThisTurn: false,
+        ...freshTurnTrail,
       }
 
     await (client as any).session.promptAsync({
@@ -2667,6 +3534,24 @@ export async function deliverInjectedTurn(input: {
       reason: 'owner_commands',
       data: { ...modelStoryData(model) },
     })
+    // Eager Working trail (item 05a88ed5): open the bubble the instant OpenCode
+    // has accepted the turn, rather than waiting for the first message.updated
+    // with real content — on a slow model that gap can be many seconds, during
+    // which the room looks dead even though the turn is genuinely running.
+    // force+seed: `shouldPostTrail` would otherwise refuse an empty trail; this
+    // is the one case a placeholder body is correct, since the very next real
+    // update overwrites it wholesale (the client always resends the full
+    // cumulative trail, never an append) — so it never lingers, and there is
+    // still only ever one trail row for this turn.
+    //
+    // Own try/catch: promptAsync already succeeded by this point, so a trail
+    // hiccup must never fall into the catch below and be misreported as a
+    // failed delivery (which would unclaim and re-inject an already-running turn).
+    try {
+      await postWorkTrail(client, directory, sessionId, { force: true, seed: true })
+    } catch (err) {
+      logPoll(`deliverInjectedTurn: eager trail seed failed (non-fatal): ${err}`)
+    }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     const freshForNotice = readState(directory) ?? state
@@ -2687,13 +3572,12 @@ export async function deliverInjectedTurn(input: {
     } else {
       logPoll(`promptAsync failed (sessionless): ${reason}`)
     }
-    // No turn is actually running, so clear the busy we just asserted.
+    // No turn is actually running, so clear the busy we just asserted. Item
+    // 40279ae0: `promptAsync` itself rejecting means OpenCode never even
+    // started this turn — unclaim so the command is eligible to re-inject on
+    // the next poll instead of being silently swallowed forever.
     await setBusy(directory, false)
-    patchState(directory, {
-      awaitingRemoteReply: false,
-      replyAfterOpenCodeMessageId: null,
-      replyBaselineCaptured: undefined,
-    })
+    clearInjectTurnState(directory, { unclaim: true })
     return
   }
 
@@ -2734,6 +3618,38 @@ export function decideAwaitingBaseline(opts: {
   }
   if (opts.baselineCaptured === true) return { action: 'all' }
   return { action: 'fail_closed_legacy' }
+}
+
+/**
+ * Turn an `AwaitingBaselineDecision` into the assistant messages `checkBusyStall`
+ * should evaluate progress against (item 40279ae0). Unlike `mirrorLatestReply`'s
+ * own use of the same decision — where several actions must `return` outright
+ * (never post an answer without a confident correlation) — stall detection has
+ * a safe meaning for "nothing after baseline yet": empty input is exactly what
+ * `decideBusyStall` needs to correctly declare `empty_assistant_timeout` for a
+ * freshly-injected turn that has produced nothing at all, rather than falling
+ * back to whatever a completely unrelated, already-answered turn's last
+ * assistant happened to say (the bug this fix closes: a stale global-last
+ * assistant with real text made a brand-new, silent turn look "not a stall").
+ */
+export function scopeAssistantsAfterBaseline<T extends { info?: { id?: string } }>(
+  assistants: T[],
+  decision: AwaitingBaselineDecision,
+): T[] {
+  switch (decision.action) {
+    case 'slice':
+      return assistants.slice(decision.fromIndex)
+    case 'all':
+    case 'fail_closed_legacy':
+      // Legacy state shape (no baseline info at all) — fall back to the whole
+      // history rather than fail closed, which has no safe meaning here the
+      // way it does for mirroring.
+      return assistants
+    case 'wait':
+    case 'fail_closed_snapshot':
+    default:
+      return []
+  }
 }
 
 /**
@@ -2805,7 +3721,7 @@ export async function mirrorNow(
     guard.at = Date.now()
     mirrorGuards.set(key, guard)
     try {
-      await mirrorLatestReply(client, auth, directory, state, sessionId)
+      await mirrorLatestReply(client, auth, directory, state, sessionId, { force })
     } catch (err) {
       logPoll(`mirrorNow failed: ${err}`)
     } finally {
@@ -2857,6 +3773,347 @@ export function flushMirrorNow(
 }
 
 /**
+ * Live work trail (item bfca2495) — publish what this turn has produced SO FAR
+ * into DevSpec's streaming bubble, so the room is not blank while OpenCode works.
+ *
+ * Separate from the mirror on purpose. The mirror is answer-shaped: it fires once
+ * per turn, dedups, strips chrome, and closes the turn. The trail is progress-
+ * shaped: it fires repeatedly with unfiltered output and closes nothing. They
+ * share only the connection and the tool.
+ *
+ * Throttled leading-edge: the first update of a turn goes out immediately, and
+ * later ones are spaced by TRAIL_POST_MIN_GAP_MS with a trailing flush scheduled
+ * at the boundary — so the bubble stays about a second behind the terminal
+ * without turning `message.updated` into an MCP call per token.
+ */
+const trailGuards = new Map<string, { inFlight: boolean; pending: boolean }>()
+const trailTrailingTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+/** Debounced/throttled trail publish for `message.updated`. */
+export function scheduleWorkTrailPost(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+): void {
+  const key = mirrorGuardKey(directory, sessionId)
+  void postWorkTrail(client, directory, sessionId)
+  // Whatever arrives during the gap still reaches the room: schedule one trailing
+  // publish so the last update before a quiet stretch is never the one dropped.
+  if (trailTrailingTimers.has(key)) return
+  const timer = setTimeout(() => {
+    trailTrailingTimers.delete(key)
+    void postWorkTrail(client, directory, sessionId)
+  }, TRAIL_POST_MIN_GAP_MS)
+  if (typeof timer === 'object' && timer && 'unref' in timer) {
+    ;(timer as NodeJS.Timeout).unref()
+  }
+  trailTrailingTimers.set(key, timer)
+}
+
+/**
+ * Serialize and post the current turn's trail, subject to the throttle.
+ *
+ * Only while a remote turn is actually in flight (`busy` or `awaitingRemoteReply`):
+ * a trail posted outside one would open a streaming bubble that nothing is going
+ * to close. Best-effort throughout — a failed trail post must never disturb the
+ * turn or the mirror that ends it.
+ */
+export async function postWorkTrail(
+  client: Parameters<Plugin>[0]['client'],
+  directory: string,
+  sessionId: string,
+  { force = false, seed = false }: { force?: boolean; seed?: boolean } = {},
+): Promise<void> {
+  const bondKey = stateKeyForOpenCodeBond(sessionId)
+  const run = async () => {
+    const auth = resolveDevspecAuth(directory)
+    const state = readState(directory)
+    if (!auth.ok || !auth.token || !auth.mcp_url) return
+    if (!state?.sessionId || !state.connectionId) return
+    if (!state.busy && !state.awaitingRemoteReply) return
+
+    const key = mirrorGuardKey(directory, sessionId)
+    const guard = trailGuards.get(key) ?? { inFlight: false, pending: false }
+    if (guard.inFlight) {
+      // A trailing timer alone is not enough: if it fires while this post is
+      // still in flight it no-ops, and with no further message.updated the last
+      // chunk of a quiet stretch never leaves the laptop. Mark dirty and flush
+      // once the in-flight post clears.
+      guard.pending = true
+      trailGuards.set(key, guard)
+      return
+    }
+
+    let messages: any[]
+    try {
+      const res: any = await withTimeout(
+        (client as any).session.messages({ path: { id: sessionId } }),
+        OPENCODE_SESSION_API_TIMEOUT_MS,
+        'session.messages(trail)',
+      )
+      messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : []
+    } catch (err) {
+      logPoll(`postWorkTrail: client.session.messages failed: ${err}`)
+      return
+    }
+
+    // Same baseline the mirror correlates on: everything after the pre-inject
+    // assistant is this remote turn's work. Without one, only the newest turn.
+    const rawTrail = serializeTurnTrail(messages, {
+      afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
+    })
+    // Turn-start seed (item 05a88ed5): only substitute the placeholder when
+    // there is genuinely nothing to show yet. Real content always wins, so a
+    // seed call racing behind a message.updated-triggered post never clobbers
+    // it — "one trail row" holds, never an orphan second bubble.
+    const usingSeed = seed && !rawTrail.trim()
+    const trail = usingSeed ? TRAIL_SEED_TEXT : rawTrail
+    const trailHash = hashPostedContent(trail)
+    if (
+      !shouldPostTrail({
+        trail,
+        trailHash,
+        lastPostedTrailHash: state.lastTrailHash ?? null,
+        lastPostedAt: state.lastTrailPostedAt ?? null,
+        now: Date.now(),
+        force,
+        seed,
+      })
+    ) {
+      return
+    }
+
+    guard.inFlight = true
+    guard.pending = false
+    trailGuards.set(key, guard)
+    // Claim the throttle window before the round-trip so concurrent updates during
+    // it do not queue a second identical post behind this one.
+    patchState(directory, { lastTrailHash: trailHash, lastTrailPostedAt: Date.now() })
+    try {
+      const result = await mcpToolsCall({
+        mcpUrl: auth.mcp_url,
+        token: auth.token,
+        name: 'post_session_message',
+        arguments: postMessageArgs(state, trail, { turn_kind: 'agent', phase: 'trail' }),
+        timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+      })
+      const messageId = extractPostedMessageId(result)
+      if (messageId && messageId !== readState(directory)?.activeTrailMessageId) {
+        patchState(directory, { activeTrailMessageId: messageId })
+        logPoll(`postWorkTrail: opened live trail turn ${messageId}`)
+      }
+    } catch (err) {
+      // Roll the hash back so the next update retries rather than assuming this
+      // body already landed.
+      patchState(directory, { lastTrailHash: state.lastTrailHash ?? null })
+      logPoll(`postWorkTrail: post_session_message(phase=trail) failed: ${err}`)
+    } finally {
+      const stillPending = guard.pending
+      guard.inFlight = false
+      guard.pending = false
+      trailGuards.set(key, guard)
+      if (stillPending) {
+        void postWorkTrail(client, directory, sessionId)
+      }
+    }
+  }
+  if (bondKey === undefined) {
+    await run()
+    return
+  }
+  await runWithBoundSessionAsync(bondKey, run)
+}
+
+/**
+ * DevSpec's `message_id` out of an MCP tool result.
+ *
+ * `mcpToolsCall` unwraps JSON to `{ message_id, … }`; tests and some call
+ * sites still pass the raw MCP envelope. Both shapes are accepted.
+ * Mirror answer posts MUST require this id before claiming success (item 6990fd9e).
+ */
+export function extractPostedMessageId(result: unknown): string | null {
+  const parsed = parsePostedToolJson(result)
+  const id = parsed?.message_id
+  return typeof id === 'string' && id ? id : null
+}
+
+/** Whether `phase:'error'|'answer'` actually closed a server-open trail turn. */
+export function extractClosedTrailTurn(result: unknown): boolean {
+  return parsePostedToolJson(result)?.closed_trail_turn === true
+}
+
+/**
+ * Parse `post_session_message` (and similar) MCP tool results.
+ *
+ * `mcpToolsCall` unwraps the JSON body and returns `{ message_id, … }` directly.
+ * Some call sites / tests still pass the raw MCP envelope
+ * `{ content: [{ type: 'text', text: '<json>' }] }`. Accept both — otherwise a
+ * success check on `message_id` always misses and falsely rolls back (or, before
+ * the verify fix, never verified at all).
+ */
+export function parsePostedToolJson(result: unknown): Record<string, unknown> | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null
+  const obj = result as Record<string, unknown>
+
+  // Unwrapped mcpToolsCall success (the live path).
+  if (
+    typeof obj.message_id === 'string' ||
+    obj.closed_trail_turn === true ||
+    obj.noop === true ||
+    typeof obj.session_id === 'string'
+  ) {
+    return obj
+  }
+
+  // Raw MCP envelope.
+  const content = obj.content
+  for (const block of Array.isArray(content) ? content : []) {
+    const text = (block as { text?: unknown } | null)?.text
+    if (typeof text !== 'string') continue
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      // Not JSON (a plain error string) — nothing to extract.
+    }
+  }
+
+  // mcpToolsCall fallback shape when the body was not valid JSON.
+  if (typeof obj.raw === 'string') {
+    try {
+      const parsed = JSON.parse(obj.raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return null
+}
+
+/**
+ * Reset all inject-turn correlation state (item 40279ae0): the
+ * awaiting-reply flag, baseline pointer, turn-scoped tool-post flag, and
+ * trail pointers. Every code path that ends a remote turn — a real answer,
+ * chrome-only completion, a stall, or a `session.error` — must clear these
+ * or the NEXT turn inherits stale correlation state (a wrong baseline, a
+ * phantom manual-post flag, an orphan trail bubble).
+ *
+ * `unclaim: true` is for an ABNORMAL end only (stall / session.error): it
+ * also removes this turn's ids from `deliveredMessageIds` so they are
+ * eligible to re-inject on the next poll. Real bug found live: a stalled
+ * turn's command stayed permanently marked "delivered" even though it was
+ * never actually answered, so `shouldAdvanceMessageCursor` held the poll
+ * cursor in place forever (deliverable room command present, but filtered
+ * to zero injects by the dedup set) — see `currentTurnMessageIds` on
+ * `ConnectionState`. A CLEAN end must never pass `unclaim: true` — the
+ * command really was answered, and re-injecting it would duplicate the turn.
+ */
+export function clearInjectTurnState(directory: string, opts: { unclaim?: boolean } = {}): void {
+  const state = readState(directory)
+  if (!state) return
+  const patch: Partial<ConnectionState> = {
+    awaitingRemoteReply: false,
+    replyAfterOpenCodeMessageId: null,
+    replyBaselineCaptured: undefined,
+    currentTurnMessageIds: null,
+    manualAnswerPostedThisTurn: false,
+    // Hashes are turn-scoped (item 4f9515a4) — drop them with the rest of the
+    // inject-turn correlation so the next remote turn starts clean.
+    recentPostedContentHashes: [],
+    activeTrailMessageId: null,
+    lastTrailHash: null,
+    lastTrailPostedAt: null,
+  }
+  if (opts.unclaim && state.currentTurnMessageIds?.length) {
+    const stuck = new Set(state.currentTurnMessageIds)
+    patch.deliveredMessageIds = (state.deliveredMessageIds ?? []).filter((id) => !stuck.has(id))
+    logPoll(
+      `clearInjectTurnState: unclaiming ${stuck.size} stalled command id(s) from deliveredMessageIds ` +
+        `so they can re-inject on the next poll: ${Array.from(stuck).join(', ')}`,
+    )
+  }
+  patchState(directory, patch)
+}
+
+/** Forget this turn's trail bookkeeping once the turn has landed. */
+function clearTrailState(directory: string): void {
+  patchState(directory, {
+    activeTrailMessageId: null,
+    lastTrailHash: null,
+    lastTrailPostedAt: null,
+  })
+}
+
+/**
+ * Close an open live-trail bubble as FAILED.
+ *
+ * This is the whole reason the plugin tracks an open turn at all: a stall, a
+ * `session.error`, or an agent that simply dies would otherwise leave a bubble
+ * streaming for ever, which reads as "still working" to whoever is watching.
+ * Returns true when it closed a server-open turn, so callers can fall back to a
+ * plain notice when there was no live bubble to fail in the first place.
+ *
+ * Do NOT gate on local `activeTrailMessageId`. The server owns the open-turn
+ * pointer (`agent_connections.active_turn_message_id`); a trail may have opened
+ * on DevSpec even when the plugin never stored the returned message_id (parse
+ * miss, crash after write). Gating locally would leave that row streaming forever
+ * while the connection stays attached.
+ */
+async function failOpenTrailTurn(
+  auth: ReturnType<typeof resolveDevspecAuth>,
+  directory: string,
+  state: ConnectionState,
+  reason: string,
+): Promise<boolean> {
+  if (!auth.ok || !auth.token || !auth.mcp_url) return false
+  if (!state.connectionId || !state.sessionId) return false
+  let result: unknown
+  try {
+    result = await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: postMessageArgs(state, reason, { turn_kind: 'agent', phase: 'error' }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+  } catch (err) {
+    logPoll(`failOpenTrailTurn: post_session_message(phase=error) failed: ${err}`)
+    return false
+  }
+  const closed = extractClosedTrailTurn(result)
+  if (!closed) {
+    // Server had no open trail turn — leave the fallback notice path alone.
+    // Item 40279ae0: also clear the broader inject-turn state (not just the
+    // trail pointers) here — this "abandon" branch still means the turn is
+    // over from this connection's point of view. Callers that know the end
+    // was ABNORMAL (checkBusyStall, handleSessionError) additionally unclaim
+    // this turn's ids at their own call site right after this returns.
+    clearInjectTurnState(directory)
+    return false
+  }
+  const messageId = extractPostedMessageId(result) ?? state.activeTrailMessageId ?? null
+  logRemoteControlStory({
+    phase: 'mirror_post',
+    outcome: 'failed_turn',
+    connectionId: state.connectionId,
+    sessionId: state.sessionId,
+    agent: AGENT_NAME,
+    codename: state.codename,
+    tool: 'post_session_message',
+    reason: 'work_trail_error',
+    data: { message_id: messageId, phase: 'error' },
+  })
+  // Item 40279ae0: same reasoning as the abandon branch above — a closed
+  // trail turn means this connection's remote turn is over.
+  clearInjectTurnState(directory)
+  return true
+}
+
+/**
  * Mirror a completed OpenCode assistant reply into the attached DevSpec session.
  *
  * OpenCode has no separate skill post path — this plugin *is* the agent writer.
@@ -2873,6 +4130,7 @@ async function mirrorLatestReply(
   directory: string,
   state: ConnectionState,
   sessionId: string,
+  opts: { force?: boolean } = {},
 ): Promise<void> {
   // Sessionless: no room. connection_id without attachment would be rejected server-side.
   if (!auth.ok || !auth.token || !auth.mcp_url || !state.sessionId || !state.connectionId) return
@@ -2913,6 +4171,11 @@ async function mirrorLatestReply(
     }
     if (decision.action === 'clear_abandoned') {
       clearAbandonedInjectCursor(directory, decision.baseline)
+      // Item 40279ae0: an abandoned cursor is an abnormal end for whatever
+      // command(s) this turn claimed — unclaim them so they can re-inject
+      // against the (now current) OpenCode session instead of being
+      // silently swallowed forever by the delivery dedup set.
+      clearInjectTurnState(directory, { unclaim: true })
       await setBusy(directory, false)
       return
     }
@@ -2944,6 +4207,31 @@ async function mirrorLatestReply(
   }
   // When not awaiting a remote reply, still allow local-terminal answers while
   // attached — but never re-post something older than lastMirrored (handled above).
+
+  // No answer-path narration mid-turn (item d4b8adcb): `message.updated` fires
+  // repeatedly while a turn is still running, and can land while `last` still
+  // has an in-flight tool part. Posting it now would mirror half-finished
+  // work as if it were the model's final answer — the room reads intermediate
+  // narration as done. The live trail is built for exactly this progress
+  // view; defer to it and let the turn actually finish.
+  //
+  // `opts.force` (session.idle's flushMirrorNow) always bypasses this: that
+  // event is OpenCode's own authoritative "this turn is over" signal, and
+  // trusting it unconditionally is what keeps this deadlock-free. Without the
+  // bypass, a tool whose status field never updates after session.idle fires
+  // would leave the connection stuck at busy:false forever with no answer
+  // ever posted and no stall recovery — checkBusyStall only runs while
+  // busy:true (see pollAndDeliver's turnActive gate), so nothing would ever
+  // re-check `last` again. A non-forced skip here is always safe to retry:
+  // either a later message.updated re-triggers the debounced mirror once the
+  // tool genuinely finishes, or session.idle forces it through regardless.
+  if (!opts.force && messageHasActiveToolWork(last)) {
+    logPoll(
+      `mirrorLatestReply: skip (active tool work, mid-turn) last.id=${last.info.id} — ` +
+        `trail covers this; waiting for quiescence or session.idle`,
+    )
+    return
+  }
 
   // Connect skill turn (e7ecc1de): never post — would settle unanswered
   // owner dispatches that landed during attach. command.executed ids +
@@ -3011,6 +4299,8 @@ async function mirrorLatestReply(
         // Handshake skip only — awaitingRemoteReply is already false above.
         replyAfterOpenCodeMessageId: null,
         replyBaselineCaptured: undefined,
+        currentTurnMessageIds: null,
+        manualAnswerPostedThisTurn: false,
       })
       await setBusy(directory, false)
       return
@@ -3049,7 +4339,11 @@ async function mirrorLatestReply(
   // banner from an otherwise-real reply, and returns null for pure chrome.
   const preparedText = prepareMirrorText(text)
 
-  if (!preparedText) {
+  // Item 5f75c2cb: never post empty/whitespace. `prepareMirrorText` already
+  // trims and returns null for nothing-postable, so `!preparedText.trim()`
+  // should be unreachable in practice — this is explicit defense-in-depth
+  // against a future regression there, not a workaround for one today.
+  if (!preparedText || !preparedText.trim()) {
     // Claim + treat as a finished (non-)turn so busy clears, but never post.
     logPoll(`mirrorLatestReply: skip (operational chrome) last.id=${last.info.id}`)
     logRemoteControlStory({
@@ -3063,6 +4357,17 @@ async function mirrorLatestReply(
       reason: 'operational_chrome',
       data: { message_id: last.info.id },
     })
+    // A live trail bubble opened by this turn would otherwise stream for ever:
+    // the answer that closes it is never coming, because there wasn't one. Fail
+    // it so the room shows a finished turn that produced no reply, with the work
+    // still readable, rather than a permanent "working…". Always attempt — the
+    // server owns the open-turn pointer, not local activeTrailMessageId.
+    await failOpenTrailTurn(
+      auth,
+      directory,
+      fresh,
+      '⚠️ The remote agent finished this turn without an answer — only operational output. The work above is what it did.',
+    )
     alreadyMirrored.add(last.info.id)
     patchState(directory, {
       lastMirroredMessageId: last.info.id,
@@ -3070,21 +4375,51 @@ async function mirrorLatestReply(
       awaitingRemoteReply: false,
       replyAfterOpenCodeMessageId: null,
       replyBaselineCaptured: undefined,
+      currentTurnMessageIds: null,
+      manualAnswerPostedThisTurn: false,
     })
     await setBusy(directory, false)
     return
   }
 
-  // Mechanical double-post guard (a70cdf78): if the model already called
-  // post_session_message for this turn (tool part on the message, or hash
-  // recorded from tool.execute.after during the settle window), claim the
-  // OpenCode message id and do NOT post again.
+  // Mechanical double-post guard (a70cdf78, hardened for 5f75c2cb): if the
+  // model already called post_session_message for this turn, claim the
+  // OpenCode message id and do NOT post again. Three independent signals,
+  // because no single one covers every shape observed live:
+  // - content hash: the exact same body was already posted (manual or mirror).
+  // - tool-part scan across every post-inject candidate (not just `last`) —
+  //   the model may have called post_session_message from an EARLIER
+  //   assistant message in this turn and then kept working, ending on a
+  //   `last` with no tool part of its own.
+  // - `manualAnswerPostedThisTurn`: message-id-independent — set the instant
+  //   `tool.execute.after` observes the call (see recordManualPostSessionMessage),
+  //   so it also catches a shape neither the hash nor the tool-part scan sees.
   const contentHash = hashPostedContent(preparedText)
   const alreadyPostedByHash = (fresh.recentPostedContentHashes ?? []).includes(contentHash)
-  const alreadyPostedByTool = messageHasPostSessionMessageTool(last)
-  if (alreadyPostedByHash || alreadyPostedByTool) {
+  const alreadyPostedByTool = candidates.some((m) => messageHasPostSessionMessageTool(m))
+  const alreadyPostedManually = Boolean(fresh.manualAnswerPostedThisTurn)
+  // Hash-only hits must NOT skip while a live trail is still open (item 4f9515a4).
+  // Cross-turn identical short answers used to hash-skip here and leave
+  // response_status=streaming forever; tool/manual posts already closed the
+  // trail server-side, so those skips remain safe.
+  const hashSkipWouldOrphanTrail =
+    alreadyPostedByHash &&
+    !alreadyPostedByTool &&
+    !alreadyPostedManually &&
+    Boolean(fresh.activeTrailMessageId)
+  if (hashSkipWouldOrphanTrail) {
     logPoll(
-      `mirrorLatestReply: skip (already posted via ${alreadyPostedByTool ? 'tool' : 'content-hash'}) ` +
+      `mirrorLatestReply: content-hash hit but trail ${fresh.activeTrailMessageId} still open — ` +
+        `posting phase=answer anyway (last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…)`,
+    )
+  }
+  if (
+    (alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) &&
+    !hashSkipWouldOrphanTrail
+  ) {
+    const via = alreadyPostedByTool ? 'tool' : alreadyPostedManually ? 'manual-flag' : 'content-hash'
+    logPoll(
+      `mirrorLatestReply: skip (already posted via ${via}) ` +
         `last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…`,
     )
     logRemoteControlStory({
@@ -3095,7 +4430,8 @@ async function mirrorLatestReply(
       agent: AGENT_NAME,
       codename: fresh.codename,
       tool: 'mirrorLatestReply',
-      reason: alreadyPostedByTool ? 'already_posted_tool' : 'already_posted_hash',
+      reason:
+        via === 'tool' ? 'already_posted_tool' : via === 'manual-flag' ? 'already_posted_manual_flag' : 'already_posted_hash',
       data: { message_id: last.info.id },
     })
     alreadyMirrored.add(last.info.id)
@@ -3105,9 +4441,16 @@ async function mirrorLatestReply(
       awaitingRemoteReply: false,
       replyAfterOpenCodeMessageId: null,
       replyBaselineCaptured: undefined,
+      currentTurnMessageIds: null,
+      manualAnswerPostedThisTurn: false,
       recentPostedContentHashes: (fresh.recentPostedContentHashes ?? []).includes(contentHash)
         ? fresh.recentPostedContentHashes
         : [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
+      // The model's own post already closed any open trail turn server-side
+      // (a phase-less post takes the answer path) — just drop the local pointer.
+      activeTrailMessageId: null,
+      lastTrailHash: null,
+      lastTrailPostedAt: null,
     })
     await setBusy(directory, false)
     return
@@ -3124,6 +4467,8 @@ async function mirrorLatestReply(
     awaitingRemoteReply: false,
     replyAfterOpenCodeMessageId: null,
     replyBaselineCaptured: undefined,
+    currentTurnMessageIds: null,
+    manualAnswerPostedThisTurn: false,
     // A successful real mirror means the connect handshake is over.
     connectMirrorSuppressed: false,
     // Claim the content hash too so a racing manual post that lands during
@@ -3164,14 +4509,36 @@ async function mirrorLatestReply(
     })
   }
 
+  // phase:'answer' closes the live work-trail bubble this turn has been growing
+  // (item bfca2495) by writing the chrome-filtered answer into the SAME row,
+  // instead of leaving it streaming under a second, duplicate message. With no
+  // open trail turn the server falls back to the historical insert, so every
+  // mirror can take this path unconditionally. complete_turn rides along so the
+  // Working dots clear with the bubble rather than one report_complete later.
+  let postedDevspecMessageId: string | null = null
   try {
-    await mcpToolsCall({
+    const result = await mcpToolsCall({
       mcpUrl: auth.mcp_url,
       token: auth.token,
       name: 'post_session_message',
-      arguments: postMessageArgs(fresh, preparedText, { turn_kind: 'agent', model }),
+      arguments: postMessageArgs(fresh, preparedText, {
+        turn_kind: 'agent',
+        model,
+        phase: 'answer',
+        complete_turn: true,
+      }),
       timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
+    // Item 6990fd9e: "no throw" is not success. Live: mcpToolsCall returned
+    // without throwing, we logged posted + claimed the OpenCode id, but no
+    // session_messages row existed. Require a DevSpec message_id before keeping
+    // the optimistic claim.
+    postedDevspecMessageId = extractPostedMessageId(result)
+    if (!postedDevspecMessageId) {
+      throw new Error(
+        'post_session_message returned without message_id — refusing silent mirror success',
+      )
+    }
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.
     const ids = (readState(directory)?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id)
@@ -3182,6 +4549,8 @@ async function mirrorLatestReply(
       awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
       replyAfterOpenCodeMessageId: fresh.replyAfterOpenCodeMessageId ?? null,
       replyBaselineCaptured: fresh.replyBaselineCaptured,
+      currentTurnMessageIds: fresh.currentTurnMessageIds ?? null,
+      manualAnswerPostedThisTurn: fresh.manualAnswerPostedThisTurn ?? false,
       recentPostedContentHashes: hashes,
     })
     logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`)
@@ -3203,8 +4572,14 @@ async function mirrorLatestReply(
     return
   }
 
+  // Answer landed: the trail turn is closed server-side, so this connection has
+  // no open bubble any more. Clearing the pointer is what lets the NEXT turn open
+  // a fresh one instead of appending to a turn that already has an answer.
+  clearTrailState(directory)
+
   logPoll(
     `mirrorLatestReply: posted last.id=${last.info.id} via connection_id` +
+      ` devspec_message_id=${postedDevspecMessageId}` +
       (model ? ` model=${model.providerID}/${model.modelID}` : ' model=(none)'),
   )
   logRemoteControlStory({
@@ -3218,6 +4593,7 @@ async function mirrorLatestReply(
     reason: 'plugin_mirror',
     data: {
       message_id: last.info.id,
+      devspec_message_id: postedDevspecMessageId,
       ...modelStoryData(model),
       model_stamped: Boolean(model),
     },
@@ -3233,6 +4609,7 @@ async function mirrorLatestReply(
     reason: 'plugin_mirror',
     data: {
       message_id: last.info.id,
+      devspec_message_id: postedDevspecMessageId,
       ...modelStoryData(model),
       model_stamped: Boolean(model),
     },

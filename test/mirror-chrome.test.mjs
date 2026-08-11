@@ -10,6 +10,7 @@ import {
   isOperationalChrome,
   prepareMirrorText,
   shouldClaimConnectTurnSuppress,
+  shouldDeferInjectDuringConnect,
   shouldSkipConnectTurnMirror,
   stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
@@ -36,6 +37,20 @@ Open:       Agents page
 Stop with:  /devspec.remote-stop
 ───────────────────────────────`
 
+/** Live leak (Dashing Osprey): rule-only opener, no REMOTE_STATUS_BANNER title. */
+const VARIANT_BANNER = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Agent:      OpenCode · Dashing Osprey
+Connection: 1701c62c…
+Session:    7976fffb… | attached
+Status:     registered | attached
+Open:       Agents page
+Stop with:  /devspec.remote-stop
+──────────────────────────────────`
+
+const VARIANT_WITH_INTERNAL_NOTE = `${VARIANT_BANNER}
+
+> **Internal note (not mirrored):** Oriented on the room. Session is "Explain DevSpec Project Intelligence Platform" — standing by for the next owner command.`
+
 describe('prepareMirrorText — fence-aware chrome (0ffe97cb)', () => {
   it('returns null for a status banner wrapped in markdown code fences', () => {
     assert.equal(prepareMirrorText(FENCED_BANNER), null)
@@ -57,6 +72,37 @@ describe('prepareMirrorText — fence-aware chrome (0ffe97cb)', () => {
 
   it('keeps an ordinary real reply', () => {
     assert.equal(prepareMirrorText('1 + 1 is 2.'), '1 + 1 is 2.')
+  })
+})
+
+describe('prepareMirrorText — variant status chrome (Dashing Osprey / 7976fffb)', () => {
+  it('returns null for a rule-only status block without the canonical title', () => {
+    assert.equal(prepareMirrorText(VARIANT_BANNER), null)
+    assert.equal(isOperationalChrome(VARIANT_BANNER), true)
+  })
+
+  it('returns null when variant banner is followed by Internal note chrome', () => {
+    assert.equal(prepareMirrorText(VARIANT_WITH_INTERNAL_NOTE), null)
+    assert.equal(isOperationalChrome(VARIANT_WITH_INTERNAL_NOTE), true)
+  })
+
+  it('returns null for a standalone Internal note (not mirrored) block', () => {
+    const note =
+      '> **Internal note (not mirrored):** Oriented on the room. Standing by for the next owner command.'
+    assert.equal(prepareMirrorText(note), null)
+  })
+
+  it('keeps a real answer after a variant status block (fields stripped)', () => {
+    assert.equal(prepareMirrorText(`${VARIANT_BANNER}\n\n2`), '2')
+  })
+
+  it('keeps a real answer after variant banner + Internal note (blank-line separated)', () => {
+    assert.equal(prepareMirrorText(`${VARIANT_WITH_INTERNAL_NOTE}\n\n2`), '2')
+  })
+
+  it('does not strip a real reply that mentions Session once in prose', () => {
+    const reply = 'The Session: field on that form is optional.'
+    assert.equal(prepareMirrorText(reply), reply)
   })
 })
 
@@ -128,6 +174,38 @@ describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => 
     assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.work'), false)
+  })
+})
+
+describe('shouldDeferInjectDuringConnect — mid-handshake owner command (6990fd9e)', () => {
+  it('defers inject while connectMirrorSuppressed and not awaiting a reply', () => {
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectMirrorSuppressed: true,
+        awaitingRemoteReply: false,
+      }),
+      true,
+    )
+  })
+
+  it('does not defer after handshake suppress clears', () => {
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectMirrorSuppressed: false,
+        awaitingRemoteReply: false,
+      }),
+      false,
+    )
+  })
+
+  it('does not defer when already awaiting an inject reply (suppress may still be set)', () => {
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectMirrorSuppressed: true,
+        awaitingRemoteReply: true,
+      }),
+      false,
+    )
   })
 })
 
