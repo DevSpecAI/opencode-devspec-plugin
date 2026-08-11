@@ -111,12 +111,28 @@ OpenCode SDK also documents `session.command` and session create/delete. Those a
 
 OpenCode exposes an in-process session API. Poller+wait is a workaround for hosts that cannot push into their own chat. Do not force OpenCode onto Claude’s scripts; do not assume other hosts can `promptAsync`.
 
+## Work trail / Show work (plugin-owned)
+
+While a remote turn runs, the plugin grows a live DevSpec bubble via `post_session_message({ phase: 'trail' })`. The owner expands it under **Show work**. This is **plugin-owned**, not model play-by-play — the skill forbids interim “still working…” posts; the trail already serializes what the session is producing.
+
+| Piece | Behaviour |
+|---|---|
+| Module | `src/work-trail.ts` (pure serialize) + publish helpers in `src/remote-control.ts` |
+| Seed | `TRAIL_SEED_TEXT` (`Working…`) the instant the turn starts (item `05a88ed5`) so the room is not busy-dots-only while the model thinks |
+| Growth | Full replace of the cumulative trail on each post (never append). Throttled (`TRAIL_POST_MIN_GAP_MS` ≈ 1s) + hash-skip identical bodies |
+| Content | **Unfiltered on purpose** — tool calls, reasoning, failures, and tool output. Opposite of answer mirror chrome strip (`prepareMirrorText`). Only enormous single parts are mid-elided; total capped at `TRAIL_MAX_CHARS` (100k) |
+| Close | When the answer posts with `phase: 'answer'` (+ `complete_turn` as applicable), the live trail collapses under **Show work** |
+
+**Vs Cursor:** Cursor is local-poller — IDE mid-turn hooks and/or a **CLI transcript watcher** feed trail because Agents `--resume` often skips hooks. OpenCode already sits inside the session API, so it serializes the in-flight turn directly. Do **not** port Cursor’s wait/inbox/transcript-watcher stack into OpenCode for Show work.
+
 ## What not to change lightly
 
 - Full `writeState({ ...stale })` that clobbers mirror claims → **double bubbles** (live regression).
 - Injecting slash-looking text expecting host commands.
 - Dropping mirror dedup while also letting the model `post_session_message`.
 - Reintroducing a detached wait “for consistency” with Claude.
+- Making the **model** drive `phase: 'trail'` (or narrating progress into the room) — trail is plugin-owned from the OpenCode transcript.
+- Filtering trail the same way as answer chrome — Show work is meant to look like the terminal, not a cleaned reply.
 - **Replacing multi-bond with a single `lastKnownSessionId` pin** — second attach starves the first → `idle_timeout`.
 - **Awaiting inject or stall before the next `poll_connection`** — presence starve → `idle_timeout`.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
@@ -155,6 +171,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 | `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state, `extractOpenCodeReplyModel`, `resolveOpenCodeAssistantModel` |
 | `src/poll-turn.ts` | Pure hold tiers, command gate, `renderInjectedTurn`, `unansweredCommands`, cursor advance rules |
 | `src/mirror-chrome.ts` | Fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` |
+| `src/work-trail.ts` | Serialize in-flight turn → trail text (seed, throttle helpers, unfiltered parts) |
 | `src/agent-identity.ts` | `AGENT_NAME = 'OpenCode'` |
 | `src/devspec-client.ts` | MCP `tools/call` with timeouts |
 | `commands/devspec.remote.md` / `devspec.remote-stop.md` | Skill steps for register/attach (act section, budgeted transcript, terminal-only chrome) |
@@ -184,6 +201,7 @@ Do **not** ship a remote-control change without that suite passing. Prefer also 
 - `test/mcp-short-timeout.test.mjs` — hung MCP abort on the pump path
 - `test/poll-turn.test.mjs` / `test/busy-stall.test.mjs` — hold tiers, stall policy
 - `test/model-stamp.test.mjs` — `extractOpenCodeReplyModel` aliases, `resolveOpenCodeAssistantModel` (MiniMax flat + nested), loud `mirror_post`/`model_missing` story shape
+- `test/work-trail.test.mjs` — serialize / seed / throttle / clamp for live Show work
 
 ### Optional live smell-test (after ship)
 

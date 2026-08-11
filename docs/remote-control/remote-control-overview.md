@@ -26,15 +26,16 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
 | Slash commands | Host UI commands (e.g. `/clear`) are **not** remote-control. Injecting `"/clear"` as prompt text does not run them. |
+| Work trail / Show work | Attached turns may grow a live `phase: "trail"` bubble that collapses under **Show work** when the answer lands. **Plugin-owned** where possible. Host feeds differ — see per-agent primers. |
 | OpenCode serve password | Laptop-local HTTP basic auth for rocket `serve`↔attach only. DevSpec MCP never stores or sends it. See `remote-control-opencode.md`. |
 
 ## Three implementation families
 
-| Family | Members | How a DevSpec command reaches the model |
-|---|---|---|
-| **Local-poller** | Claude Code, Cursor, Grok Build, Antigravity | Detached Node poller long-polls DevSpec → writes inbox file → wait process wakes the model. Model posts the reply (skill-driven). |
-| **Bridge** | Codex | Poller + **app-server bridge** injects into the Codex thread via `turn/start`. Bridge posts remote-turn replies. |
-| **Native runtime** | OpenCode | In-process TypeScript: self-scheduling held `poll_connection` inside OpenCode → fire-and-forget `promptAsync` inject → plugin mirrors assistant reply (with dedup). **Presence constraint:** the pump must keep returning to `poll_connection` while a turn runs (`last_seen` ≈ 90s); awaiting inject on the critical path caused mid-conversation `idle_timeout`. See `remote-control-opencode.md`. |
+| Family | Members | How a DevSpec command reaches the model | Work-trail feed (typical) |
+|---|---|---|---|
+| **Local-poller** | Claude Code, Cursor, Grok Build, Antigravity | Detached Node poller long-polls DevSpec → writes inbox file → wait process wakes the model. Model posts the reply (skill-driven). | Host-specific. **Cursor:** IDE mid-turn hooks + **CLI transcript watcher** (hooks often skip on Agents `--resume`). |
+| **Bridge** | Codex | Poller + **app-server bridge** injects into the Codex thread via `turn/start`. Bridge posts remote-turn replies. | Bridge/plugin as implemented for that host. |
+| **Native runtime** | OpenCode | In-process TypeScript: self-scheduling held `poll_connection` inside OpenCode → fire-and-forget `promptAsync` inject → plugin mirrors assistant reply (with dedup). **Presence constraint:** the pump must keep returning to `poll_connection` while a turn runs (`last_seen` ≈ 90s); awaiting inject on the critical path caused mid-conversation `idle_timeout`. See `remote-control-opencode.md`. | In-process serialize of the OpenCode turn (`work-trail.ts`) — closest to a live terminal dump; unfiltered by design. |
 
 Same MCP verbs and delivery rules. Different laptop plumbing. **Do not port one family’s wake/inject mechanism onto another without a host reason.**
 
