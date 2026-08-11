@@ -81,7 +81,9 @@ export function controlSlashSuccessMessage(cmd: OpencodeControlSlash): string {
     case 'abort':
       return 'Aborted the current OpenCode generation.'
     case 'new':
-      return 'Started a new OpenCode session.'
+      // Composer /new is silent in the DevSpec transcript (8718be5a); this
+      // string is only for logging / non-composer callers that still want copy.
+      return 'Cleared OpenCode working memory (same DevSpec session).'
     case 'undo':
       return 'Undid the last OpenCode turn.'
     case 'redo':

@@ -3208,8 +3208,84 @@ async function postControlSlashAnswer(
 }
 
 /**
+ * Reset OpenCode LLM context in place (item 8718be5a + siblings 37a7487b / 8a55a89b).
+ *
+ * Creates a fresh OpenCode SDK session and rebinds the remote-control bond so
+ * the pump injects into the blank chat — WITHOUT changing the DevSpec room
+ * (`ConnectionState.sessionId`), calling `create_session` / `attach_connection`,
+ * or posting chrome into the DevSpec transcript.
+ *
+ * The previous bug called `bindSessionState(directory, newOpenCodeId)`, which
+ * treated the OpenCode session id as the DevSpec session key and briefly
+ * rewrote `state.sessionId` — that looked like a new DevSpec room and could
+ * trip server-attachment adopt / re-delivery.
+ */
+export async function wipeOpenCodeContextInPlace(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  /** Current OpenCode session id (the one the bond / pump is on). */
+  opencodeSessionId: string
+}): Promise<{ newOpenCodeSessionId: string; preservedDevspecSessionId: string | null }> {
+  const { client, directory, opencodeSessionId } = input
+  const before = readState(directory)
+  const preservedDevspecSessionId = before?.sessionId ?? null
+
+  const created = await withTimeout(
+    (client as any).session.create({
+      body: { title: 'DevSpec remote' },
+    }),
+    OPENCODE_SESSION_API_TIMEOUT_MS,
+    'session.create',
+  )
+  const session = unwrapSdkData<{ id?: string }>(created)
+  const newId = typeof session?.id === 'string' ? session.id : null
+  if (!newId) throw new Error('session.create returned no id')
+
+  // Prefer the bond's DevSpec state key (session UUID or null folder-only).
+  // Fall back to the ALS / process bind or the on-disk DevSpec session id —
+  // never to the OpenCode session id (that was the old bindSessionState bug).
+  const priorKey = stateKeyForOpenCodeBond(opencodeSessionId)
+  const stateKey: string | null =
+    priorKey !== undefined
+      ? priorKey
+      : (effectiveBoundSessionId() ?? preservedDevspecSessionId)
+
+  forgetOpenCodeBond(opencodeSessionId)
+  rememberOpenCodeBond(newId, stateKey)
+
+  // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery cursors
+  // (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room transcript
+  // is not re-injected into the blank chat.
+  patchState(directory, {
+    lastMirroredMessageId: null,
+    replyAfterOpenCodeMessageId: null,
+    replyBaselineCaptured: undefined,
+    awaitingRemoteReply: false,
+    pendingQuestion: null,
+  })
+
+  // Explicitly do NOT call bindSessionState with newId — DevSpec session_id
+  // and the state-file key stay on the prior room.
+  const after = readState(directory)
+  if (
+    preservedDevspecSessionId &&
+    after?.sessionId &&
+    after.sessionId !== preservedDevspecSessionId
+  ) {
+    patchState(directory, { sessionId: preservedDevspecSessionId })
+  }
+
+  logPoll(
+    `wipeOpenCodeContextInPlace: ${opencodeSessionId} → ${newId} ` +
+      `(devspecSession=${preservedDevspecSessionId ?? '(none)'}, stateKey=${stateKey ?? '(folder-only)'})`,
+  )
+  return { newOpenCodeSessionId: newId, preservedDevspecSessionId }
+}
+
+/**
  * Run a native OpenCode control slash via SDK (item b315fe42).
- * Always posts a short DevSpec answer and clears busy so Working never hangs.
+ * Posts a short DevSpec answer for most commands; `/new` is silent (8718be5a).
+ * Always clears busy so Working never hangs.
  */
 export async function executeOwnerControlSlash(input: {
   client: Parameters<Plugin>[0]['client']
@@ -3221,6 +3297,8 @@ export async function executeOwnerControlSlash(input: {
 }): Promise<void> {
   const { client, directory, sessionId, auth, command, model } = input
   const label = command.kind
+  /** `/new` must not append a chat row (acceptance: transcript unchanged). */
+  const silentSuccess = command.kind === 'new'
   try {
     switch (command.kind) {
       case 'abort': {
@@ -3247,21 +3325,11 @@ export async function executeOwnerControlSlash(input: {
         break
       }
       case 'new': {
-        const created = await withTimeout(
-          (client as any).session.create({
-            body: { title: 'DevSpec remote' },
-          }),
-          OPENCODE_SESSION_API_TIMEOUT_MS,
-          'session.create',
-        )
-        const session = unwrapSdkData<{ id?: string }>(created)
-        const newId = typeof session?.id === 'string' ? session.id : null
-        if (!newId) throw new Error('session.create returned no id')
-        const priorKey = stateKeyForOpenCodeBond(sessionId)
-        forgetOpenCodeBond(sessionId)
-        rememberOpenCodeBond(newId, priorKey === undefined ? null : priorKey)
-        bindSessionState(directory, newId)
-        logPoll(`control slash /new: rebound ${sessionId} → ${newId}`)
+        await wipeOpenCodeContextInPlace({
+          client,
+          directory,
+          opencodeSessionId: sessionId,
+        })
         break
       }
       case 'undo': {
@@ -3294,7 +3362,9 @@ export async function executeOwnerControlSlash(input: {
         break
       }
     }
-    await postControlSlashAnswer(directory, auth, controlSlashSuccessMessage(command))
+    if (!silentSuccess) {
+      await postControlSlashAnswer(directory, auth, controlSlashSuccessMessage(command))
+    }
     logRemoteControlStory({
       phase: 'inject',
       outcome: 'kicked',
@@ -3304,11 +3374,12 @@ export async function executeOwnerControlSlash(input: {
       codename: readState(directory)?.codename ?? null,
       tool: 'session.control',
       reason: `/${label}`,
-      data: { ok: true },
+      data: { ok: true, silent: silentSuccess },
     })
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     logPoll(`control slash /${label} failed: ${reason}`)
+    // Failures still surface — silent only applies to a successful /new wipe.
     await postControlSlashAnswer(
       directory,
       auth,

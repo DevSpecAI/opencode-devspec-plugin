@@ -38,6 +38,6 @@ describe('resolveOwnerControlSlash', () => {
 describe('controlSlashSuccessMessage', () => {
   it('returns a short confirmation for each kind', () => {
     assert.match(controlSlashSuccessMessage({ kind: 'abort' }), /Abort/i)
-    assert.match(controlSlashSuccessMessage({ kind: 'new' }), /new/i)
+    assert.match(controlSlashSuccessMessage({ kind: 'new' }), /Cleared OpenCode working memory/i)
   })
 })
