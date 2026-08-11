@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Remote control — OpenCode control slashes via SDK (not promptAsync)
+
+Exact owner tokens `/compact` (`/summarize`), `/abort`, `/new` (`/clear`), `/undo`, `/redo` are intercepted before `promptAsync` and executed with `session.summarize` / `abort` / `create`+rebond / `revert` / `unrevert`. Posts a short DevSpec answer with `complete_turn` and clears busy so Working never hangs on abort.
+
+Item `b315fe42`. Requires plugin rebuild/reload (**0.3.11**).
+
 ### Remote control — auto-allow permission.ask while bonded (yolo for promptAsync)
 
 Live stall (session `1187956b`, 2026-08-10): OpenCode asked `external_directory` for `~/.config/opencode` on a later remote turn and never got a reply. Cold-launch `opencode run --auto` only covers the first connect message; subsequent owner commands are injected via `promptAsync`, so they never inherit `--auto`.

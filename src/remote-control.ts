@@ -64,6 +64,11 @@ import {
   serializeTurnTrail,
   shouldPostTrail,
 } from './work-trail.js'
+import {
+  controlSlashSuccessMessage,
+  resolveOwnerControlSlash,
+  type OpencodeControlSlash,
+} from './opencode-control-slash.js'
 
 export {
   REMOTE_STATUS_BANNER,
@@ -148,6 +153,16 @@ export const MCP_HEARTBEAT_TIMEOUT_MS = 5_000
  * the same way hung MCP did (item 875d75b5 — Crimson Osprey / Gentle Weasel).
  */
 export const OPENCODE_SESSION_API_TIMEOUT_MS = 5_000
+
+/** Compact/summarize can run a model turn — don't use the short session API ceiling. */
+export const OPENCODE_CONTROL_COMPACT_TIMEOUT_MS = 120_000
+
+function unwrapSdkData<T>(res: unknown): T {
+  if (res && typeof res === 'object' && 'data' in (res as object)) {
+    return (res as { data: T }).data
+  }
+  return res as T
+}
 
 /**
  * Warn (story `presence_gap`) when this many ms pass without a successful
@@ -2985,6 +3000,43 @@ export async function pollAndDeliver(
     return { delayMs: 2000, stop: false }
   }
 
+  // OpenCode control slashes (item b315fe42): exact `/compact` etc. run via SDK,
+  // never promptAsync of the slash text. Advisory context is discarded — control
+  // is not a model turn.
+  const controlSlash = resolveOwnerControlSlash(commands)
+  if (controlSlash) {
+    pump.carry.take()
+    const rawDispatchModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
+    const dispatchModelExtract = extractOpenCodeReplyModel(rawDispatchModel)
+    const model = dispatchModelExtract.model
+    logPoll(`control slash: /${controlSlash.kind} via SDK (not promptAsync)`)
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'queued',
+      connectionId: state.connectionId,
+      sessionId: state.sessionId,
+      agent: AGENT_NAME,
+      codename: state.codename,
+      tool: 'session.control',
+      reason: `/${controlSlash.kind}`,
+      data: { commands: commands.length, ...modelStoryData(model) },
+    })
+    const injectStateKey = effectiveBoundSessionId()
+    void runWithBoundSessionAsync(injectStateKey, () =>
+      executeOwnerControlSlash({
+        client,
+        directory,
+        sessionId,
+        auth,
+        command: controlSlash,
+        model,
+      }),
+    ).catch((err) => {
+      logPoll(`executeOwnerControlSlash failed: ${err}`)
+    })
+    return { delayMs: 0, stop: false }
+  }
+
   // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
   // by every command in the delta. Injecting per-command would queue separate OpenCode
   // turns, and only the first would carry the context they all share.
@@ -3095,6 +3147,190 @@ export async function pollAndDeliver(
   })
 
   return { delayMs: 0, stop: false }
+}
+
+async function listSessionMessages(
+  client: Parameters<Plugin>[0]['client'],
+  sessionId: string,
+): Promise<Array<{ info?: { id?: string; role?: string; model?: unknown } }>> {
+  const snap: unknown = await withTimeout(
+    (client as any).session.messages({ path: { id: sessionId } }),
+    OPENCODE_SESSION_API_TIMEOUT_MS,
+    'session.messages(control-slash)',
+  )
+  const data = unwrapSdkData<unknown>(snap)
+  return Array.isArray(data) ? (data as any[]) : []
+}
+
+async function resolveControlSlashModel(
+  client: Parameters<Plugin>[0]['client'],
+  sessionId: string,
+  preferred?: OpenCodeModelStamp,
+): Promise<OpenCodeModelStamp | null> {
+  if (preferred?.providerID && preferred?.modelID) return preferred
+  try {
+    const msgs = await listSessionMessages(client, sessionId)
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const row = msgs[i]
+      if (row?.info?.role !== 'assistant') continue
+      const extracted = resolveOpenCodeAssistantModel(row as any)
+      if (extracted.model) return extracted.model
+    }
+  } catch (err) {
+    logPoll(`resolveControlSlashModel: messages failed: ${err}`)
+  }
+  return null
+}
+
+async function postControlSlashAnswer(
+  directory: string,
+  auth: { ok: boolean; token?: string; mcp_url?: string },
+  message: string,
+): Promise<void> {
+  const state = readState(directory)
+  if (!state || !auth.ok || !auth.token || !auth.mcp_url) return
+  if (!state.sessionId && !state.connectionId) return
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'post_session_message',
+      arguments: postMessageArgs(state, message, {
+        turn_kind: 'agent',
+        phase: 'answer',
+        complete_turn: true,
+      }),
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+  } catch (err) {
+    logPoll(`postControlSlashAnswer failed: ${err}`)
+  }
+}
+
+/**
+ * Run a native OpenCode control slash via SDK (item b315fe42).
+ * Always posts a short DevSpec answer and clears busy so Working never hangs.
+ */
+export async function executeOwnerControlSlash(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  sessionId: string
+  auth: { ok: boolean; token?: string; mcp_url?: string }
+  command: OpencodeControlSlash
+  model?: OpenCodeModelStamp
+}): Promise<void> {
+  const { client, directory, sessionId, auth, command, model } = input
+  const label = command.kind
+  try {
+    switch (command.kind) {
+      case 'abort': {
+        await withTimeout(
+          (client as any).session.abort({ path: { id: sessionId } }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.abort',
+        )
+        break
+      }
+      case 'compact': {
+        const stamp = await resolveControlSlashModel(client, sessionId, model)
+        if (!stamp) {
+          throw new Error('No provider/model available to compact this session')
+        }
+        await withTimeout(
+          (client as any).session.summarize({
+            path: { id: sessionId },
+            body: { providerID: stamp.providerID, modelID: stamp.modelID },
+          }),
+          OPENCODE_CONTROL_COMPACT_TIMEOUT_MS,
+          'session.summarize',
+        )
+        break
+      }
+      case 'new': {
+        const created = await withTimeout(
+          (client as any).session.create({
+            body: { title: 'DevSpec remote' },
+          }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.create',
+        )
+        const session = unwrapSdkData<{ id?: string }>(created)
+        const newId = typeof session?.id === 'string' ? session.id : null
+        if (!newId) throw new Error('session.create returned no id')
+        const priorKey = stateKeyForOpenCodeBond(sessionId)
+        forgetOpenCodeBond(sessionId)
+        rememberOpenCodeBond(newId, priorKey === undefined ? null : priorKey)
+        bindSessionState(directory, newId)
+        logPoll(`control slash /new: rebound ${sessionId} → ${newId}`)
+        break
+      }
+      case 'undo': {
+        const msgs = await listSessionMessages(client, sessionId)
+        let messageID: string | null = null
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const info = msgs[i]?.info
+          if (info?.role === 'user' && typeof info.id === 'string' && info.id) {
+            messageID = info.id
+            break
+          }
+        }
+        if (!messageID) throw new Error('Nothing to undo')
+        await withTimeout(
+          (client as any).session.revert({
+            path: { id: sessionId },
+            body: { messageID },
+          }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.revert',
+        )
+        break
+      }
+      case 'redo': {
+        await withTimeout(
+          (client as any).session.unrevert({ path: { id: sessionId } }),
+          OPENCODE_SESSION_API_TIMEOUT_MS,
+          'session.unrevert',
+        )
+        break
+      }
+    }
+    await postControlSlashAnswer(directory, auth, controlSlashSuccessMessage(command))
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'kicked',
+      connectionId: readState(directory)?.connectionId ?? null,
+      sessionId: readState(directory)?.sessionId ?? null,
+      agent: AGENT_NAME,
+      codename: readState(directory)?.codename ?? null,
+      tool: 'session.control',
+      reason: `/${label}`,
+      data: { ok: true },
+    })
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    logPoll(`control slash /${label} failed: ${reason}`)
+    await postControlSlashAnswer(
+      directory,
+      auth,
+      `⚠️ \`/${label}\` failed: ${reason}`,
+    )
+    logRemoteControlStory({
+      phase: 'inject',
+      outcome: 'failed',
+      connectionId: readState(directory)?.connectionId ?? null,
+      sessionId: readState(directory)?.sessionId ?? null,
+      agent: AGENT_NAME,
+      codename: readState(directory)?.codename ?? null,
+      tool: 'session.control',
+      reason: `/${label}`,
+      data: { error: reason },
+    })
+  } finally {
+    // Abort (and any mid-busy control) must clear Working without waiting for
+    // a model reply that will never arrive.
+    await setBusy(directory, false)
+    clearInjectTurnState(directory)
+  }
 }
 
 /**
