@@ -129,7 +129,7 @@ When the conversation produces a durable decision, convention, architecture choi
    - Types: `decision`, `convention`, `architecture`, `risk`, `insight`.
 2. **Artifacts** — short plans / ADRs / runbooks via `create_resource` / `update_resource` / `supersede_resource`.
 3. When attached, just say so in your own reply (offer, then confirmation once recorded) — the plugin's automatic mirror carries it to the phone transcript. Do not call `post_session_message` yourself for this either.
-4. Don't rely on autopilot post-session extraction for this channel — capture it live.
+4. Don't rely on post-session extraction for this channel — capture it live.
 
 ## When the connection "ends" — recoverable vs permanent
 

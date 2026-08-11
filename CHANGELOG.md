@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### The `/autopilot.*` commands are gone — staged batches arrive at any idle connection
+
+**Migration:** if you used `/autopilot.start` (or its queue flags), stage the items in DevSpec instead (**Stage for Autopilot** / approve a plan) and keep an ordinary remote-control session idle — DevSpec hands the batch to it. Status is the Agents page; stop is `devspec.remote-stop`; history is the assignment and item record.
+
+- **The plugin no longer chooses its own work.** The old commands pulled a global queue and decided locally what to take; the server now routes a staged batch to a connection and the plugin only works what it was handed.
+- **Unattended is a mode, not a command.** The assignment-dispatch text the plugin injects now says so explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
+- No replacement command or flag is created. Same deletion across the Claude Code, Cursor, Grok, Antigravity and Codex plugins under the same item (`3f2f390c`).
+
 ### Remote control — OpenCode control slashes via SDK (not promptAsync)
 
 Exact owner tokens `/compact` (`/summarize`), `/abort`, `/new` (`/clear`), `/undo`, `/redo` are intercepted before `promptAsync` and executed with `session.summarize` / `abort` / `create`+rebond / `revert` / `unrevert`. Posts a short DevSpec answer with `complete_turn` and clears busy so Working never hangs on abort.
