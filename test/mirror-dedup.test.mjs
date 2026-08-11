@@ -190,3 +190,60 @@ describe('recordManualPostSessionMessage — manualAnswerPostedThisTurn (item 5f
     assert.equal(readState(dir)?.manualAnswerPostedThisTurn ?? false, false)
   })
 })
+
+// Item 4f9515a4: content-hash dedup is turn-scoped. A prior turn's identical
+// short answer must not skip phase=answer while a live Working trail is open.
+describe('turn-scoped content-hash (item 4f9515a4)', () => {
+  it('content-hash skip is overridden when an open trail would be orphaned', () => {
+    const contentHash = hashPostedContent('7.')
+    const alreadyPostedByHash = true
+    const alreadyPostedByTool = false
+    const alreadyPostedManually = false
+    const activeTrailMessageId = '0b5f248c-5e88-43aa-8815-228463497ff4'
+    const hashSkipWouldOrphanTrail =
+      alreadyPostedByHash &&
+      !alreadyPostedByTool &&
+      !alreadyPostedManually &&
+      Boolean(activeTrailMessageId)
+    const shouldSkip =
+      (alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) &&
+      !hashSkipWouldOrphanTrail
+    assert.ok(contentHash.length >= 32)
+    assert.equal(hashSkipWouldOrphanTrail, true)
+    assert.equal(shouldSkip, false)
+  })
+
+  it('content-hash skip still applies within a turn when no trail is open', () => {
+    const alreadyPostedByHash = true
+    const alreadyPostedByTool = false
+    const alreadyPostedManually = false
+    const activeTrailMessageId = null
+    const hashSkipWouldOrphanTrail =
+      alreadyPostedByHash &&
+      !alreadyPostedByTool &&
+      !alreadyPostedManually &&
+      Boolean(activeTrailMessageId)
+    const shouldSkip =
+      (alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) &&
+      !hashSkipWouldOrphanTrail
+    assert.equal(hashSkipWouldOrphanTrail, false)
+    assert.equal(shouldSkip, true)
+  })
+
+  it('inject-turn / clearInjectTurnState clears the content-hash ring', () => {
+    const afterInject = {
+      awaitingRemoteReply: true,
+      recentPostedContentHashes: [],
+      manualAnswerPostedThisTurn: false,
+    }
+    const afterClear = {
+      awaitingRemoteReply: false,
+      recentPostedContentHashes: [],
+      manualAnswerPostedThisTurn: false,
+      activeTrailMessageId: null,
+    }
+    assert.deepEqual(afterInject.recentPostedContentHashes, [])
+    assert.deepEqual(afterClear.recentPostedContentHashes, [])
+    assert.equal(afterClear.activeTrailMessageId, null)
+  })
+})

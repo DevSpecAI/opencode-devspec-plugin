@@ -3054,7 +3054,14 @@ export async function pollAndDeliver(
   // Mark awaiting BEFORE fire-and-forget deliverInjectedTurn. Baseline capture
   // used to set this only after session.messages — during that window a late
   // command.executed / connect suppress could poison the answer id (b156e680).
-  patchState(directory, { awaitingRemoteReply: true })
+  // Turn-scope the content-hash ring (item 4f9515a4): a prior turn's "7." must
+  // not suppress this turn's identical short answer, or the live Working trail
+  // stays streaming forever with empty content.
+  patchState(directory, {
+    awaitingRemoteReply: true,
+    recentPostedContentHashes: [],
+    manualAnswerPostedThisTurn: false,
+  })
   logRemoteControlStory({
     phase: 'pickup',
     outcome: 'started',
@@ -3140,12 +3147,18 @@ export async function deliverInjectedTurn(input: {
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
+        // Reaffirm turn-scoped hash ring (item 4f9515a4) — inject may have
+        // already cleared it; baseline patch must not reintroduce prior hashes.
+        recentPostedContentHashes: [],
+        manualAnswerPostedThisTurn: false,
         ...freshTurnTrail,
       }) ?? {
         ...state,
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
+        recentPostedContentHashes: [],
+        manualAnswerPostedThisTurn: false,
         ...freshTurnTrail,
       }
 
@@ -3654,6 +3667,9 @@ export function clearInjectTurnState(directory: string, opts: { unclaim?: boolea
     replyBaselineCaptured: undefined,
     currentTurnMessageIds: null,
     manualAnswerPostedThisTurn: false,
+    // Hashes are turn-scoped (item 4f9515a4) — drop them with the rest of the
+    // inject-turn correlation so the next remote turn starts clean.
+    recentPostedContentHashes: [],
     activeTrailMessageId: null,
     lastTrailHash: null,
     lastTrailPostedAt: null,
@@ -4028,7 +4044,25 @@ async function mirrorLatestReply(
   const alreadyPostedByHash = (fresh.recentPostedContentHashes ?? []).includes(contentHash)
   const alreadyPostedByTool = candidates.some((m) => messageHasPostSessionMessageTool(m))
   const alreadyPostedManually = Boolean(fresh.manualAnswerPostedThisTurn)
-  if (alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) {
+  // Hash-only hits must NOT skip while a live trail is still open (item 4f9515a4).
+  // Cross-turn identical short answers used to hash-skip here and leave
+  // response_status=streaming forever; tool/manual posts already closed the
+  // trail server-side, so those skips remain safe.
+  const hashSkipWouldOrphanTrail =
+    alreadyPostedByHash &&
+    !alreadyPostedByTool &&
+    !alreadyPostedManually &&
+    Boolean(fresh.activeTrailMessageId)
+  if (hashSkipWouldOrphanTrail) {
+    logPoll(
+      `mirrorLatestReply: content-hash hit but trail ${fresh.activeTrailMessageId} still open — ` +
+        `posting phase=answer anyway (last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…)`,
+    )
+  }
+  if (
+    (alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) &&
+    !hashSkipWouldOrphanTrail
+  ) {
     const via = alreadyPostedByTool ? 'tool' : alreadyPostedManually ? 'manual-flag' : 'content-hash'
     logPoll(
       `mirrorLatestReply: skip (already posted via ${via}) ` +
