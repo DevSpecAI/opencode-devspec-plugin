@@ -10,7 +10,9 @@ Create a new action item in DevSpec without leaving the terminal.
 
 ## Steps
 
-0. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so name the project the item belongs to. Run `git remote get-url origin` and call `list_projects({ git_remote: "<that remote>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match, output `✗ No DevSpec project tracks this repo (<git_remote>).` and stop. Pass `project_id` on the `create_action_item` call in step 3.
+0. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so name the project the item belongs to. Run `git remote get-url origin` and call `list_projects({ git_remote: "<that remote>" })`; use `remote_match.resolved_project_id` as `project_id`. If it is null with multiple `candidate_project_ids`, present them and ask the user which project. If there is no match — or there is no remote — **and there is no pin**, output `✗ No DevSpec project tracks this repo (<git_remote>), and there is no .devspec/project.json pin.` and stop. **With a pin, carry on** and pass `pinned_project_id` instead. Pass `project_id` on the `create_action_item` call in step 3.
+
+   **Folder pin — a project with no repo yet.** Whether or not there is a remote, read `.devspec/project.json` in the workspace root if it exists; it holds `{ "project_id": "<uuid>" }`. That is how a folder whose code does not exist yet names its project. Pass it as **`pinned_project_id`**, NEVER as `project_id`: `project_id` is an explicit override that outranks a verified git remote, whereas the pin is only a local assertion the server deliberately ranks BELOW a remote it can verify — so sending it as `project_id` reverses that. Send `git_remote` when you have one, `pinned_project_id` when you have one, both when you have both, and let the server arbitrate. **Never decide precedence locally.**
 
 1. Extract from the user's input:
    - `title`: required — the action item title
