@@ -1,291 +1,82 @@
 #!/usr/bin/env node
 /**
- * Mirror chrome filter — fence-aware status strip + unansweredCommands settlement
- * (item 4973de1f / session 0ffe97cb).
+ * What survives in mirror-chrome after egress stopped reading text (68cc567c).
+ *
+ * This file used to be the home of the classifier suite: `prepareMirrorText`
+ * fence-awareness (0ffe97cb), variant status-block detection (Dashing Osprey /
+ * 7976fffb), `shouldSkipConnectTurnMirror` (e7ecc1de) and
+ * `shouldClaimConnectTurnSuppress` (b156e680). Every one of those was added
+ * after a live failure, and the last of them let "Done." through into DevSpec
+ * session 8fd18ec0 on 2026-08-17 because it did not look like chrome.
+ *
+ * The decision moved to what a turn DID — a handshake turn has no answer to
+ * post — so the classifiers are deleted rather than tuned. What is left here is
+ * formatting that cannot change whether something is posted, a command NAME
+ * test, and inject sequencing during connect.
  */
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  collapseOrphanMarkdownFences,
   isDevspecRemoteControlCommand,
-  isOperationalChrome,
-  prepareMirrorText,
-  shouldClaimConnectTurnSuppress,
   shouldDeferInjectDuringConnect,
-  shouldSkipConnectTurnMirror,
-  stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
 } from '../dist/mirror-chrome.js'
 import { unansweredCommands } from '../dist/poll-turn.js'
 
-const FENCED_BANNER = `\`\`\`
-━━━ DevSpec Remote Control ━━━
-Agent:      OpenCode · Ivory Ibis
-Connection: cc58a50b…
-Session:    0ffe97cb… | (none — available)
-Status:     registered | attached
-Open:       Agents page
-Stop with:  /devspec.remote-stop
-───────────────────────────────
-\`\`\``
+const FENCED = '```\n━━━ DevSpec Remote Control ━━━\nAgent: OpenCode\n```'
 
-const PLAIN_BANNER = `━━━ DevSpec Remote Control ━━━
-Agent:      OpenCode · Ivory Ibis
-Connection: cc58a50b…
-Session:    0ffe97cb… | (none — available)
-Status:     registered | attached
-Open:       Agents page
-Stop with:  /devspec.remote-stop
-───────────────────────────────`
-
-/** Live leak (Dashing Osprey): rule-only opener, no REMOTE_STATUS_BANNER title. */
-const VARIANT_BANNER = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Agent:      OpenCode · Dashing Osprey
-Connection: 1701c62c…
-Session:    7976fffb… | attached
-Status:     registered | attached
-Open:       Agents page
-Stop with:  /devspec.remote-stop
-──────────────────────────────────`
-
-const VARIANT_WITH_INTERNAL_NOTE = `${VARIANT_BANNER}
-
-> **Internal note (not mirrored):** Oriented on the room. Session is "Explain DevSpec Project Intelligence Platform" — standing by for the next owner command.`
-
-describe('prepareMirrorText — fence-aware chrome (0ffe97cb)', () => {
-  it('returns null for a status banner wrapped in markdown code fences', () => {
-    assert.equal(prepareMirrorText(FENCED_BANNER), null)
+describe('formatting helpers are content-blind', () => {
+  it('unwraps a single outer fence without judging what is inside', () => {
+    const out = unwrapSingleOuterMarkdownFence(FENCED)
+    assert.equal(out.startsWith('```'), false)
+    assert.equal(out.includes('━━━ DevSpec Remote Control ━━━'), true, 'content is preserved verbatim')
   })
 
-  it('returns null for a plain (unfenced) status banner', () => {
-    assert.equal(prepareMirrorText(PLAIN_BANNER), null)
+  it('leaves non-fenced text exactly as written', () => {
+    assert.equal(unwrapSingleOuterMarkdownFence('hello world'), 'hello world')
+    assert.equal(collapseOrphanMarkdownFences('hello world'), 'hello world')
   })
 
-  it('returns null for fence-only leftovers after a banner strip', () => {
-    assert.equal(prepareMirrorText('```\n```'), null)
-    assert.equal(isOperationalChrome('```\n```'), true)
-  })
-
-  it('keeps a real answer that follows a pasted status block (banner stripped)', () => {
-    const mixed = `${PLAIN_BANNER}\n\n2`
-    assert.equal(prepareMirrorText(mixed), '2')
-  })
-
-  it('keeps an ordinary real reply', () => {
-    assert.equal(prepareMirrorText('1 + 1 is 2.'), '1 + 1 is 2.')
+  it('collapses an orphan fence pair to nothing postable', () => {
+    assert.equal(collapseOrphanMarkdownFences('```\n```').trim(), '')
   })
 })
 
-describe('prepareMirrorText — variant status chrome (Dashing Osprey / 7976fffb)', () => {
-  it('returns null for a rule-only status block without the canonical title', () => {
-    assert.equal(prepareMirrorText(VARIANT_BANNER), null)
-    assert.equal(isOperationalChrome(VARIANT_BANNER), true)
-  })
-
-  it('returns null when variant banner is followed by Internal note chrome', () => {
-    assert.equal(prepareMirrorText(VARIANT_WITH_INTERNAL_NOTE), null)
-    assert.equal(isOperationalChrome(VARIANT_WITH_INTERNAL_NOTE), true)
-  })
-
-  it('returns null for a standalone Internal note (not mirrored) block', () => {
-    const note =
-      '> **Internal note (not mirrored):** Oriented on the room. Standing by for the next owner command.'
-    assert.equal(prepareMirrorText(note), null)
-  })
-
-  it('keeps a real answer after a variant status block (fields stripped)', () => {
-    assert.equal(prepareMirrorText(`${VARIANT_BANNER}\n\n2`), '2')
-  })
-
-  it('keeps a real answer after variant banner + Internal note (blank-line separated)', () => {
-    assert.equal(prepareMirrorText(`${VARIANT_WITH_INTERNAL_NOTE}\n\n2`), '2')
-  })
-
-  it('does not strip a real reply that mentions Session once in prose', () => {
-    const reply = 'The Session: field on that form is optional.'
-    assert.equal(prepareMirrorText(reply), reply)
-  })
-})
-
-describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => {
-  it('skips when the message id was recorded from command.executed', () => {
-    assert.equal(
-      shouldSkipConnectTurnMirror({
-        messageId: 'msg_connect',
-        nonMirrorMessageIds: ['msg_connect'],
-        connectMirrorSuppressed: false,
-        awaitingRemoteReply: false,
-      }),
-      true,
-    )
-  })
-
-  it('skips while handshake suppress is on and not awaiting an inject reply', () => {
-    assert.equal(
-      shouldSkipConnectTurnMirror({
-        messageId: 'msg_other',
-        nonMirrorMessageIds: [],
-        connectMirrorSuppressed: true,
-        awaitingRemoteReply: false,
-      }),
-      true,
-    )
-  })
-
-  it('does not suppress a post-inject remote reply even during handshake', () => {
-    assert.equal(
-      shouldSkipConnectTurnMirror({
-        messageId: 'msg_answer',
-        nonMirrorMessageIds: [],
-        connectMirrorSuppressed: true,
-        awaitingRemoteReply: true,
-      }),
-      false,
-    )
-  })
-
-  it('does not skip an ordinary local reply after handshake cleared', () => {
-    assert.equal(
-      shouldSkipConnectTurnMirror({
-        messageId: 'msg_local',
-        nonMirrorMessageIds: ['msg_connect'],
-        connectMirrorSuppressed: false,
-        awaitingRemoteReply: false,
-      }),
-      false,
-    )
-  })
-
-  // Session 8a97effc / connection 4aab7fe0: late command.executed tagged the
-  // inject answer with the connect-skill message id; nonMirrorMessageIds must
-  // not win over awaitingRemoteReply.
-  it('never skips while awaitingRemoteReply even if answer id is in nonMirrorMessageIds (8a97effc)', () => {
-    assert.equal(
-      shouldSkipConnectTurnMirror({
-        messageId: 'msg_fd7a125e2001jMlrosBkXrxYbv',
-        nonMirrorMessageIds: ['msg_fd7a125e2001jMlrosBkXrxYbv'],
-        connectMirrorSuppressed: false,
-        awaitingRemoteReply: true,
-      }),
-      false,
-    )
-  })
-
-  it('recognises remote-control skill command names', () => {
+describe('isDevspecRemoteControlCommand — a NAME test, not a text test', () => {
+  it('matches the two remote-control commands', () => {
     assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
-    assert.equal(isDevspecRemoteControlCommand('devspec.create'), false)
+  })
+
+  it('rejects anything else, including near misses and non-strings', () => {
+    assert.equal(isDevspecRemoteControlCommand('devspec.work'), false)
+    assert.equal(isDevspecRemoteControlCommand('remote'), false)
+    assert.equal(isDevspecRemoteControlCommand(null), false)
+    assert.equal(isDevspecRemoteControlCommand(42), false)
   })
 })
 
-describe('shouldDeferInjectDuringConnect — mid-handshake owner command (6990fd9e)', () => {
-  it('defers inject while connectMirrorSuppressed and not awaiting a reply', () => {
-    assert.equal(
-      shouldDeferInjectDuringConnect({
-        connectMirrorSuppressed: true,
-        awaitingRemoteReply: false,
-      }),
-      true,
-    )
+describe('shouldDeferInjectDuringConnect — sequencing, not egress (6990fd9e)', () => {
+  it('defers an owner command while the handshake is still settling', () => {
+    assert.equal(shouldDeferInjectDuringConnect({ connectMirrorSuppressed: true }), true)
   })
 
-  it('does not defer after handshake suppress clears', () => {
+  it('does not defer once a real inject turn is in flight', () => {
     assert.equal(
-      shouldDeferInjectDuringConnect({
-        connectMirrorSuppressed: false,
-        awaitingRemoteReply: false,
-      }),
+      shouldDeferInjectDuringConnect({ connectMirrorSuppressed: true, awaitingRemoteReply: true }),
       false,
+      'a turn already answering a command must not be starved by a stale handshake flag',
     )
   })
 
-  it('does not defer when already awaiting an inject reply (suppress may still be set)', () => {
-    assert.equal(
-      shouldDeferInjectDuringConnect({
-        connectMirrorSuppressed: true,
-        awaitingRemoteReply: true,
-      }),
-      false,
-    )
+  it('does not defer when no handshake is in progress', () => {
+    assert.equal(shouldDeferInjectDuringConnect({}), false)
   })
 })
 
-describe('shouldClaimConnectTurnSuppress — real answer under false connect tag (b156e680)', () => {
-  it('does not claim while awaitingRemoteReply', () => {
-    assert.equal(
-      shouldClaimConnectTurnSuppress({
-        awaitingRemoteReply: true,
-        preparedText: null,
-      }),
-      false,
-    )
-  })
-
-  it('does not claim when prepareMirrorText still has a real answer (banner + -1)', () => {
-    const mixed = `${PLAIN_BANNER}\n\n-1.`
-    assert.equal(prepareMirrorText(mixed), '-1.')
-    assert.equal(
-      shouldClaimConnectTurnSuppress({
-        awaitingRemoteReply: false,
-        preparedText: prepareMirrorText(mixed),
-      }),
-      false,
-    )
-  })
-
-  it('claims pure connect chrome so the status turn is not rechecked forever', () => {
-    assert.equal(prepareMirrorText(PLAIN_BANNER), null)
-    assert.equal(
-      shouldClaimConnectTurnSuppress({
-        awaitingRemoteReply: false,
-        preparedText: null,
-      }),
-      true,
-    )
-  })
-})
-
-describe('unansweredCommands — connect narration must not settle (regression)', () => {
-  it('keeps a pending dispatch when no agent bubble was mirrored (post-fix)', () => {
-    // After the connect-turn skip-mirror fix, the narration never enters the
-    // room — so the seed filter correctly keeps the mid-attach dispatch.
-    const cmds = [{ id: 'math', created_at: '2026-08-05T19:15:59.854Z' }]
-    const room = []
-    assert.deepEqual(unansweredCommands(cmds, room).map((c) => c.id), ['math'])
-  })
-
-  it('still settles when a real answer was mirrored after the dispatch', () => {
-    const cmds = [{ id: 'math', created_at: '2026-08-05T19:15:59.854Z' }]
-    const room = [
-      {
-        message_type: 'external_agent',
-        author: { kind: 'external_agent' },
-        created_at: '2026-08-05T19:16:53.000Z',
-        content: '2',
-      },
-    ]
-    assert.deepEqual(unansweredCommands(cmds, room), [])
-  })
-})
-
-describe('unwrapSingleOuterMarkdownFence', () => {
-  it('unwraps a single outer fence so the banner header is visible', () => {
-    assert.equal(unwrapSingleOuterMarkdownFence(FENCED_BANNER).includes('━━━ DevSpec Remote Control ━━━'), true)
-    assert.equal(unwrapSingleOuterMarkdownFence(FENCED_BANNER).startsWith('```'), false)
-  })
-
-  it('leaves non-fenced text alone', () => {
-    assert.equal(unwrapSingleOuterMarkdownFence(PLAIN_BANNER), PLAIN_BANNER)
-  })
-})
-
-describe('stripRemoteControlBanner', () => {
-  it('removes the banner through the trailing rule line', () => {
-    assert.equal(stripRemoteControlBanner(`${PLAIN_BANNER}\n\nhello`).trim(), 'hello')
-  })
-})
-
-describe('unansweredCommands — empty/chrome bubbles do not settle', () => {
-  it('still returns a prior command when the only later agent bubble is empty fences', () => {
+describe('unansweredCommands — a blank bubble is not an answer', () => {
+  it('keeps a pending command when the only later agent bubble is empty fences', () => {
     const cmds = [{ id: 'math', created_at: '2026-08-04T11:16:30.000Z' }]
     const room = [
       {
@@ -298,45 +89,37 @@ describe('unansweredCommands — empty/chrome bubbles do not settle', () => {
     assert.deepEqual(unansweredCommands(cmds, room).map((c) => c.id), ['math'])
   })
 
-  it('still returns a prior command when the later bubble is a fenced status banner', () => {
-    const cmds = [{ id: 'math', created_at: '2026-08-04T11:16:30.000Z' }]
+  it('settles when a real answer was posted after the command', () => {
+    const cmds = [{ id: 'math', created_at: '2026-08-05T19:15:59.854Z' }]
     const room = [
       {
         message_type: 'external_agent',
         author: { kind: 'external_agent' },
-        created_at: '2026-08-04T11:17:53.000Z',
-        content: FENCED_BANNER,
-      },
-    ]
-    assert.deepEqual(unansweredCommands(cmds, room).map((c) => c.id), ['math'])
-  })
-
-  it('settles commands before a real agent reply', () => {
-    const cmds = [
-      { id: 'old', created_at: '2026-08-04T11:16:30.000Z' },
-      { id: 'live', created_at: '2026-08-04T11:18:00.000Z' },
-    ]
-    const room = [
-      {
-        message_type: 'external_agent',
-        author: { kind: 'external_agent' },
-        created_at: '2026-08-04T11:17:53.000Z',
+        created_at: '2026-08-05T19:16:53.000Z',
         content: '2',
       },
     ]
-    assert.deepEqual(unansweredCommands(cmds, room).map((c) => c.id), ['live'])
+    assert.deepEqual(unansweredCommands(cmds, room), [])
   })
 
-  it('fails open when agent reply content is missing (keep timestamp settlement)', () => {
-    const cmds = [{ id: 'old', created_at: '2026-08-04T11:16:30.000Z' }]
+  it('keeps a pending command when nothing was posted at all', () => {
+    const cmds = [{ id: 'math', created_at: '2026-08-05T19:15:59.854Z' }]
+    assert.deepEqual(unansweredCommands(cmds, []).map((c) => c.id), ['math'])
+  })
+
+  it('settles on an answer that would once have been filtered as chrome', () => {
+    // The room-side chrome filter is gone with the mirror-side one. A short or
+    // banner-ish reply is now taken at face value, because the plugin no longer
+    // puts operational text in a room for anyone to filter back out.
+    const cmds = [{ id: 'q', created_at: '2026-08-05T19:15:59.854Z' }]
     const room = [
       {
         message_type: 'external_agent',
         author: { kind: 'external_agent' },
-        created_at: '2026-08-04T11:17:53.000Z',
-        // content omitted — cannot prove chrome; do not re-deliver finished turns
+        created_at: '2026-08-05T19:16:53.000Z',
+        content: 'Done.',
       },
     ]
-    assert.deepEqual(unansweredCommands(cmds, room).map((c) => c.id), [])
+    assert.deepEqual(unansweredCommands(cmds, room), [])
   })
 })

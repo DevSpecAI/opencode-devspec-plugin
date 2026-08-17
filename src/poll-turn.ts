@@ -1,4 +1,7 @@
-import { prepareMirrorText } from './mirror-chrome.js'
+import {
+  collapseOrphanMarkdownFences,
+  unwrapSingleOuterMarkdownFence,
+} from './mirror-chrome.js'
 
 /**
  * Pure logic for the long-poll tick and the tiered turn OpenCode injects
@@ -360,7 +363,15 @@ export function unansweredCommands(
   let lastReplyAt: string | null = null
   for (const m of room) {
     if (!isSettlingReplyForThisAgent(m, { agentName, connectionId })) continue
-    if (typeof m.content === 'string' && prepareMirrorText(m.content) === null) continue
+    // A bubble with nothing in it is not a reply. That is emptiness, not a
+    // judgement about what the content says: the chrome classifier that used to
+    // run here went with the mirror's (item 68cc567c). The plugin no longer
+    // posts operational text into a room, so there is nothing to filter back
+    // out — but a stray blank bubble must still not settle a command.
+    if (typeof m.content === 'string') {
+      const body = collapseOrphanMarkdownFences(unwrapSingleOuterMarkdownFence(m.content)).trim()
+      if (!body) continue
+    }
     if (!lastReplyAt || m.created_at! > lastReplyAt) lastReplyAt = m.created_at!
   }
   if (!lastReplyAt) return cmds
