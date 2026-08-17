@@ -52,6 +52,11 @@ function isRegisterConnectionTool(tool: string): boolean {
   return tool === "devspec_register_connection" || tool.endsWith("register_connection")
 }
 
+/** The model-facing answer-egress verb, prefixed per MCP server or bare. */
+function isPostSessionMessageTool(tool: string): boolean {
+  return tool === "devspec_post_session_message" || tool.endsWith("post_session_message")
+}
+
 function isAttachConnectionTool(tool: string): boolean {
   return tool === "devspec_attach_connection" || tool.endsWith("attach_connection")
 }
@@ -372,6 +377,39 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
      * a heuristic — it is the plugin providing a fact the model has no access to.
      */
     'tool.execute.before': async (input, output) => {
+      // ---- Single-writer enforcement (item 4c639620) -------------------------
+      // While this session holds a bond, the plugin owns answer egress, so a
+      // model call to post_session_message is refused before it reaches the
+      // server rather than deduplicated after it lands.
+      //
+      // Prose was not enough. The skill has said "never call this" since
+      // 42391f84, and on 2026-08-17 the model called it anyway at 16:14:56; the
+      // mirror then suppressed ITSELF using a remembered content hash, which is
+      // a second writer racing a first and choosing a winner after the fact
+      // (a70cdf78). Two OpenCode sessions posted contradictory answers under one
+      // connection that way.
+      //
+      // This blocks the MODEL's tool surface only. The plugin's own delivery is
+      // raw JSON-RPC from this process and never passes through here, and every
+      // other DevSpec verb — report_progress, action items, memories — is
+      // untouched: the boundary is answer egress, not the MCP server.
+      if (isPostSessionMessageTool(input.tool)) {
+        const bonded =
+          typeof input.sessionID === 'string' && isBondedOpenCodeSession(input.sessionID)
+        if (bonded) {
+          logPoll(
+            `post_session_message refused for opencodeSession=${input.sessionID} — ` +
+              `plugin owns egress while a bond is active`,
+          )
+          throw new Error(
+            'DevSpec: this OpenCode session is connected to DevSpec, and the plugin posts your ' +
+              'reply for you. Do not call post_session_message — just answer normally in the ' +
+              'terminal and your answer reaches the room verbatim. (Calling it would create a ' +
+              'second, competing writer; see DevSpec item 4c639620.)',
+          )
+        }
+      }
+
       try {
         if (!isRegisterConnectionTool(input.tool)) return
         if (typeof input.sessionID !== 'string' || !input.sessionID) return
