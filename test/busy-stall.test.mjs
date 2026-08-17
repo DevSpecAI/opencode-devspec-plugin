@@ -20,10 +20,11 @@ import {
   assistantTextFromMessage,
   assistantReasoningFingerprint,
   readState,
-  resetBoundSessionIdForTests,
+  resetBondsForTests,
   scopeAssistantsAfterBaseline,
   writeState,
   PERMISSION_ASK_STALL_MS,
+  runWithBondAsync,
 } from '../dist/remote-control.js'
 
 const TIMEOUT = 120_000
@@ -36,8 +37,22 @@ function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-devspec-stall-'))
 }
 
+
+/**
+ * State reads and writes are scoped to a bond now (item a72a4e22) — there is no
+ * process-global to fall back on. These cases exercise the state layer itself,
+ * so each runs inside one explicit test bond.
+ */
+// Each suite gets its own bond AND its own home: state files are keyed on the
+// bond alone now, so a shared name would have these files racing each other in
+// the real ~/.devspec directory. (Before the rekey the folder was part of the
+// key, which isolated them by accident.)
+process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-busy_stall-home-'))
+const TEST_BOND = 'ses_test_bond_busy_stall'
+const itInBond = (name, fn) => it(name, () => runWithBondAsync(TEST_BOND, async () => fn()))
+
 describe('messageHasActiveToolWork', () => {
-  it('is true for pending or running tools', () => {
+  itInBond('is true for pending or running tools', () => {
     assert.equal(
       messageHasActiveToolWork(assistant('m1', [{ type: 'tool', state: { status: 'running' } }])),
       true,
@@ -48,7 +63,7 @@ describe('messageHasActiveToolWork', () => {
     )
   })
 
-  it('is false for completed tools, reasoning, or text-only', () => {
+  itInBond('is false for completed tools, reasoning, or text-only', () => {
     assert.equal(
       messageHasActiveToolWork(assistant('m1', [{ type: 'tool', state: { status: 'completed' } }])),
       false,
@@ -59,7 +74,7 @@ describe('messageHasActiveToolWork', () => {
 })
 
 describe('messageHasPendingPermissionAsk', () => {
-  it('detects tool state ask / waiting / permission*', () => {
+  itInBond('detects tool state ask / waiting / permission*', () => {
     assert.equal(
       messageHasPendingPermissionAsk(
         assistant('m1', [{ type: 'tool', state: { status: 'ask' } }]),
@@ -86,7 +101,7 @@ describe('messageHasPendingPermissionAsk', () => {
     )
   })
 
-  it('detects permission part types and nested permission flags', () => {
+  itInBond('detects permission part types and nested permission flags', () => {
     assert.equal(
       messageHasPendingPermissionAsk(assistant('m1', [{ type: 'permission' }])),
       true,
@@ -107,7 +122,7 @@ describe('messageHasPendingPermissionAsk', () => {
     )
   })
 
-  it('is false for ordinary running tools without an ask', () => {
+  itInBond('is false for ordinary running tools without an ask', () => {
     assert.equal(
       messageHasPendingPermissionAsk(
         assistant('m1', [{ type: 'tool', state: { status: 'running' } }]),
@@ -122,7 +137,7 @@ describe('messageHasPendingPermissionAsk', () => {
 })
 
 describe('decideBusyStall', () => {
-  it('stays under_timeout before the wall clock elapses', () => {
+  itInBond('stays under_timeout before the wall clock elapses', () => {
     const d = decideBusyStall({
       elapsedMs: 30_000,
       timeoutMs: TIMEOUT,
@@ -132,7 +147,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.action, 'under_timeout')
   })
 
-  it('does not stall when the latest assistant has reply text', () => {
+  itInBond('does not stall when the latest assistant has reply text', () => {
     const msg = assistant('m1', [{ type: 'text', text: 'done' }])
     assert.ok(assistantTextFromMessage(msg))
     const d = decideBusyStall({
@@ -144,7 +159,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.action, 'has_text')
   })
 
-  it('slides on in-flight tools even with no reply text (Tembo tool-loop)', () => {
+  itInBond('slides on in-flight tools even with no reply text (Tembo tool-loop)', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 5_000,
       timeoutMs: TIMEOUT,
@@ -159,7 +174,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, 'm1')
   })
 
-  it('slides when a new assistant message appears (even tool-only / empty)', () => {
+  itInBond('slides when a new assistant message appears (even tool-only / empty)', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -171,7 +186,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, 'm2')
   })
 
-  it('slides once when first past timeout with an unseen assistant id', () => {
+  itInBond('slides once when first past timeout with an unseen assistant id', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -182,7 +197,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reason, 'new_assistant')
   })
 
-  it('stalls on true silence — same empty assistant, no active tools, past timeout', () => {
+  itInBond('stalls on true silence — same empty assistant, no active tools, past timeout', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -194,7 +209,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, 'm1')
   })
 
-  it('stalls when there is no assistant message at all past timeout', () => {
+  itInBond('stalls when there is no assistant message at all past timeout', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -206,7 +221,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, null)
   })
 
-  it('still slides active_tool on the same assistant before the slide cap', () => {
+  itInBond('still slides active_tool on the same assistant before the slide cap', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -219,7 +234,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reason, 'active_tool')
   })
 
-  it('stalls when the same assistant active_tool has already slid to the cap', () => {
+  itInBond('stalls when the same assistant active_tool has already slid to the cap', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -233,7 +248,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, 'm1')
   })
 
-  it('resets the active_tool slide budget when the assistant id changes', () => {
+  itInBond('resets the active_tool slide budget when the assistant id changes', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -247,7 +262,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, 'm2')
   })
 
-  it('never slides active_tool while a permission ask is pending', () => {
+  itInBond('never slides active_tool while a permission ask is pending', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -262,7 +277,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.action, 'under_timeout')
   })
 
-  it('stalls after the permission-ask window even with a running tool', () => {
+  itInBond('stalls after the permission-ask window even with a running tool', () => {
     const d = decideBusyStall({
       elapsedMs: 20_000,
       timeoutMs: TIMEOUT,
@@ -282,7 +297,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.assistantId, 'm1')
   })
 
-  it('detects permission ask from message parts without an explicit flag', () => {
+  itInBond('detects permission ask from message parts without an explicit flag', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -294,7 +309,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reason, 'permission_asked')
   })
 
-  it('without permission, active_tool still slides before the cap', () => {
+  itInBond('without permission, active_tool still slides before the cap', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -308,7 +323,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reason, 'active_tool')
   })
 
-  it('slides when reasoning grows on the same assistant (MiniMax long think)', () => {
+  itInBond('slides when reasoning grows on the same assistant (MiniMax long think)', () => {
     const early = assistant('m1', [{ type: 'reasoning', text: 'planning…' }])
     const earlyFp = assistantReasoningFingerprint(early)
     assert.ok(earlyFp)
@@ -331,7 +346,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reasoningFingerprint, laterFp)
   })
 
-  it('slides on first seen reasoning fingerprint even when assistant id already tracked', () => {
+  itInBond('slides on first seen reasoning fingerprint even when assistant id already tracked', () => {
     const msg = assistant('m1', [{ type: 'thinking', text: 'deep think' }])
     const fp = assistantReasoningFingerprint(msg)
     const d = decideBusyStall({
@@ -346,7 +361,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reasoningFingerprint, fp)
   })
 
-  it('stalls when reasoning is frozen on the same assistant past timeout', () => {
+  itInBond('stalls when reasoning is frozen on the same assistant past timeout', () => {
     const msg = assistant('m1', [{ type: 'reasoning', text: 'stuck mid-thought' }])
     const fp = assistantReasoningFingerprint(msg)
     const d = decideBusyStall({
@@ -360,7 +375,7 @@ describe('decideBusyStall', () => {
     assert.equal(d.reason, 'empty_assistant_timeout')
   })
 
-  it('prefers active_tool over reasoning_growth when a tool is in flight', () => {
+  itInBond('prefers active_tool over reasoning_growth when a tool is in flight', () => {
     const d = decideBusyStall({
       elapsedMs: TIMEOUT + 1,
       timeoutMs: TIMEOUT,
@@ -379,7 +394,7 @@ describe('decideBusyStall', () => {
 })
 
 describe('assistantReasoningFingerprint', () => {
-  it('returns null without reasoning/thinking parts', () => {
+  itInBond('returns null without reasoning/thinking parts', () => {
     assert.equal(assistantReasoningFingerprint(assistant('m1', [{ type: 'text', text: 'hi' }])), null)
     assert.equal(
       assistantReasoningFingerprint(
@@ -389,7 +404,7 @@ describe('assistantReasoningFingerprint', () => {
     )
   })
 
-  it('changes when reasoning text grows', () => {
+  itInBond('changes when reasoning text grows', () => {
     const a = assistantReasoningFingerprint(assistant('m1', [{ type: 'reasoning', text: 'a' }]))
     const b = assistantReasoningFingerprint(assistant('m1', [{ type: 'reasoning', text: 'ab' }]))
     assert.ok(a && b)
@@ -407,7 +422,7 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
     assistant('a2', [{ type: 'text', text: 'newer, still part of old turn' }]),
   ]
 
-  it('slice: only assistants strictly after the baseline are candidates', () => {
+  itInBond('slice: only assistants strictly after the baseline are candidates', () => {
     const decision = decideAwaitingBaseline({
       baseline: 'a1',
       baselineCaptured: true,
@@ -421,7 +436,7 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
     assert.equal(scoped[0].info.id, 'a2')
   })
 
-  it('wait: baseline is the newest assistant — no progress yet, not the stale text', () => {
+  itInBond('wait: baseline is the newest assistant — no progress yet, not the stale text', () => {
     const decision = decideAwaitingBaseline({
       baseline: 'a2',
       baselineCaptured: true,
@@ -442,7 +457,7 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
     assert.equal(d.reason, 'empty_assistant_timeout')
   })
 
-  it('a genuine new post-inject assistant is still visible for progress', () => {
+  itInBond('a genuine new post-inject assistant is still visible for progress', () => {
     const withNew = [...assistants, assistant('a3', [{ type: 'text', text: 'real reply' }])]
     const decision = decideAwaitingBaseline({
       baseline: 'a2',
@@ -462,7 +477,7 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
     assert.equal(d.action, 'has_text')
   })
 
-  it('fail_closed_snapshot: baseline snapshot failed — treated as no progress, not all history', () => {
+  itInBond('fail_closed_snapshot: baseline snapshot failed — treated as no progress, not all history', () => {
     const decision = decideAwaitingBaseline({
       baseline: 'a1',
       baselineCaptured: false,
@@ -471,7 +486,7 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
     assert.deepEqual(scopeAssistantsAfterBaseline(assistants, decision), [])
   })
 
-  it('all: empty history at inject — every assistant is new', () => {
+  itInBond('all: empty history at inject — every assistant is new', () => {
     const decision = decideAwaitingBaseline({
       baseline: null,
       baselineCaptured: true,
@@ -480,7 +495,7 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
     assert.deepEqual(scopeAssistantsAfterBaseline(assistants, decision), assistants)
   })
 
-  it('fail_closed_legacy: no baseline info at all — lenient fallback to full history', () => {
+  itInBond('fail_closed_legacy: no baseline info at all — lenient fallback to full history', () => {
     const decision = decideAwaitingBaseline({
       baseline: null,
       baselineCaptured: undefined,
@@ -494,10 +509,10 @@ describe('scopeAssistantsAfterBaseline (checkBusyStall baseline scoping)', () =>
 describe('clearInjectTurnState (item 40279ae0)', () => {
   const dirs = []
   beforeEach(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
   })
   after(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     for (const d of dirs) {
       try {
         fs.rmSync(d, { recursive: true, force: true })
@@ -508,7 +523,7 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
   })
 
   function seedState(dir, extra = {}) {
-    writeState(dir, {
+    writeState({
       connectionId: '5aa9129e-aa63-4b80-a2ad-ad8c5e336bde',
       sessionId: '5546c769-0cc2-4eac-9bcf-ca91b14151c4',
       codename: 'Fierce Eagle',
@@ -525,14 +540,14 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
     })
   }
 
-  it('clears awaiting/baseline/trail/manual-post state without touching deliveredMessageIds by default', () => {
+  itInBond('clears awaiting/baseline/trail/manual-post state without touching deliveredMessageIds by default', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir)
 
-    clearInjectTurnState(dir)
+    clearInjectTurnState()
 
-    const fresh = readState(dir)
+    const fresh = readState()
     assert.equal(fresh?.awaitingRemoteReply, false)
     assert.equal(fresh?.replyAfterOpenCodeMessageId, null)
     assert.equal(fresh?.currentTurnMessageIds, null)
@@ -544,14 +559,14 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
     assert.deepEqual(fresh?.deliveredMessageIds, ['cmd-1', 'cmd-2', 'cmd-3'])
   })
 
-  it('unclaim:true removes exactly this turn\'s ids from deliveredMessageIds — the stuck-turn fix', () => {
+  itInBond('unclaim:true removes exactly this turn\'s ids from deliveredMessageIds — the stuck-turn fix', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir)
 
-    clearInjectTurnState(dir, { unclaim: true })
+    clearInjectTurnState({ unclaim: true })
 
-    const fresh = readState(dir)
+    const fresh = readState()
     assert.equal(fresh?.awaitingRemoteReply, false)
     assert.equal(fresh?.currentTurnMessageIds, null)
     // cmd-2/cmd-3 belonged to the stalled turn — unclaimed so they can
@@ -560,9 +575,9 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
     assert.deepEqual(fresh?.deliveredMessageIds, ['cmd-1'])
   })
 
-  it('is a safe no-op when there is no state file for the directory', () => {
+  itInBond('is a safe no-op when there is no state file for the directory', () => {
     const dir = tmpDir()
     dirs.push(dir)
-    assert.doesNotThrow(() => clearInjectTurnState(dir, { unclaim: true }))
+    assert.doesNotThrow(() => clearInjectTurnState({ unclaim: true }))
   })
 })

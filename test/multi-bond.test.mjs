@@ -10,9 +10,9 @@ import {
   forgetOpenCodeBond,
   listOpenCodeBondSessions,
   rememberOpenCodeBond,
-  resetBoundSessionIdForTests,
-  runWithBoundSession,
-  stateKeyForOpenCodeBond,
+  resetBondsForTests,
+  runWithBond,
+  devspecSessionForBond,
   writeState,
   readState,
 } from '../dist/remote-control.js'
@@ -22,7 +22,7 @@ import path from 'node:path'
 
 describe('multi-bond registry (7a9b7b0f)', () => {
   beforeEach(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
   })
 
   it('second remember keeps the first bond active', () => {
@@ -31,8 +31,8 @@ describe('multi-bond registry (7a9b7b0f)', () => {
 
     const sessions = listOpenCodeBondSessions().sort()
     assert.deepEqual(sessions, ['ses_dolphin', 'ses_ivory'])
-    assert.equal(stateKeyForOpenCodeBond('ses_ivory'), 'b4fc6bbb-a9d0-4f03-83a0-e8880c70c262')
-    assert.equal(stateKeyForOpenCodeBond('ses_dolphin'), '88d61d19-59b0-4053-8d97-c678c9595961')
+    assert.equal(devspecSessionForBond('ses_ivory'), 'b4fc6bbb-a9d0-4f03-83a0-e8880c70c262')
+    assert.equal(devspecSessionForBond('ses_dolphin'), '88d61d19-59b0-4053-8d97-c678c9595961')
   })
 
   it('forget removes only the ended bond', () => {
@@ -41,38 +41,38 @@ describe('multi-bond registry (7a9b7b0f)', () => {
     forgetOpenCodeBond('ses_a')
 
     assert.deepEqual(listOpenCodeBondSessions(), ['ses_b'])
-    assert.equal(stateKeyForOpenCodeBond('ses_a'), undefined)
-    assert.equal(stateKeyForOpenCodeBond('ses_b'), 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
+    assert.equal(devspecSessionForBond('ses_a'), undefined)
+    assert.equal(devspecSessionForBond('ses_b'), 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
   })
 
   it('re-remember same OpenCode session upgrades state key (register → attach)', () => {
     rememberOpenCodeBond('ses_x', null)
-    assert.equal(stateKeyForOpenCodeBond('ses_x'), null)
+    assert.equal(devspecSessionForBond('ses_x'), null)
     rememberOpenCodeBond('ses_x', 'cccccccc-cccc-cccc-cccc-cccccccccccc')
-    assert.equal(stateKeyForOpenCodeBond('ses_x'), 'cccccccc-cccc-cccc-cccc-cccccccccccc')
+    assert.equal(devspecSessionForBond('ses_x'), 'cccccccc-cccc-cccc-cccc-cccccccccccc')
     assert.deepEqual(listOpenCodeBondSessions(), ['ses_x'])
   })
 
-  it('runWithBoundSession isolates state files across concurrent logical bonds', () => {
+  it('runWithBond isolates state files across concurrent logical bonds', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-multibond-'))
     try {
-      runWithBoundSession('sess-one', () => {
-        writeState(dir, {
+      runWithBond('sess-one', () => {
+        writeState({
           connectionId: 'conn-1',
           sessionId: 'sess-one',
           codename: 'Ivory Panda',
         })
       })
-      runWithBoundSession('sess-two', () => {
-        writeState(dir, {
+      runWithBond('sess-two', () => {
+        writeState({
           connectionId: 'conn-2',
           sessionId: 'sess-two',
           codename: 'Racing Dolphin',
         })
       })
 
-      const one = runWithBoundSession('sess-one', () => readState(dir))
-      const two = runWithBoundSession('sess-two', () => readState(dir))
+      const one = runWithBond('sess-one', () => readState())
+      const two = runWithBond('sess-two', () => readState())
       assert.equal(one?.connectionId, 'conn-1')
       assert.equal(one?.codename, 'Ivory Panda')
       assert.equal(two?.connectionId, 'conn-2')

@@ -4,8 +4,8 @@
  * branch on the firing session's bond, and `permission.ask` auto-allow is
  * bond-scoped rather than process-wide.
  *
- * Before this, each branch resolved `stateKeyForOpenCodeBond(target)` and, on
- * `undefined`, ran the side effect anyway against the process-global bind — so
+ * Before this, each branch looked up the bond and, when there was none, ran the
+ * side effect anyway against the process-global bind — so
  * an unbonded `@explore` child's `session.idle` sent a busy=false heartbeat for
  * the BONDED connection and cleared its busy flag, ending a remote turn that
  * was still running. `message.updated` did not consult the bond at all.
@@ -26,8 +26,8 @@ import {
   forgetOpenCodeBond,
   readState,
   rememberOpenCodeBond,
-  resetBoundSessionIdForTests,
-  runWithBoundSession,
+  resetBondsForTests,
+  runWithBond,
   writeState,
 } from '../dist/remote-control.js'
 
@@ -101,7 +101,7 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
   let mcp
 
   beforeEach(async () => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     forgetOpenCodeBond(BONDED)
     forgetOpenCodeBond(CHILD)
 
@@ -122,9 +122,9 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
     // local check for the life of this test instead of polling the stub.
     hooks = await DevSpecPlugin({ client, directory: projectDir })
 
-    rememberOpenCodeBond(BONDED, null)
-    runWithBoundSession(null, () => {
-      writeState(projectDir, {
+    rememberOpenCodeBond(BONDED, '8fd18ec0-2a4f-4242-8172-1c76e06a3b8e')
+    runWithBond(BONDED, () => {
+      writeState({
         connectionId: '7695c4dc-872e-48b2-92ea-6ca86e7c72bd',
         sessionId: '8fd18ec0-2a4f-4242-8172-1c76e06a3b8e',
         codename: 'Drifting Mongoose',
@@ -145,12 +145,12 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
     if (priorUrl === undefined) delete process.env.DEVSPEC_MCP_URL
     else process.env.DEVSPEC_MCP_URL = priorUrl
     forgetOpenCodeBond(BONDED)
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     fs.rmSync(tmpHome, { recursive: true, force: true })
     fs.rmSync(projectDir, { recursive: true, force: true })
   })
 
-  const readBonded = () => runWithBoundSession(null, () => readState(projectDir))
+  const readBonded = () => runWithBond(BONDED, () => readState())
   const heartbeats = () => mcp.toolCalls.filter((c) => c.name === 'heartbeat_connection')
 
   it('session.idle from an unbonded child does not end the bonded turn', async () => {

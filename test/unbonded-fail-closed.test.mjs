@@ -7,15 +7,13 @@
  * child (`ses_fef87a…`) produced 3,886 tokens of internal handoff material, and
  * on its `session.idle` the plugin published that text into the room under
  * bonded connection 7695c4dc / "Drifting Mongoose". The cause was
- * `stateKeyForOpenCodeBond()` returning `undefined` and both `mirrorNow` and
+ * an unbonded session resolving to 'no bond' and both `mirrorNow` and
  * `postWorkTrail` reading that as "fall back to the process-global bind"
  * instead of "refuse".
  *
- * The fixture reproduces the live shape exactly: the bonded connection's state
- * lives in the FOLDER-ONLY state file — that really was its key on the machine
- * where this happened — so a process-global read finds a fully live connection.
- * That is why the old fallback posted rather than harmlessly no-oping, and it
- * is why a test with an empty global state would prove nothing.
+ * The fixture is a fully live bonded connection in the same process, so the
+ * unbonded session has something real to leak INTO. A test whose bonded state
+ * was empty would pass against the bug for the wrong reason.
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -27,8 +25,8 @@ import {
   mirrorNow,
   postWorkTrail,
   rememberOpenCodeBond,
-  resetBoundSessionIdForTests,
-  runWithBoundSession,
+  resetBondsForTests,
+  runWithBond,
   writeState,
 } from '../dist/remote-control.js'
 
@@ -82,7 +80,7 @@ describe('unbonded OpenCode sessions are inert (2a5d212b)', () => {
   let priorUrl
 
   beforeEach(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     forgetOpenCodeBond(BONDED_OPENCODE_SESSION)
     forgetOpenCodeBond(EXPLORE_CHILD_SESSION)
     forgetOpenCodeBond(UNRELATED_SIBLING_SESSION)
@@ -103,9 +101,9 @@ describe('unbonded OpenCode sessions are inert (2a5d212b)', () => {
     process.env.DEVSPEC_MCP_URL = 'http://127.0.0.1:9/api/mcp'
 
     // The bonded parent, keyed folder-only — the live shape from 8fd18ec0.
-    rememberOpenCodeBond(BONDED_OPENCODE_SESSION, null)
-    runWithBoundSession(null, () => {
-      writeState(projectDir, liveState())
+    rememberOpenCodeBond(BONDED_OPENCODE_SESSION, '8fd18ec0-2a4f-4242-8172-1c76e06a3b8e')
+    runWithBond(BONDED_OPENCODE_SESSION, () => {
+      writeState(liveState())
     })
   })
 
@@ -119,7 +117,7 @@ describe('unbonded OpenCode sessions are inert (2a5d212b)', () => {
     if (priorUrl === undefined) delete process.env.DEVSPEC_MCP_URL
     else process.env.DEVSPEC_MCP_URL = priorUrl
     forgetOpenCodeBond(BONDED_OPENCODE_SESSION)
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     fs.rmSync(tmpHome, { recursive: true, force: true })
     fs.rmSync(projectDir, { recursive: true, force: true })
   })

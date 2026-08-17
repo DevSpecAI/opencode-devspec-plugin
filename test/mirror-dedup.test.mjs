@@ -15,29 +15,44 @@ import {
   normalizePostedContent,
   readState,
   recordManualPostSessionMessage,
-  resetBoundSessionIdForTests,
+  resetBondsForTests,
   writeState,
+  runWithBondAsync,
 } from '../dist/remote-control.js'
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-devspec-mirror-dedup-'))
 }
 
+
+/**
+ * State reads and writes are scoped to a bond now (item a72a4e22) — there is no
+ * process-global to fall back on. These cases exercise the state layer itself,
+ * so each runs inside one explicit test bond.
+ */
+// Each suite gets its own bond AND its own home: state files are keyed on the
+// bond alone now, so a shared name would have these files racing each other in
+// the real ~/.devspec directory. (Before the rekey the folder was part of the
+// key, which isolated them by accident.)
+process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-mirror_dedup-home-'))
+const TEST_BOND = 'ses_test_bond_mirror_dedup'
+const itInBond = (name, fn) => it(name, () => runWithBondAsync(TEST_BOND, async () => fn()))
+
 describe('normalizePostedContent / hashPostedContent', () => {
-  it('trims and normalizes CRLF so whitespace-only drift shares a hash', () => {
+  itInBond('trims and normalizes CRLF so whitespace-only drift shares a hash', () => {
     const a = hashPostedContent('Hello\r\nworld\n')
     const b = hashPostedContent('Hello\nworld')
     assert.equal(a, b)
     assert.equal(normalizePostedContent('  x  '), 'x')
   })
 
-  it('distinguishes different bodies', () => {
+  itInBond('distinguishes different bodies', () => {
     assert.notEqual(hashPostedContent('one'), hashPostedContent('two'))
   })
 })
 
 describe('messageHasPostSessionMessageTool', () => {
-  it('detects common OpenCode / MCP tool name shapes', () => {
+  itInBond('detects common OpenCode / MCP tool name shapes', () => {
     assert.equal(
       messageHasPostSessionMessageTool({
         parts: [{ type: 'tool', tool: 'post_session_message' }],
@@ -58,7 +73,7 @@ describe('messageHasPostSessionMessageTool', () => {
     )
   })
 
-  it('is false for text-only or unrelated tools', () => {
+  itInBond('is false for text-only or unrelated tools', () => {
     assert.equal(
       messageHasPostSessionMessageTool({
         parts: [{ type: 'text', text: 'hi' }],
@@ -74,7 +89,7 @@ describe('messageHasPostSessionMessageTool', () => {
     assert.equal(messageHasPostSessionMessageTool(null), false)
   })
 
-  it('turn-scoped detection: some() across every candidate finds an earlier post, not just the last message', () => {
+  itInBond('turn-scoped detection: some() across every candidate finds an earlier post, not just the last message', () => {
     // mirrorLatestReply's guard is `candidates.some(messageHasPostSessionMessageTool)`
     // — the model may have posted from an EARLIER assistant in the turn and
     // kept working, ending on a `last` with no tool part of its own.
@@ -94,7 +109,7 @@ describe('messageHasPostSessionMessageTool', () => {
 // covered end-to-end via this shared predicate, already exercised for stall
 // detection in busy-stall.test.mjs.
 describe('messageHasActiveToolWork (mirror mid-turn gate, item d4b8adcb)', () => {
-  it('a message with a still-running tool is mid-turn — must not be mirrored as the answer', () => {
+  itInBond('a message with a still-running tool is mid-turn — must not be mirrored as the answer', () => {
     assert.equal(
       messageHasActiveToolWork({
         info: { id: 'm1' },
@@ -107,7 +122,7 @@ describe('messageHasActiveToolWork (mirror mid-turn gate, item d4b8adcb)', () =>
     )
   })
 
-  it('a fully completed message has nothing active — safe to mirror', () => {
+  itInBond('a fully completed message has nothing active — safe to mirror', () => {
     assert.equal(
       messageHasActiveToolWork({
         info: { id: 'm1' },
@@ -126,10 +141,10 @@ describe('messageHasActiveToolWork (mirror mid-turn gate, item d4b8adcb)', () =>
 describe('recordManualPostSessionMessage — manualAnswerPostedThisTurn (item 5f75c2cb)', () => {
   const dirs = []
   beforeEach(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
   })
   after(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     for (const d of dirs) {
       try {
         fs.rmSync(d, { recursive: true, force: true })
@@ -140,7 +155,7 @@ describe('recordManualPostSessionMessage — manualAnswerPostedThisTurn (item 5f
   })
 
   function seedState(dir, extra = {}) {
-    writeState(dir, {
+    writeState({
       connectionId: '5aa9129e-aa63-4b80-a2ad-ad8c5e336bde',
       sessionId: '5546c769-0cc2-4eac-9bcf-ca91b14151c4',
       codename: 'Fierce Eagle',
@@ -148,53 +163,53 @@ describe('recordManualPostSessionMessage — manualAnswerPostedThisTurn (item 5f
     })
   }
 
-  it('sets the flag when the model posts while awaiting a remote reply', () => {
+  itInBond('sets the flag when the model posts while awaiting a remote reply', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir, { awaitingRemoteReply: true })
 
-    recordManualPostSessionMessage(dir, 'post_session_message', { message: 'done, here is the answer' })
+    recordManualPostSessionMessage('post_session_message', { message: 'done, here is the answer' })
 
-    assert.equal(readState(dir)?.manualAnswerPostedThisTurn, true)
+    assert.equal(readState()?.manualAnswerPostedThisTurn, true)
   })
 
-  it('does NOT set the flag for a plain local turn (not awaiting a remote reply)', () => {
+  itInBond('does NOT set the flag for a plain local turn (not awaiting a remote reply)', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir, { awaitingRemoteReply: false })
 
-    recordManualPostSessionMessage(dir, 'post_session_message', { message: 'a local-only post' })
+    recordManualPostSessionMessage('post_session_message', { message: 'a local-only post' })
 
-    assert.equal(readState(dir)?.manualAnswerPostedThisTurn ?? false, false)
+    assert.equal(readState()?.manualAnswerPostedThisTurn ?? false, false)
   })
 
-  it('does not set the flag or remember a hash for an empty/whitespace message', () => {
+  itInBond('does not set the flag or remember a hash for an empty/whitespace message', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir, { awaitingRemoteReply: true })
 
-    recordManualPostSessionMessage(dir, 'post_session_message', { message: '   ' })
+    recordManualPostSessionMessage('post_session_message', { message: '   ' })
 
-    const fresh = readState(dir)
+    const fresh = readState()
     assert.equal(fresh?.manualAnswerPostedThisTurn ?? false, false)
     assert.deepEqual(fresh?.recentPostedContentHashes ?? [], [])
   })
 
-  it('ignores unrelated tool names entirely', () => {
+  itInBond('ignores unrelated tool names entirely', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir, { awaitingRemoteReply: true })
 
-    recordManualPostSessionMessage(dir, 'bash', { message: 'irrelevant' })
+    recordManualPostSessionMessage('bash', { message: 'irrelevant' })
 
-    assert.equal(readState(dir)?.manualAnswerPostedThisTurn ?? false, false)
+    assert.equal(readState()?.manualAnswerPostedThisTurn ?? false, false)
   })
 })
 
 // Item 4f9515a4: content-hash dedup is turn-scoped. A prior turn's identical
 // short answer must not skip phase=answer while a live Working trail is open.
 describe('turn-scoped content-hash (item 4f9515a4)', () => {
-  it('content-hash skip is overridden when an open trail would be orphaned', () => {
+  itInBond('content-hash skip is overridden when an open trail would be orphaned', () => {
     const contentHash = hashPostedContent('7.')
     const alreadyPostedByHash = true
     const alreadyPostedByTool = false
@@ -213,7 +228,7 @@ describe('turn-scoped content-hash (item 4f9515a4)', () => {
     assert.equal(shouldSkip, false)
   })
 
-  it('content-hash skip still applies within a turn when no trail is open', () => {
+  itInBond('content-hash skip still applies within a turn when no trail is open', () => {
     const alreadyPostedByHash = true
     const alreadyPostedByTool = false
     const alreadyPostedManually = false
@@ -230,7 +245,7 @@ describe('turn-scoped content-hash (item 4f9515a4)', () => {
     assert.equal(shouldSkip, true)
   })
 
-  it('inject-turn / clearInjectTurnState clears the content-hash ring', () => {
+  itInBond('inject-turn / clearInjectTurnState clears the content-hash ring', () => {
     const afterInject = {
       awaitingRemoteReply: true,
       recentPostedContentHashes: [],

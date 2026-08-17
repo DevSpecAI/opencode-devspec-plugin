@@ -421,7 +421,7 @@ interface ConnectionState {
  */
 async function reportActivity(directory: string, verb: 'pickup' | 'keepalive' | 'complete'): Promise<void> {
   const auth = resolveDevspecAuth(directory)
-  const state = readState(directory)
+  const state = readState()
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
   const tool = { pickup: 'report_pickup', keepalive: 'report_keepalive', complete: 'report_complete' }[verb]
   try {
@@ -449,7 +449,7 @@ async function reportActivity(directory: string, verb: 'pickup' | 'keepalive' | 
  */
 export async function setBusy(directory: string, busy: boolean): Promise<void> {
   const auth = resolveDevspecAuth(directory)
-  const state = readState(directory)
+  const state = readState()
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) return
   if (state.busy === busy) {
     logPoll(`setBusy(${busy}) skipped — already ${state.busy}`)
@@ -468,7 +468,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
     })
     // patchState re-reads disk — never spread a stale snapshot here (see
     // patchState's doc: that lost-update duplicated mirrored replies).
-    patchState(directory, {
+    patchState({
       busy,
       busySince: busy ? Date.now() : null,
       stallWarnedAt: busy ? null : state.stallWarnedAt ?? null,
@@ -487,7 +487,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
   }
   await reportActivity(directory, busy ? 'pickup' : 'complete')
   if (!busy) {
-    const after = readState(directory)
+    const after = readState()
     if (after) {
       logRemoteControlStory({
         phase: 'complete_turn',
@@ -834,14 +834,14 @@ export function messageHasPendingPermissionAsk(
  * Idempotent on the timestamp — keep the first ask time so the early stall
  * clock does not reset if the event repeats.
  */
-export function markPermissionAsked(directory: string, nowMs: number = Date.now()): void {
-  const state = readState(directory)
+export function markPermissionAsked(nowMs: number = Date.now()): void {
+  const state = readState()
   if (!state) return
   if (state.permissionAskedPending && state.permissionAskedAt != null) {
     logPoll(`markPermissionAsked: already pending since ${state.permissionAskedAt}`)
     return
   }
-  patchState(directory, {
+  patchState({
     permissionAskedPending: true,
     permissionAskedAt: state.permissionAskedAt ?? nowMs,
   })
@@ -849,11 +849,11 @@ export function markPermissionAsked(directory: string, nowMs: number = Date.now(
 }
 
 /** Clear a pending permission ask (resolved / denied / replied, or busy clear). */
-export function clearPermissionAsked(directory: string): void {
-  const state = readState(directory)
+export function clearPermissionAsked(): void {
+  const state = readState()
   if (!state) return
   if (!state.permissionAskedPending && state.permissionAskedAt == null) return
-  patchState(directory, {
+  patchState({
     permissionAskedPending: false,
     permissionAskedAt: null,
   })
@@ -902,7 +902,7 @@ export async function handleQuestionAsked(
     logPoll('handleQuestionAsked: missing request id — ignored')
     return
   }
-  const state = readState(directory)
+  const state = readState()
   if (!state?.connectionId) {
     logPoll(`handleQuestionAsked: no connection for request ${requestId}`)
     return
@@ -935,7 +935,7 @@ export async function handleQuestionAsked(
       timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     })
     const messageId = extractPostedMessageId(result)
-    patchState(directory, {
+    patchState({
       pendingQuestion: {
         requestId,
         questionCount: Math.max(1, questions.length),
@@ -961,10 +961,10 @@ export async function handleQuestionAsked(
 }
 
 /** Clear a pending question after reply/reject/disconnect. */
-export function clearPendingQuestion(directory: string): void {
-  const state = readState(directory)
+export function clearPendingQuestion(): void {
+  const state = readState()
   if (!state?.pendingQuestion) return
-  patchState(directory, { pendingQuestion: null })
+  patchState({ pendingQuestion: null })
   logPoll('clearPendingQuestion: cleared')
 }
 
@@ -978,7 +978,7 @@ export async function replyPendingQuestion(input: {
   answerText: string
 }): Promise<boolean> {
   const { client, directory, answerText } = input
-  const state = readState(directory)
+  const state = readState()
   const pending = state?.pendingQuestion
   if (!state || !pending?.requestId) return false
   const text = answerText.trim()
@@ -996,7 +996,7 @@ export async function replyPendingQuestion(input: {
       OPENCODE_SESSION_API_TIMEOUT_MS,
       'question.reply',
     )
-    clearPendingQuestion(directory)
+    clearPendingQuestion()
     logPoll(`replyPendingQuestion: replied to ${pending.requestId}`)
     logRemoteControlStory({
       phase: 'inject',
@@ -1025,7 +1025,7 @@ export async function rejectPendingQuestion(input: {
   reason?: string
 }): Promise<void> {
   const { client, directory, reason } = input
-  const state = readState(directory)
+  const state = readState()
   const pending = state?.pendingQuestion
   if (!state || !pending?.requestId) return
   try {
@@ -1037,12 +1037,11 @@ export async function rejectPendingQuestion(input: {
   } catch (err) {
     logPoll(`rejectPendingQuestion: reject call failed: ${err}`)
   }
-  clearPendingQuestion(directory)
+  clearPendingQuestion()
   const auth = resolveDevspecAuth(directory)
   if (auth.ok && auth.token && auth.mcp_url) {
     await failOpenTrailTurn(
       auth,
-      directory,
       state,
       reason ?? 'OpenCode question was dismissed before an answer arrived.',
     )
@@ -1188,12 +1187,12 @@ export function messageHasPostSessionMessageTool(
   return false
 }
 
-function rememberPostedContentHash(directory: string, hash: string): void {
-  const state = readState(directory)
+function rememberPostedContentHash(hash: string): void {
+  const state = readState()
   if (!state) return
   const prev = state.recentPostedContentHashes ?? []
   if (prev.includes(hash)) return
-  patchState(directory, {
+  patchState({
     recentPostedContentHashes: [...prev, hash].slice(-40),
   })
 }
@@ -1214,7 +1213,7 @@ function rememberPostedContentHash(directory: string, hash: string): void {
  * OpenCode turn (not remote-injected) has no turn to scope it to, and this
  * flag must never suppress an unrelated later remote turn's mirror.
  */
-export function recordManualPostSessionMessage(directory: string, toolName: string, args: unknown): void {
+export function recordManualPostSessionMessage(toolName: string, args: unknown): void {
   const lower = String(toolName ?? '').toLowerCase()
   if (
     lower !== 'post_session_message' &&
@@ -1234,10 +1233,10 @@ export function recordManualPostSessionMessage(directory: string, toolName: stri
     return
   }
   const hash = hashPostedContent(message)
-  rememberPostedContentHash(directory, hash)
-  const state = readState(directory)
+  rememberPostedContentHash(hash)
+  const state = readState()
   if (state?.awaitingRemoteReply && !state.manualAnswerPostedThisTurn) {
-    patchState(directory, { manualAnswerPostedThisTurn: true })
+    patchState({ manualAnswerPostedThisTurn: true })
   }
   logPoll(
     `recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}… ` +
@@ -1344,7 +1343,7 @@ export async function checkBusyStall(
   sessionId: string,
 ): Promise<void> {
   const auth = resolveDevspecAuth(directory)
-  let state = readState(directory)
+  let state = readState()
   if (!auth.ok || !auth.token || !auth.mcp_url || !state?.busy || !state.sessionId) return
 
   // Waiting on a DevSpec-surfaced OpenCode question is not a stall — the human
@@ -1359,7 +1358,7 @@ export async function checkBusyStall(
   // Older state files may have busy:true with no busySince — seed now so we
   // don't immediately treat a mid-flight upgrade as already timed out.
   if (!state.busySince) {
-    patchState(directory, { busySince: Date.now() })
+    patchState({ busySince: Date.now() })
     logPoll(`stall check: seeded busySince for pre-existing busy=true`)
     return
   }
@@ -1412,8 +1411,8 @@ export async function checkBusyStall(
     // (session rotated under an abandoned turn — 8d0f1726). There is nothing
     // to evaluate progress against; recover immediately instead of waiting
     // out the stall timeout on a cursor that can never resolve.
-    clearAbandonedInjectCursor(directory, baselineDecision.baseline)
-    clearInjectTurnState(directory, { unclaim: true })
+    clearAbandonedInjectCursor(baselineDecision.baseline)
+    clearInjectTurnState({ unclaim: true })
     logPoll(
       `stall check: abandoned inject cursor (baseline ${baselineDecision.baseline} not in current ` +
         `session) — cleared busy/awaiting immediately`,
@@ -1436,11 +1435,11 @@ export async function checkBusyStall(
           : 0
 
   if (fromMessage && !permissionPendingFromState) {
-    patchState(directory, {
+    patchState({
       permissionAskedPending: true,
       permissionAskedAt: state.permissionAskedAt ?? Date.now() - PERMISSION_ASK_STALL_MS,
     })
-    state = readState(directory) ?? state
+    state = readState() ?? state
   }
 
   const decision = decideBusyStall({
@@ -1486,7 +1485,7 @@ export async function checkBusyStall(
         : decision.reason === 'new_assistant'
           ? assistantReasoningFingerprint(last)
           : (state.stallReasoningFingerprint ?? null)
-    patchState(directory, {
+    patchState({
       busySince: now,
       stallProgressAssistantId: decision.assistantId,
       stallActiveToolSlides: nextSlides,
@@ -1530,7 +1529,7 @@ export async function checkBusyStall(
       last_id: lastId,
     },
   })
-  patchState(directory, { stallWarnedAt: state.busySince })
+  patchState({ stallWarnedAt: state.busySince })
   const notice =
     stallReason === 'permission_asked'
       ? `⚠️ OpenCode turn stalled after a hung permission ask ` +
@@ -1544,14 +1543,14 @@ export async function checkBusyStall(
   // over and no answer is coming, so failing the open bubble (which keeps the
   // trail readable under error chrome) says more than a separate notice under a
   // turn still claiming to stream. Fall back to the notice when none is open.
-  const failedTrail = await failOpenTrailTurn(auth, directory, readState(directory) ?? state, notice)
+  const failedTrail = await failOpenTrailTurn(auth, readState() ?? state, notice)
   if (!failedTrail) await postSessionNotice(auth, state, notice)
   // Item 40279ae0: this IS the abnormal end — unclaim this turn's command ids
   // from `deliveredMessageIds` so they are eligible to re-inject, breaking the
   // seedKept>0/inject=0 hold loop a stalled-but-never-answered command used to
   // cause. `failOpenTrailTurn` above already cleared the non-unclaiming parts
   // of inject-turn state; this call additionally unclaims.
-  clearInjectTurnState(directory, { unclaim: true })
+  clearInjectTurnState({ unclaim: true })
   await setBusy(directory, false)
 }
 
@@ -1563,7 +1562,7 @@ export async function checkBusyStall(
  */
 export async function handleSessionError(directory: string, event: unknown): Promise<void> {
   const auth = resolveDevspecAuth(directory)
-  const state = readState(directory)
+  const state = readState()
   let detail = ''
   try {
     detail = JSON.stringify(event)
@@ -1578,76 +1577,101 @@ export async function handleSessionError(directory: string, event: unknown): Pro
     // Same reasoning as the stall path: close the open live-trail bubble as
     // failed so it stops streaming, keeping the trail visible; only post a
     // standalone notice when this turn never opened one.
-    const failedTrail = await failOpenTrailTurn(auth, directory, state, notice)
+    const failedTrail = await failOpenTrailTurn(auth, state, notice)
     if (!failedTrail) await postSessionNotice(auth, state, notice)
   }
   // Item 40279ae0: a session.error is an abnormal end for whatever turn was
   // in flight — unclaim its command ids so they can re-inject instead of
   // being silently swallowed forever by the delivery dedup set.
-  clearInjectTurnState(directory, { unclaim: true })
+  clearInjectTurnState({ unclaim: true })
   await setBusy(directory, false)
 }
 
 /**
- * DevSpec session id this plugin process is currently bound to. Set once
- * `recordConnectionEventFromTool` observes a successful `attach_connection`
- * carrying a session id — mirrors plugin.ts's own `lastKnownSessionId` pin
- * (same event, same moment), just keyed to the DevSpec session instead of
- * the OpenCode-internal one.
+ * THE BOND IS THE OPENCODE SESSION (item a72a4e22).
  *
- * Folding this into `stateFile`'s key (below) is what lets two `opencode
- * serve` processes for the SAME project folder — one per DevSpec session —
- * keep fully independent local state instead of silently sharing (and
- * corrupting) one file keyed on folder path alone. Before attach (or for a
- * bare, sessionless connection) this stays null and state falls back to the
- * folder-only key, unchanged from before — session-scoping only matters once
- * a session is actually in play.
+ * A remote identity belongs to one conversation, so exactly one thing may key
+ * it: the OpenCode session id that conversation runs in. Not the folder, not
+ * the repo, not the process, not the DevSpec session it happens to be attached
+ * to — those are all facts ABOUT a bond, and none of them identifies one.
+ *
+ * What this replaced, and why it had to go rather than be guarded:
+ *
+ *   - The state file was keyed on `sha256(folder)` plus, once attached, the
+ *     DevSpec session id. A bare `/devspec.remote` had no session id, so a
+ *     brand-new OpenCode window read the previous conversation's folder-keyed
+ *     file and adopted its connection, codename and room. Live 2026-08-17: a
+ *     fresh window came back as "Drifting Mongoose", already in session
+ *     8fd18ec0, and posted into it.
+ *   - Which key to read came from a process-global (`boundSessionId`) with an
+ *     AsyncLocalStorage override bolted on later for multi-bond. Two writers,
+ *     one global, and `undefined` meaning "use whatever is current".
+ *   - Because the key CHANGED at attach time, `bindSessionState` had to
+ *     scavenge up to four candidate "donor" files and merge them (d5efd533).
+ *
+ * `be952be5` already reached this conclusion on 2026-07-23 and stopped half
+ * way: it folded the DevSpec session into the key *when one was known* and
+ * left the bare path on the folder. That leftover is the whole bug.
+ *
+ * The key now never changes for the life of a conversation, which is what
+ * makes the donor merge unnecessary rather than merely unused: attach patches
+ * one record in place. OpenCode session ids are durable, so a plugin reload or
+ * process restart re-finds that session's own bond — and only its own — which
+ * is what the folder key was badly approximating.
  */
-let boundSessionId: string | null = null
+type Bond = {
+  /** DevSpec session this bond is attached to; null while sessionless. */
+  devspecSessionId: string | null
+}
 
 /**
- * Per-async-context override of `boundSessionId`. Multi-bond (item 7a9b7b0f):
- * one OpenCode process can drive several DevSpec connections; each poll /
- * inject / mirror must read and write THAT bond's state file even when
- * another bond's work is in flight on the same event loop.
- *
- * `undefined` store = not inside `runWithBoundSession` → fall back to the
- * process-global `boundSessionId`. An explicit `null` store means folder-only
- * state (sessionless bond).
+ * Live bonds in this process, keyed by OpenCode session id. The pump iterates
+ * this so a second `/devspec.remote` ADDS a bond rather than overwriting a
+ * single pin (Ivory Panda idle_timeout when Racing Dolphin attached,
+ * 2026-08-07 — item 7a9b7b0f). Multi-bond gets simpler under this key, not
+ * harder: two bonded sessions are two entries, not two candidate files
+ * reconciled through one global.
  */
-const boundSessionAls = new AsyncLocalStorage<string | null>()
+const openCodeBonds = new Map<string, Bond>()
 
-function effectiveBoundSessionId(): string | null {
-  const fromAls = boundSessionAls.getStore()
-  return fromAls === undefined ? boundSessionId : fromAls
+/**
+ * The OpenCode session whose bond the current async context is operating on.
+ *
+ * This is now the ONLY carrier of bond identity — there is no process-global
+ * beneath it and no fallback when the store is empty. Ambient async scoping is
+ * the right shape for it (every poll, inject and mirror is already one async
+ * operation belonging to exactly one bond), but it must be a hard requirement:
+ * `undefined` means "nobody said which bond", and the only safe answer to that
+ * is to touch nothing.
+ */
+const bondAls = new AsyncLocalStorage<string>()
+
+/** The current bond's OpenCode session id, or undefined outside `runWithBond`. */
+function currentBondSessionId(): string | undefined {
+  return bondAls.getStore()
 }
 
-/** Run `fn` with state reads/writes scoped to `stateKey` (DevSpec session id or null). */
-export function runWithBoundSession<T>(stateKey: string | null, fn: () => T): T {
-  return boundSessionAls.run(stateKey, fn)
+/** Run `fn` with all state reads/writes scoped to `opencodeSessionId`'s bond. */
+export function runWithBond<T>(opencodeSessionId: string, fn: () => T): T {
+  return bondAls.run(opencodeSessionId, fn)
 }
 
-export async function runWithBoundSessionAsync<T>(
-  stateKey: string | null,
+export async function runWithBondAsync<T>(
+  opencodeSessionId: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return boundSessionAls.run(stateKey, fn)
+  return bondAls.run(opencodeSessionId, fn)
 }
 
-/**
- * OpenCode session id → DevSpec state-file key (session UUID, or null for
- * folder-only / sessionless). The pump iterates this map so a second
- * `/devspec.remote` ADDS a bond instead of overwriting a single pin
- * (Ivory Panda idle_timeout when Racing Dolphin attached — 2026-08-07).
- */
-const openCodeBonds = new Map<string, string | null>()
-
-export function rememberOpenCodeBond(opencodeSessionId: string, stateKey: string | null): void {
+export function rememberOpenCodeBond(
+  opencodeSessionId: string,
+  devspecSessionId: string | null = null,
+): void {
   if (!opencodeSessionId) return
-  openCodeBonds.set(opencodeSessionId, stateKey)
+  openCodeBonds.set(opencodeSessionId, { devspecSessionId })
   logPoll(
-    `bond remember opencodeSession=${opencodeSessionId} stateKey=${stateKey ?? '(folder-only)'} ` +
-      `(active=${openCodeBonds.size})`,
+    `bond remember opencodeSession=${opencodeSessionId} ` +
+      `devspecSession=${devspecSessionId ?? '(sessionless)'} (active=${openCodeBonds.size})`,
   )
 }
 
@@ -1678,9 +1702,14 @@ export function shouldAutoAllowRemoteControlPermission(): boolean {
   return listOpenCodeBondSessions().length > 0
 }
 
-export function stateKeyForOpenCodeBond(opencodeSessionId: string): string | null | undefined {
-  if (!openCodeBonds.has(opencodeSessionId)) return undefined
-  return openCodeBonds.get(opencodeSessionId)
+/** Whether this OpenCode session holds a DevSpec bond. The gate for every side effect. */
+export function isBondedOpenCodeSession(opencodeSessionId: string): boolean {
+  return openCodeBonds.has(opencodeSessionId)
+}
+
+/** The DevSpec session a bond is attached to, or null/undefined when sessionless/unbonded. */
+export function devspecSessionForBond(opencodeSessionId: string): string | null | undefined {
+  return openCodeBonds.get(opencodeSessionId)?.devspecSessionId
 }
 
 /**
@@ -1703,227 +1732,51 @@ function hashKey(raw: string): string {
 }
 
 /**
- * Matches the key `devspec.remote.md` computes for `local_id` (see step 2
- * there) so the local state file and the server-side connection identity
- * stay in step: same folder+session in, same hash out, on both sides.
+ * The bond's state file. One input: the OpenCode session id.
  *
- * `sessionKey` overrides the process-global bind for read/migrate paths:
- * `null` = folder-only file; a string = that session id's scoped file.
+ * This is also the value passed to `register_connection` as `local_id`, so the
+ * local file and the server-side connection identity are the same fact stated
+ * twice. That symmetry is load-bearing: bond succession (`78a117ab`) revives
+ * the `(owner, local_id)` connection within a reconnect window, so a local_id
+ * derived from the FOLDER meant a brand-new conversation was handed back the
+ * previous one's connection and codename — the server half of the same bug the
+ * state key had.
  */
-function stateFileForKey(directory: string, sessionKey: string | null): string {
-  const base = path.resolve(directory)
-  const raw = sessionKey ? `${base}:${sessionKey}` : base
-  const key = hashKey(raw)
+export function bondLocalId(opencodeSessionId: string): string {
+  return hashKey(opencodeSessionId)
+}
+
+function stateFileForBond(opencodeSessionId: string): string {
   const dir = path.join(os.homedir(), '.devspec', 'opencode-remote-control')
   fs.mkdirSync(dir, { recursive: true })
-  return path.join(dir, `${key}.json`)
+  return path.join(dir, `${bondLocalId(opencodeSessionId)}.json`)
 }
 
-function stateFile(directory: string): string {
-  return stateFileForKey(directory, effectiveBoundSessionId())
-}
-
-function readStateAtKey(directory: string, sessionKey: string | null): ConnectionState | null {
+function readBondState(opencodeSessionId: string): ConnectionState | null {
   try {
-    return JSON.parse(fs.readFileSync(stateFileForKey(directory, sessionKey), 'utf8'))
+    return JSON.parse(fs.readFileSync(stateFileForBond(opencodeSessionId), "utf8"))
   } catch {
     return null
   }
 }
 
-function unlinkStateAtKey(directory: string, sessionKey: string | null): void {
-  try {
-    fs.unlinkSync(stateFileForKey(directory, sessionKey))
-  } catch {
-    /* already gone */
-  }
-}
-
-function unionIds(a?: string[] | null, b?: string[] | null): string[] | undefined {
-  if (!a?.length && !b?.length) return a ?? b ?? undefined
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const id of [...(a ?? []), ...(b ?? [])]) {
-    if (!id || seen.has(id)) continue
-    seen.add(id)
-    out.push(id)
-  }
-  return out
-}
-
-/**
- * Merge two connection-state snapshots. `primary` wins on scalar conflicts;
- * list fields are unioned. When either side is mid-inject (`awaitingRemoteReply`),
- * that side's baseline fields win so a key flip cannot drop the inject cursor.
- */
-export function mergeConnectionStates(
-  primary: ConnectionState | null | undefined,
-  secondary: ConnectionState | null | undefined,
-): ConnectionState | null {
-  if (!primary && !secondary) return null
-  if (!primary) return { ...secondary! }
-  if (!secondary) return { ...primary }
-  const awaiting = Boolean(primary.awaitingRemoteReply || secondary.awaitingRemoteReply)
-  const awaitingPrimary = primary.awaitingRemoteReply
-    ? primary
-    : secondary.awaitingRemoteReply
-      ? secondary
-      : primary
-  return {
-    ...secondary,
-    ...primary,
-    deliveredMessageIds: unionIds(secondary.deliveredMessageIds, primary.deliveredMessageIds),
-    deliveredAssignmentIds: unionIds(secondary.deliveredAssignmentIds, primary.deliveredAssignmentIds),
-    mirroredMessageIds: unionIds(secondary.mirroredMessageIds, primary.mirroredMessageIds),
-    recentPostedContentHashes: unionIds(
-      secondary.recentPostedContentHashes,
-      primary.recentPostedContentHashes,
-    ),
-    nonMirrorMessageIds: unionIds(secondary.nonMirrorMessageIds, primary.nonMirrorMessageIds),
-    awaitingRemoteReply: awaiting,
-    replyAfterOpenCodeMessageId: awaiting
-      ? awaitingPrimary.replyAfterOpenCodeMessageId
-      : (primary.replyAfterOpenCodeMessageId ?? secondary.replyAfterOpenCodeMessageId),
-    replyBaselineCaptured: awaiting
-      ? awaitingPrimary.replyBaselineCaptured
-      : (primary.replyBaselineCaptured ?? secondary.replyBaselineCaptured),
-    busy: Boolean(primary.busy || secondary.busy),
-    busySince: primary.busy
-      ? (primary.busySince ?? null)
-      : (primary.busySince ?? secondary.busySince ?? null),
-    stallWarnedAt: primary.stallWarnedAt ?? secondary.stallWarnedAt ?? null,
-    permissionAskedPending: Boolean(
-      primary.permissionAskedPending || secondary.permissionAskedPending,
-    ),
-    // Keep the earliest ask clock so a merge cannot reset the early-stall window.
-    permissionAskedAt: (() => {
-      const a = primary.permissionAskedAt ?? null
-      const b = secondary.permissionAskedAt ?? null
-      if (a == null) return b
-      if (b == null) return a
-      return Math.min(a, b)
-    })(),
-    connectMirrorSuppressed: Boolean(
-      primary.connectMirrorSuppressed || secondary.connectMirrorSuppressed,
-    ),
-  }
-}
-
-function foldConnectionStates(states: Array<ConnectionState | null | undefined>): ConnectionState | null {
-  let acc: ConnectionState | null = null
-  for (const s of states) {
-    if (!s) continue
-    if (!acc) {
-      acc = { ...s }
-      continue
-    }
-    // Prefer the awaiting snapshot as primary so inject cursors survive bind.
-    acc =
-      s.awaitingRemoteReply && !acc.awaitingRemoteReply
-        ? mergeConnectionStates(s, acc)
-        : mergeConnectionStates(acc, s)
-  }
-  return acc
-}
-
-/**
- * Flip `boundSessionId` to `sessionId` and migrate every prior key that may
- * hold live remote-control state into the canonical session-scoped file.
- *
- * Live bug (d5efd533 / Fierce Eagle): seed inject wrote `awaitingRemoteReply`
- * on the folder-only file; mid-turn `attach_connection` rebound to the full
- * UUID file without migrating — mirror then connect-skip-claimed the answer.
- * Comments already claimed this migration existed; it did not.
- */
-export function bindSessionState(
-  directory: string,
-  sessionId: string,
-  patch: Partial<ConnectionState> = {},
-): ConnectionState {
-  const donorKeys = new Set<string | null>([boundSessionId])
-  // Always consider the folder-only scratch file (register + pre-bind inject).
-  donorKeys.add(null)
-  // Short 8-char prefix — `devspec.remote.md` / attach args often use this.
-  if (sessionId.length > 8) donorKeys.add(sessionId.slice(0, 8))
-  if (boundSessionId && boundSessionId.length > 8) {
-    donorKeys.add(boundSessionId.slice(0, 8))
-  }
-
-  const donors: Array<ConnectionState | null> = []
-  for (const key of donorKeys) {
-    donors.push(readStateAtKey(directory, key))
-  }
-
-  const destBefore = readStateAtKey(directory, sessionId)
-  const firstSessionBind = !destBefore?.sessionId
-  donors.push(destBefore)
-
-  const folded = foldConnectionStates(donors)
-  if (!folded && !patch.connectionId) {
-    throw new Error('bindSessionState: no connection state to migrate')
-  }
-
-  boundSessionId = sessionId
-  const connectionId = patch.connectionId ?? folded?.connectionId
-  if (!connectionId) {
-    throw new Error('bindSessionState: connectionId required')
-  }
-
-  const next: ConnectionState = {
-    ...(folded ?? { connectionId, sessionId: null, codename: null }),
-    ...patch,
-    connectionId,
-    sessionId,
-    codename:
-      patch.codename !== undefined
-        ? patch.codename
-        : (folded?.codename ?? null),
-    // Re-apply awaiting merge after patch so an identity-only patch cannot
-    // clobber an in-flight inject cursor carried from a donor key.
-    awaitingRemoteReply: Boolean(
-      patch.awaitingRemoteReply ?? folded?.awaitingRemoteReply,
-    ),
-    replyAfterOpenCodeMessageId:
-      folded?.awaitingRemoteReply || patch.awaitingRemoteReply
-        ? (patch.replyAfterOpenCodeMessageId ?? folded?.replyAfterOpenCodeMessageId)
-        : (patch.replyAfterOpenCodeMessageId !== undefined
-            ? patch.replyAfterOpenCodeMessageId
-            : folded?.replyAfterOpenCodeMessageId),
-    replyBaselineCaptured:
-      folded?.awaitingRemoteReply || patch.awaitingRemoteReply
-        ? (patch.replyBaselineCaptured ?? folded?.replyBaselineCaptured)
-        : (patch.replyBaselineCaptured !== undefined
-            ? patch.replyBaselineCaptured
-            : folded?.replyBaselineCaptured),
-    connectMirrorSuppressed: firstSessionBind
-      ? true
-      : (patch.connectMirrorSuppressed ?? folded?.connectMirrorSuppressed),
-  }
-
-  writeState(directory, next)
-
-  // Drop donor files that are no longer the canonical key so the next cold
-  // launch cannot resume a stale folder-only snapshot beside the real one.
-  for (const key of donorKeys) {
-    if (key === sessionId) continue
-    const donorPath = stateFileForKey(directory, key)
-    const destPath = stateFileForKey(directory, sessionId)
-    if (donorPath === destPath) continue
-    unlinkStateAtKey(directory, key)
-  }
-
-  return next
-}
-
-/** Test helper — reset the process-global session bind between cases. */
-export function resetBoundSessionIdForTests(): void {
-  boundSessionId = null
+/** Test helper — drop every bond between cases. */
+export function resetBondsForTests(): void {
   openCodeBonds.clear()
 }
 
-/** Exported for regression tests (item 67794386) — prefer patchState in production paths. */
-export function readState(directory: string): ConnectionState | null {
-  return readStateAtKey(directory, effectiveBoundSessionId())
+/**
+ * The current bond's state, or null when there is no bond in scope.
+ *
+ * Reading outside `runWithBond` returns null rather than guessing. That is the
+ * whole point of the rewrite: "no bond in scope" used to fall through to a
+ * process-global and a folder-keyed file, which is how one conversation read
+ * another's connection.
+ */
+export function readState(): ConnectionState | null {
+  const bond = currentBondSessionId()
+  if (!bond) return null
+  return readBondState(bond)
 }
 
 /**
@@ -1932,8 +1785,16 @@ export function readState(directory: string): ConnectionState | null {
  * patchState — a stale `writeState({ ...inMemory })` rolls back concurrent
  * mirror claims (live: session f3af591e double-posted msg_fc80605c).
  */
-export function writeState(directory: string, state: ConnectionState): void {
-  fs.writeFileSync(stateFile(directory), JSON.stringify(state, null, 2), { mode: 0o600 })
+export function writeState(state: ConnectionState): void {
+  const bond = currentBondSessionId()
+  if (!bond) {
+    // Never write to a guessed location. A caller outside a bond scope is a
+    // bug in the caller, and silently picking a file is what this rewrite
+    // exists to stop.
+    logPoll('writeState called with no bond in scope — refused')
+    return
+  }
+  fs.writeFileSync(stateFileForBond(bond), JSON.stringify(state, null, 2), { mode: 0o600 })
 }
 
 /**
@@ -1950,16 +1811,22 @@ export function writeState(directory: string, state: ConnectionState): void {
  * advisory echo of a just-mirrored reply then re-mirrored the same OpenCode
  * message. Every mid-tick persistence must go through this helper.
  */
-export function patchState(directory: string, patch: Partial<ConnectionState>): ConnectionState | null {
-  const current = readState(directory)
+export function patchState(patch: Partial<ConnectionState>): ConnectionState | null {
+  const current = readState()
   if (!current) return null
   const next = { ...current, ...patch }
-  writeState(directory, next)
+  writeState(next)
   return next
 }
 
-function clearState(directory: string): void {
-  unlinkStateAtKey(directory, boundSessionId)
+function clearState(): void {
+  const bond = currentBondSessionId()
+  if (!bond) return
+  try {
+    fs.unlinkSync(stateFileForBond(bond))
+  } catch {
+    /* already gone */
+  }
 }
 
 /**
@@ -1971,7 +1838,7 @@ function clearState(directory: string): void {
  * Real gap found live-testing: the command completes a genuine connect
  * handshake with DevSpec's server, but never went through `ensureConnection`/
  * `attachSession` above — so no local state file was ever written, and
- * `pollAndDeliver` (gated on `readState(directory)` being non-null) silently
+ * `pollAndDeliver` (gated on `readState()` being non-null) silently
  * never activated for that session. Wire this into the `tool.execute.after`
  * plugin hook so ANY path that results in these tool calls (the command,
  * or the model doing it ad hoc) keeps local state in sync automatically —
@@ -1986,7 +1853,6 @@ function clearState(directory: string): void {
  * trusting the declared type, which is only accurate for the built-in case.
  */
 export function recordConnectionEventFromTool(
-  directory: string,
   toolName: string,
   args: unknown,
   hookOutput: unknown,
@@ -1995,6 +1861,25 @@ export function recordConnectionEventFromTool(
   const isRegister = toolName === 'devspec_register_connection' || toolName.endsWith('register_connection')
   const isAttach = toolName === 'devspec_attach_connection' || toolName.endsWith('attach_connection')
   if (!isRegister && !isAttach) return
+  // The handshake belongs to the session that performed it, and this hook fires
+  // outside any bond scope — so establish one here or there is nowhere to write.
+  // Without a session id the result cannot be attributed to any conversation,
+  // which is the same reason every other path refuses.
+  if (!opencodeSessionId) {
+    logPoll(`recordConnectionEventFromTool: ${toolName} carried no OpenCode session id — ignored`)
+    return
+  }
+  runWithBond(opencodeSessionId, () =>
+    recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessionId),
+  )
+}
+
+function recordConnectionEventInBond(
+  isRegister: boolean,
+  args: unknown,
+  hookOutput: unknown,
+  opencodeSessionId: string,
+): void {
 
   const out = (hookOutput && typeof hookOutput === 'object' ? hookOutput : {}) as Record<string, unknown>
   const mcpContent = Array.isArray(out.content) ? out.content : null
@@ -2016,32 +1901,33 @@ export function recordConnectionEventFromTool(
   const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
 
   if (isRegister) {
-    // boundSessionId isn't set yet at this point on a fresh process (attach,
-    // below, is what sets it) — this read/write still lands in the
-    // folder-only file, same as a bare connection. Attach migrates the full
-    // snapshot into the session-scoped file via bindSessionState.
-    const existing = readState(directory)
+    // This lands in THIS OpenCode session's own file, both now and after a
+    // later attach: the key is the session id and it never changes, so there is
+    // no second location for a snapshot to migrate into.
+    const existing = readState()
     const connectionId = typeof result?.connection_id === 'string' ? result.connection_id : existing?.connectionId
     if (!connectionId) return
     if (existing) {
       // Preserve awaiting/busy/baseline — a register that races an inject
       // must not wipe the inject cursor (hand-picked writeState used to).
-      patchState(directory, {
+      patchState({
         connectionId,
         codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
         connectMirrorSuppressed: true,
       })
     } else {
-      writeState(directory, {
+      writeState({
         connectionId,
         sessionId: null,
         codename: typeof result?.codename === 'string' ? result.codename : null,
         connectMirrorSuppressed: true,
       })
     }
-    // Sessionless (or pre-attach) bond: folder-only state key. A later attach
-    // in this OpenCode session upgrades the key — rememberOpenCodeBond again.
-    if (opencodeSessionId) rememberOpenCodeBond(opencodeSessionId, boundSessionId)
+    // Sessionless bond. The key does not change when this session later
+    // attaches — only the recorded devspecSessionId does.
+    if (opencodeSessionId) {
+      rememberOpenCodeBond(opencodeSessionId, devspecSessionForBond(opencodeSessionId) ?? null)
+    }
     return
   }
 
@@ -2064,16 +1950,32 @@ export function recordConnectionEventFromTool(
         ? (argsObj.connection_id as string)
         : undefined
 
-  // Migrate folder-only / short-prefix inject state into the canonical
-  // session-scoped file BEFORE any further mirror decision (d5efd533).
-  const prior = readState(directory)
+  // Attach records the room on the bond that already exists. Nothing moves:
+  // the state key is this OpenCode session and it does not change, so the
+  // inject cursor an in-flight turn is holding stays exactly where it is.
+  // That is what makes d5efd533's donor migration unnecessary rather than
+  // merely deleted — the failure it fixed (awaiting lost across a key flip)
+  // cannot occur when there is no key flip.
+  const prior = readState()
   const connectionId = connectionIdHint ?? prior?.connectionId
   if (!connectionId) return
 
-  bindSessionState(directory, sessionId, {
-    connectionId,
-    codename: prior?.codename ?? null,
-  })
+  if (!prior) {
+    writeState({
+      connectionId,
+      sessionId,
+      codename: null,
+      connectMirrorSuppressed: true,
+    })
+  } else {
+    patchState({
+      connectionId,
+      sessionId,
+      // First time this bond learns its room: suppress the connect turn's own
+      // assistant message, which is chrome for the terminal, not an answer.
+      connectMirrorSuppressed: prior.sessionId ? prior.connectMirrorSuppressed : true,
+    })
+  }
   if (opencodeSessionId) rememberOpenCodeBond(opencodeSessionId, sessionId)
 }
 
@@ -2087,14 +1989,13 @@ export function recordConnectionEventFromTool(
  * poison nonMirrorMessageIds and skip-mirror the real reply.
  */
 export function recordRemoteControlSkillCommand(
-  directory: string,
   props: Record<string, unknown> | null | undefined,
 ): void {
   if (!props) return
   if (!isDevspecRemoteControlCommand(props.name)) return
   const messageId = typeof props.messageID === 'string' ? props.messageID : null
   if (!messageId) return
-  const existing = readState(directory)
+  const existing = readState()
   if (!existing) return
   if (existing.awaitingRemoteReply) {
     logPoll(
@@ -2105,72 +2006,72 @@ export function recordRemoteControlSkillCommand(
   const ids = new Set(existing.nonMirrorMessageIds ?? [])
   if (ids.has(messageId)) return
   ids.add(messageId)
-  patchState(directory, {
+  patchState({
     nonMirrorMessageIds: Array.from(ids).slice(-50),
   })
   logPoll(`recordRemoteControlSkillCommand: skip-mirror id=${messageId} name=${props.name}`)
 }
 
 /**
- * Register (or reuse) this OpenCode instance as a DevSpec connection.
- * Idempotent per (directory, sessionId) — pass the target DevSpec session id
- * when one is already known (see `attachSession`) so this doesn't collapse
- * onto the same connection as an unrelated session against the same folder;
- * omit it only for a genuinely sessionless (bare) connection.
+ * Register (or resume) THIS OpenCode session as a DevSpec connection.
+ *
+ * Idempotent per OpenCode session and nothing else. The old signature took an
+ * optional DevSpec session id and used it to pick between candidate state
+ * files; that is what let a bare connect resume a stranger's connection. The
+ * DevSpec session is not an input to identity here — it is something a bond
+ * acquires later, at attach.
+ *
+ * `local_id` is the hash of the OpenCode session id, so the server's bond
+ * succession (`78a117ab`) revives THIS conversation's connection on a reload
+ * and nobody else's. A new conversation is a new session id, therefore a new
+ * local_id, therefore a genuinely new connection with its own codename.
  */
 export async function ensureConnection(
   directory: string,
-  sessionId?: string | null,
+  opencodeSessionId: string,
 ): Promise<{ auth: ReturnType<typeof resolveDevspecAuth>; state: ConnectionState | null; error?: string }> {
   const auth = resolveDevspecAuth(directory)
   if (!auth.ok || !auth.token || !auth.mcp_url) {
     return { auth, state: null, error: auth.error }
   }
+  if (!opencodeSessionId) {
+    return { auth, state: null, error: 'ensureConnection requires the OpenCode session id' }
+  }
 
-  if (sessionId && sessionId !== boundSessionId) {
-    const existingAnywhere =
-      readState(directory) ??
-      readStateAtKey(directory, null) ??
-      (sessionId.length > 8 ? readStateAtKey(directory, sessionId.slice(0, 8)) : null) ??
-      readStateAtKey(directory, sessionId)
-    if (existingAnywhere?.connectionId) {
-      return {
-        auth,
-        state: bindSessionState(directory, sessionId, {
-          connectionId: existingAnywhere.connectionId,
-          codename: existingAnywhere.codename,
-        }),
-      }
+  return runWithBondAsync(opencodeSessionId, async () => {
+    const existing = readState()
+    if (existing) return { auth, state: existing }
+
+    const result: any = await mcpToolsCall({
+      mcpUrl: auth.mcp_url!,
+      token: auth.token!,
+      name: 'register_connection',
+      arguments: {
+        local_id: bondLocalId(opencodeSessionId),
+        agent_name: AGENT_NAME,
+        cwd: directory,
+      },
+      timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    })
+
+    const state: ConnectionState = {
+      connectionId: result.connection_id,
+      sessionId: null,
+      codename: result.codename ?? null,
     }
-    boundSessionId = sessionId
-  } else if (sessionId) {
-    boundSessionId = sessionId
-  }
-  const existing = readState(directory)
-  if (existing) return { auth, state: existing }
-
-  const base = path.resolve(directory)
-  const localId = hashKey(sessionId ? `${base}:${sessionId}` : base)
-  const result: any = await mcpToolsCall({
-    mcpUrl: auth.mcp_url,
-    token: auth.token,
-    name: 'register_connection',
-    arguments: { local_id: localId, agent_name: AGENT_NAME, cwd: directory },
-    timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+    writeState(state)
+    rememberOpenCodeBond(opencodeSessionId, null)
+    return { auth, state }
   })
-
-  const state: ConnectionState = {
-    connectionId: result.connection_id,
-    sessionId: null,
-    codename: result.codename ?? null,
-  }
-  writeState(directory, state)
-  return { auth, state }
 }
 
-/** Attach the connection to a DevSpec session — `/devspec.remote --session <id>`. */
-export async function attachSession(directory: string, sessionId: string): Promise<void> {
-  const { auth, state } = await ensureConnection(directory, sessionId)
+/** Attach this session's connection to a DevSpec session — `/devspec.remote --session <id>`. */
+export async function attachSession(
+  directory: string,
+  opencodeSessionId: string,
+  sessionId: string,
+): Promise<void> {
+  const { auth, state } = await ensureConnection(directory, opencodeSessionId)
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) throw new Error(auth.error || 'DevSpec not configured')
   const result: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
@@ -2181,19 +2082,20 @@ export async function attachSession(directory: string, sessionId: string): Promi
   })
   const canonicalSessionId =
     typeof result?.session_id === 'string' ? result.session_id : sessionId
-  bindSessionState(directory, canonicalSessionId, {
-    connectionId: state.connectionId,
-    codename: state.codename,
+  // No key flip, so no migration: the same file gains a room.
+  runWithBond(opencodeSessionId, () => {
+    patchState({ sessionId: canonicalSessionId, connectMirrorSuppressed: true })
   })
+  rememberOpenCodeBond(opencodeSessionId, canonicalSessionId)
 }
 
 /** Detach + mark the connection offline — `/devspec.remote-stop`. */
-export async function stopConnection(directory: string): Promise<void> {
+export async function stopConnection(directory: string, opencodeSessionId: string): Promise<void> {
   const auth = resolveDevspecAuth(directory)
-  const state = readState(directory)
+  const state = runWithBond(opencodeSessionId, () => readState())
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
-    clearState(directory)
-    boundSessionId = null
+    runWithBond(opencodeSessionId, () => clearState())
+    forgetOpenCodeBond(opencodeSessionId)
     return
   }
   try {
@@ -2205,8 +2107,8 @@ export async function stopConnection(directory: string): Promise<void> {
       timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
     })
   } finally {
-    clearState(directory)
-    boundSessionId = null
+    runWithBond(opencodeSessionId, () => clearState())
+    forgetOpenCodeBond(opencodeSessionId)
   }
 }
 
@@ -2530,7 +2432,7 @@ export async function pollAndDeliver(
   // later writes in the same call compose on top of earlier ones instead of reverting
   // them. A single snapshot spread into several writes is a real bug this file has had
   // twice (delivery bookkeeping erased mid-cycle, causing re-delivery).
-  let state = readState(directory)
+  let state = readState()
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
     // Not connected yet (no `/devspec.remote` run). Idle cheaply — and note this costs
     // NO network calls, unlike the interval it replaces.
@@ -2570,7 +2472,7 @@ export async function pollAndDeliver(
       codename: state.codename,
       busy: true,
     })
-    state = readState(directory) ?? state
+    state = readState() ?? state
   } else if (state.sessionId) {
     maybeWarnPresenceGap({
       connectionId: state.connectionId,
@@ -2739,7 +2641,7 @@ export async function pollAndDeliver(
     logPoll(`server attachment ${state.sessionId ?? '(none)'} → ${adopt.sessionId ?? '(none)'}`)
     // patchState — never writeState a stale full snapshot (mirror claims race).
     state =
-      patchState(directory, {
+      patchState({
         sessionId: adopt.sessionId,
         lastDeliveredMessageId: null,
       }) ?? { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
@@ -2929,7 +2831,7 @@ export async function pollAndDeliver(
     pump.cursor = nextCursor
     if (pump.cursor !== state.lastDeliveredMessageId) {
       state =
-        patchState(directory, { lastDeliveredMessageId: pump.cursor }) ?? {
+        patchState({ lastDeliveredMessageId: pump.cursor }) ?? {
           ...state,
           lastDeliveredMessageId: pump.cursor,
         }
@@ -3017,7 +2919,7 @@ export async function pollAndDeliver(
     if (freshDispatches.length > 0) {
       deliveryPatch.deliveredAssignmentIds = Array.from(pump.deliveredDispatchIds).slice(-50)
     }
-    state = patchState(directory, deliveryPatch) ?? { ...state, ...deliveryPatch }
+    state = patchState(deliveryPatch) ?? { ...state, ...deliveryPatch }
   }
 
   // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
@@ -3041,7 +2943,7 @@ export async function pollAndDeliver(
     // otherwise soft-drop). Drop only the last batch from the set.
     for (const id of commandIds) deliveredIds.delete(id)
     const stillCurrent = new Set(commandIds)
-    patchState(directory, {
+    patchState({
       deliveredMessageIds: Array.from(deliveredIds).slice(-50),
       currentTurnMessageIds: (state.currentTurnMessageIds ?? []).filter((id) => !stillCurrent.has(id)),
     })
@@ -3069,8 +2971,8 @@ export async function pollAndDeliver(
       reason: `/${controlSlash.kind}`,
       data: { commands: commands.length, ...modelStoryData(model) },
     })
-    const injectStateKey = effectiveBoundSessionId()
-    void runWithBoundSessionAsync(injectStateKey, () =>
+    const injectStateKey = sessionId
+    void runWithBondAsync(injectStateKey, () =>
       executeOwnerControlSlash({
         client,
         directory,
@@ -3157,7 +3059,7 @@ export async function pollAndDeliver(
   // Turn-scope the content-hash ring (item 4f9515a4): a prior turn's "7." must
   // not suppress this turn's identical short answer, or the live Working trail
   // stays streaming forever with empty content.
-  patchState(directory, {
+  patchState({
     awaitingRemoteReply: true,
     recentPostedContentHashes: [],
     manualAnswerPostedThisTurn: false,
@@ -3179,8 +3081,8 @@ export async function pollAndDeliver(
 
   // Capture this bond's state key so fire-and-forget deliver keeps writing the
   // right file even if the pump moves on to another OpenCode session (7a9b7b0f).
-  const injectStateKey = effectiveBoundSessionId()
-  void runWithBoundSessionAsync(injectStateKey, () =>
+  const injectStateKey = sessionId
+  void runWithBondAsync(injectStateKey, () =>
     deliverInjectedTurn({
       client,
       directory,
@@ -3231,11 +3133,10 @@ async function resolveControlSlashModel(
 }
 
 async function postControlSlashAnswer(
-  directory: string,
   auth: { ok: boolean; token?: string; mcp_url?: string },
   message: string,
 ): Promise<void> {
-  const state = readState(directory)
+  const state = readState()
   if (!state || !auth.ok || !auth.token || !auth.mcp_url) return
   if (!state.sessionId && !state.connectionId) return
   try {
@@ -3263,10 +3164,11 @@ async function postControlSlashAnswer(
  * (`ConnectionState.sessionId`), calling `create_session` / `attach_connection`,
  * or posting chrome into the DevSpec transcript.
  *
- * The previous bug called `bindSessionState(directory, newOpenCodeId)`, which
- * treated the OpenCode session id as the DevSpec session key and briefly
- * rewrote `state.sessionId` — that looked like a new DevSpec room and could
- * trip server-attachment adopt / re-delivery.
+ * The state file follows the bond to the new OpenCode session (that IS the key
+ * now — item a72a4e22), while `state.sessionId` keeps naming the same DevSpec
+ * room. An earlier version conflated those two and briefly rewrote the room id,
+ * which looked like a new DevSpec session and could trip server-attachment
+ * adopt / re-delivery.
  */
 export async function wipeOpenCodeContextInPlace(input: {
   client: Parameters<Plugin>[0]['client']
@@ -3275,7 +3177,11 @@ export async function wipeOpenCodeContextInPlace(input: {
   opencodeSessionId: string
 }): Promise<{ newOpenCodeSessionId: string; preservedDevspecSessionId: string | null }> {
   const { client, directory, opencodeSessionId } = input
-  const before = readState(directory)
+  // Read the bond being transferred explicitly rather than relying on the
+  // caller's ambient scope: this function is handed the session id, so it does
+  // not need to be told twice, and a transfer that read the wrong bond would be
+  // the exact class of bug this rewrite removes.
+  const before = runWithBond(opencodeSessionId, () => readState())
   const preservedDevspecSessionId = before?.sessionId ?? null
 
   const created = await withTimeout(
@@ -3289,43 +3195,40 @@ export async function wipeOpenCodeContextInPlace(input: {
   const newId = typeof session?.id === 'string' ? session.id : null
   if (!newId) throw new Error('session.create returned no id')
 
-  // Prefer the bond's DevSpec state key (session UUID or null folder-only).
-  // Fall back to the ALS / process bind or the on-disk DevSpec session id —
-  // never to the OpenCode session id (that was the old bindSessionState bug).
-  const priorKey = stateKeyForOpenCodeBond(opencodeSessionId)
-  const stateKey: string | null =
-    priorKey !== undefined
-      ? priorKey
-      : (effectiveBoundSessionId() ?? preservedDevspecSessionId)
-
+  // The bond MOVES to the fresh OpenCode session, and because the state file
+  // is keyed on that id, moving it is a real file transfer. This is the one
+  // place a transfer legitimately happens — a deliberate, explicit hand-off of
+  // one bond from one conversation to its replacement — as opposed to the
+  // ambient donor-scavenging that used to run on every attach and could pick
+  // up a stranger's file.
+  //
+  // The DevSpec room is preserved: the same connection, the same session, now
+  // driven from the blank chat.
+  const carried = before
+  runWithBond(opencodeSessionId, () => clearState())
   forgetOpenCodeBond(opencodeSessionId)
-  rememberOpenCodeBond(newId, stateKey)
+  rememberOpenCodeBond(newId, preservedDevspecSessionId)
 
-  // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery cursors
-  // (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room transcript
-  // is not re-injected into the blank chat.
-  patchState(directory, {
-    lastMirroredMessageId: null,
-    replyAfterOpenCodeMessageId: null,
-    replyBaselineCaptured: undefined,
-    awaitingRemoteReply: false,
-    pendingQuestion: null,
+  runWithBond(newId, () => {
+    if (carried) {
+      writeState({
+        ...carried,
+        sessionId: preservedDevspecSessionId ?? carried.sessionId ?? null,
+        // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery
+        // cursors (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room
+        // transcript is not re-injected into the blank chat.
+        lastMirroredMessageId: null,
+        replyAfterOpenCodeMessageId: null,
+        replyBaselineCaptured: undefined,
+        awaitingRemoteReply: false,
+        pendingQuestion: null,
+      })
+    }
   })
-
-  // Explicitly do NOT call bindSessionState with newId — DevSpec session_id
-  // and the state-file key stay on the prior room.
-  const after = readState(directory)
-  if (
-    preservedDevspecSessionId &&
-    after?.sessionId &&
-    after.sessionId !== preservedDevspecSessionId
-  ) {
-    patchState(directory, { sessionId: preservedDevspecSessionId })
-  }
 
   logPoll(
     `wipeOpenCodeContextInPlace: ${opencodeSessionId} → ${newId} ` +
-      `(devspecSession=${preservedDevspecSessionId ?? '(none)'}, stateKey=${stateKey ?? '(folder-only)'})`,
+      `(devspecSession=${preservedDevspecSessionId ?? '(none)'}, state moved to the new session's key)`,
   )
   return { newOpenCodeSessionId: newId, preservedDevspecSessionId }
 }
@@ -3411,15 +3314,15 @@ export async function executeOwnerControlSlash(input: {
       }
     }
     if (!silentSuccess) {
-      await postControlSlashAnswer(directory, auth, controlSlashSuccessMessage(command))
+      await postControlSlashAnswer(auth, controlSlashSuccessMessage(command))
     }
     logRemoteControlStory({
       phase: 'inject',
       outcome: 'kicked',
-      connectionId: readState(directory)?.connectionId ?? null,
-      sessionId: readState(directory)?.sessionId ?? null,
+      connectionId: readState()?.connectionId ?? null,
+      sessionId: readState()?.sessionId ?? null,
       agent: AGENT_NAME,
-      codename: readState(directory)?.codename ?? null,
+      codename: readState()?.codename ?? null,
       tool: 'session.control',
       reason: `/${label}`,
       data: { ok: true, silent: silentSuccess },
@@ -3429,17 +3332,16 @@ export async function executeOwnerControlSlash(input: {
     logPoll(`control slash /${label} failed: ${reason}`)
     // Failures still surface — silent only applies to a successful /new wipe.
     await postControlSlashAnswer(
-      directory,
       auth,
       `⚠️ \`/${label}\` failed: ${reason}`,
     )
     logRemoteControlStory({
       phase: 'inject',
       outcome: 'failed',
-      connectionId: readState(directory)?.connectionId ?? null,
-      sessionId: readState(directory)?.sessionId ?? null,
+      connectionId: readState()?.connectionId ?? null,
+      sessionId: readState()?.sessionId ?? null,
       agent: AGENT_NAME,
-      codename: readState(directory)?.codename ?? null,
+      codename: readState()?.codename ?? null,
       tool: 'session.control',
       reason: `/${label}`,
       data: { error: reason },
@@ -3448,7 +3350,7 @@ export async function executeOwnerControlSlash(input: {
     // Abort (and any mid-busy control) must clear Working without waiting for
     // a model reply that will never arrive.
     await setBusy(directory, false)
-    clearInjectTurnState(directory)
+    clearInjectTurnState()
   }
 }
 
@@ -3466,7 +3368,7 @@ export async function deliverInjectedTurn(input: {
   model?: { providerID: string; modelID: string }
 }): Promise<void> {
   const { client, directory, sessionId, auth, text, fileParts, model } = input
-  let state = readState(directory)
+  let state = readState()
   if (!state) return
 
   try {
@@ -3498,7 +3400,7 @@ export async function deliverInjectedTurn(input: {
       lastTrailPostedAt: null,
     } as const
     state =
-      patchState(directory, {
+      patchState({
         replyAfterOpenCodeMessageId: replyAfter,
         replyBaselineCaptured: baselineCaptured,
         awaitingRemoteReply: true,
@@ -3555,7 +3457,7 @@ export async function deliverInjectedTurn(input: {
     }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
-    const freshForNotice = readState(directory) ?? state
+    const freshForNotice = readState() ?? state
     if (freshForNotice.sessionId && auth.ok && auth.token && auth.mcp_url) {
       await mcpToolsCall({
         mcpUrl: auth.mcp_url,
@@ -3578,7 +3480,7 @@ export async function deliverInjectedTurn(input: {
     // started this turn — unclaim so the command is eligible to re-inject on
     // the next poll instead of being silently swallowed forever.
     await setBusy(directory, false)
-    clearInjectTurnState(directory, { unclaim: true })
+    clearInjectTurnState({ unclaim: true })
     return
   }
 
@@ -3658,13 +3560,12 @@ export function scopeAssistantsAfterBaseline<T extends { info?: { id?: string } 
  * rotate). Returns true when state was cleared.
  */
 export function clearAbandonedInjectCursor(
-  directory: string,
   baseline: string,
 ): boolean {
   logPoll(
     `mirrorLatestReply: clearing abandoned inject cursor — baseline ${baseline} not in current OpenCode session`,
   )
-  const next = patchState(directory, {
+  const next = patchState({
     awaitingRemoteReply: false,
     replyAfterOpenCodeMessageId: null,
     replyBaselineCaptured: undefined,
@@ -3698,8 +3599,9 @@ export const MIRROR_SETTLE_MS = 2_000
 const mirrorGuards = new Map<string, { at: number; inFlight: boolean }>()
 const mirrorSettleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-function mirrorGuardKey(directory: string, sessionId: string): string {
-  return `${path.resolve(directory)}::${sessionId}`
+/** In-memory debounce/guard key. The OpenCode session id is already unique. */
+function mirrorGuardKey(sessionId: string): string {
+  return sessionId
 }
 
 export async function mirrorNow(
@@ -3708,13 +3610,13 @@ export async function mirrorNow(
   sessionId: string,
   { force = false }: { force?: boolean } = {},
 ): Promise<void> {
-  const bondKey = stateKeyForOpenCodeBond(sessionId)
+  const bonded = isBondedOpenCodeSession(sessionId)
   const run = async () => {
     const auth = resolveDevspecAuth(directory)
-    const state = readState(directory)
+    const state = readState()
     if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId) return
 
-    const key = mirrorGuardKey(directory, sessionId)
+    const key = mirrorGuardKey(sessionId)
     const guard = mirrorGuards.get(key) ?? { at: 0, inFlight: false }
     if (guard.inFlight) return
     if (!force && Date.now() - guard.at < MIRROR_MIN_GAP_MS) return
@@ -3730,7 +3632,7 @@ export async function mirrorNow(
       mirrorGuards.set(key, guard)
     }
   }
-  if (bondKey === undefined) {
+  if (!bonded) {
     // FAIL CLOSED (item 2a5d212b). `undefined` means this OpenCode session has no
     // bond — an @explore child, a sibling tab, an ordinary interactive chat that
     // never ran /devspec.remote. It used to mean "run against whatever the
@@ -3744,7 +3646,7 @@ export async function mirrorNow(
     logPoll(`mirrorNow: opencodeSession=${sessionId} has no bond — inert`)
     return
   }
-  await runWithBoundSessionAsync(bondKey, run)
+  await runWithBondAsync(sessionId, run)
 }
 
 /**
@@ -3756,7 +3658,7 @@ export function scheduleMirrorNow(
   directory: string,
   sessionId: string,
 ): void {
-  const key = mirrorGuardKey(directory, sessionId)
+  const key = mirrorGuardKey(sessionId)
   const prev = mirrorSettleTimers.get(key)
   if (prev) clearTimeout(prev)
   const timer = setTimeout(() => {
@@ -3776,7 +3678,7 @@ export function flushMirrorNow(
   directory: string,
   sessionId: string,
 ): void {
-  const key = mirrorGuardKey(directory, sessionId)
+  const key = mirrorGuardKey(sessionId)
   const prev = mirrorSettleTimers.get(key)
   if (prev) clearTimeout(prev)
   mirrorSettleTimers.delete(key)
@@ -3806,7 +3708,7 @@ export function scheduleWorkTrailPost(
   directory: string,
   sessionId: string,
 ): void {
-  const key = mirrorGuardKey(directory, sessionId)
+  const key = mirrorGuardKey(sessionId)
   void postWorkTrail(client, directory, sessionId)
   // Whatever arrives during the gap still reaches the room: schedule one trailing
   // publish so the last update before a quiet stretch is never the one dropped.
@@ -3835,15 +3737,15 @@ export async function postWorkTrail(
   sessionId: string,
   { force = false, seed = false }: { force?: boolean; seed?: boolean } = {},
 ): Promise<void> {
-  const bondKey = stateKeyForOpenCodeBond(sessionId)
+  const bonded = isBondedOpenCodeSession(sessionId)
   const run = async () => {
     const auth = resolveDevspecAuth(directory)
-    const state = readState(directory)
+    const state = readState()
     if (!auth.ok || !auth.token || !auth.mcp_url) return
     if (!state?.sessionId || !state.connectionId) return
     if (!state.busy && !state.awaitingRemoteReply) return
 
-    const key = mirrorGuardKey(directory, sessionId)
+    const key = mirrorGuardKey(sessionId)
     const guard = trailGuards.get(key) ?? { inFlight: false, pending: false }
     if (guard.inFlight) {
       // A trailing timer alone is not enough: if it fires while this post is
@@ -3899,7 +3801,7 @@ export async function postWorkTrail(
     trailGuards.set(key, guard)
     // Claim the throttle window before the round-trip so concurrent updates during
     // it do not queue a second identical post behind this one.
-    patchState(directory, { lastTrailHash: trailHash, lastTrailPostedAt: Date.now() })
+    patchState({ lastTrailHash: trailHash, lastTrailPostedAt: Date.now() })
     try {
       const result = await mcpToolsCall({
         mcpUrl: auth.mcp_url,
@@ -3909,14 +3811,14 @@ export async function postWorkTrail(
         timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
       })
       const messageId = extractPostedMessageId(result)
-      if (messageId && messageId !== readState(directory)?.activeTrailMessageId) {
-        patchState(directory, { activeTrailMessageId: messageId })
+      if (messageId && messageId !== readState()?.activeTrailMessageId) {
+        patchState({ activeTrailMessageId: messageId })
         logPoll(`postWorkTrail: opened live trail turn ${messageId}`)
       }
     } catch (err) {
       // Roll the hash back so the next update retries rather than assuming this
       // body already landed.
-      patchState(directory, { lastTrailHash: state.lastTrailHash ?? null })
+      patchState({ lastTrailHash: state.lastTrailHash ?? null })
       logPoll(`postWorkTrail: post_session_message(phase=trail) failed: ${err}`)
     } finally {
       const stillPending = guard.pending
@@ -3928,7 +3830,7 @@ export async function postWorkTrail(
       }
     }
   }
-  if (bondKey === undefined) {
+  if (!bonded) {
     // FAIL CLOSED (item 2a5d212b) — same rule as mirrorNow above. An unbonded
     // session's tool calls and reasoning are not a trail of any remote turn, and
     // publishing them under the bonded connection's identity is a leak, not a
@@ -3936,7 +3838,7 @@ export async function postWorkTrail(
     logPoll(`postWorkTrail: opencodeSession=${sessionId} has no bond — inert`)
     return
   }
-  await runWithBoundSessionAsync(bondKey, run)
+  await runWithBondAsync(sessionId, run)
 }
 
 /**
@@ -4027,8 +3929,8 @@ export function parsePostedToolJson(result: unknown): Record<string, unknown> | 
  * `ConnectionState`. A CLEAN end must never pass `unclaim: true` — the
  * command really was answered, and re-injecting it would duplicate the turn.
  */
-export function clearInjectTurnState(directory: string, opts: { unclaim?: boolean } = {}): void {
-  const state = readState(directory)
+export function clearInjectTurnState(opts: { unclaim?: boolean } = {}): void {
+  const state = readState()
   if (!state) return
   const patch: Partial<ConnectionState> = {
     awaitingRemoteReply: false,
@@ -4051,12 +3953,12 @@ export function clearInjectTurnState(directory: string, opts: { unclaim?: boolea
         `so they can re-inject on the next poll: ${Array.from(stuck).join(', ')}`,
     )
   }
-  patchState(directory, patch)
+  patchState(patch)
 }
 
 /** Forget this turn's trail bookkeeping once the turn has landed. */
-function clearTrailState(directory: string): void {
-  patchState(directory, {
+function clearTrailState(): void {
+  patchState({
     activeTrailMessageId: null,
     lastTrailHash: null,
     lastTrailPostedAt: null,
@@ -4080,7 +3982,6 @@ function clearTrailState(directory: string): void {
  */
 async function failOpenTrailTurn(
   auth: ReturnType<typeof resolveDevspecAuth>,
-  directory: string,
   state: ConnectionState,
   reason: string,
 ): Promise<boolean> {
@@ -4107,7 +4008,7 @@ async function failOpenTrailTurn(
     // over from this connection's point of view. Callers that know the end
     // was ABNORMAL (checkBusyStall, handleSessionError) additionally unclaim
     // this turn's ids at their own call site right after this returns.
-    clearInjectTurnState(directory)
+    clearInjectTurnState()
     return false
   }
   const messageId = extractPostedMessageId(result) ?? state.activeTrailMessageId ?? null
@@ -4124,7 +4025,7 @@ async function failOpenTrailTurn(
   })
   // Item 40279ae0: same reasoning as the abandon branch above — a closed
   // trail turn means this connection's remote turn is over.
-  clearInjectTurnState(directory)
+  clearInjectTurnState()
   return true
 }
 
@@ -4163,7 +4064,7 @@ async function mirrorLatestReply(
   // Always re-read disk before the dedup decision — a concurrent setBusy /
   // prior mirror may have advanced the cursor since `state` was snapshotted
   // at the top of pollAndDeliver.
-  const fresh = readState(directory) ?? state
+  const fresh = readState() ?? state
   const alreadyMirrored = new Set(fresh.mirroredMessageIds ?? [])
   const baseline = fresh.replyAfterOpenCodeMessageId ?? null
   const baselineCaptured = fresh.replyBaselineCaptured
@@ -4185,12 +4086,12 @@ async function mirrorLatestReply(
       return
     }
     if (decision.action === 'clear_abandoned') {
-      clearAbandonedInjectCursor(directory, decision.baseline)
+      clearAbandonedInjectCursor(decision.baseline)
       // Item 40279ae0: an abandoned cursor is an abnormal end for whatever
       // command(s) this turn claimed — unclaim them so they can re-inject
       // against the (now current) OpenCode session instead of being
       // silently swallowed forever by the delivery dedup set.
-      clearInjectTurnState(directory, { unclaim: true })
+      clearInjectTurnState({ unclaim: true })
       await setBusy(directory, false)
       return
     }
@@ -4307,7 +4208,7 @@ async function mirrorLatestReply(
         data: { message_id: last.info.id },
       })
       alreadyMirrored.add(last.info.id)
-      patchState(directory, {
+      patchState({
         lastMirroredMessageId: last.info.id,
         mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
         connectMirrorSuppressed: false,
@@ -4379,12 +4280,11 @@ async function mirrorLatestReply(
     // server owns the open-turn pointer, not local activeTrailMessageId.
     await failOpenTrailTurn(
       auth,
-      directory,
       fresh,
       '⚠️ The remote agent finished this turn without an answer — only operational output. The work above is what it did.',
     )
     alreadyMirrored.add(last.info.id)
-    patchState(directory, {
+    patchState({
       lastMirroredMessageId: last.info.id,
       mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
       awaitingRemoteReply: false,
@@ -4450,7 +4350,7 @@ async function mirrorLatestReply(
       data: { message_id: last.info.id },
     })
     alreadyMirrored.add(last.info.id)
-    patchState(directory, {
+    patchState({
       lastMirroredMessageId: last.info.id,
       mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
       awaitingRemoteReply: false,
@@ -4476,7 +4376,7 @@ async function mirrorLatestReply(
   // both write. Whichever claims second sees the id already in the set and
   // skips. If the post fails we roll the claim back so a later poll can retry.
   alreadyMirrored.add(last.info.id)
-  const claimed = patchState(directory, {
+  const claimed = patchState({
     lastMirroredMessageId: last.info.id,
     mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
     awaitingRemoteReply: false,
@@ -4556,9 +4456,9 @@ async function mirrorLatestReply(
     }
   } catch (err) {
     // Roll back the optimistic claim so this reply can be retried.
-    const ids = (readState(directory)?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id)
-    const hashes = (readState(directory)?.recentPostedContentHashes ?? []).filter((h) => h !== contentHash)
-    patchState(directory, {
+    const ids = (readState()?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id)
+    const hashes = (readState()?.recentPostedContentHashes ?? []).filter((h) => h !== contentHash)
+    patchState({
       lastMirroredMessageId: fresh.lastMirroredMessageId ?? null,
       mirroredMessageIds: ids,
       awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
@@ -4590,7 +4490,7 @@ async function mirrorLatestReply(
   // Answer landed: the trail turn is closed server-side, so this connection has
   // no open bubble any more. Clearing the pointer is what lets the NEXT turn open
   // a fresh one instead of appending to a turn that already has an answer.
-  clearTrailState(directory)
+  clearTrailState()
 
   logPoll(
     `mirrorLatestReply: posted last.id=${last.info.id} via connection_id` +
