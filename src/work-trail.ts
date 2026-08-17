@@ -7,10 +7,11 @@
  * turns whatever OpenCode has produced SO FAR into one cumulative blob that
  * `post_session_message({ phase: 'trail' })` grows on a single DevSpec turn.
  *
- * UNFILTERED, deliberately. The mirror path (`prepareMirrorText`) strips connect
- * banners and operational chrome because the answer must read as an answer; the
- * trail is the opposite surface — it is what the terminal shows, tool calls,
- * reasoning, failures and all. The only thing this module shortens is a single
+ * UNFILTERED, deliberately — and since item 68cc567c the answer path is too.
+ * The mirror used to strip banners and "operational chrome" so an answer would
+ * read as an answer, which is exactly the guessing that published "Done." into a
+ * room; a handshake turn is now excluded by what it did, so both surfaces carry
+ * the model's words as written. The only thing this module shortens is a single
  * enormous tool output, and it says so in place rather than dropping it silently.
  *
  * Pure functions: no OpenCode client, no filesystem, no network. The transport

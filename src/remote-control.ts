@@ -51,11 +51,10 @@ import {
   type CarriedContext,
 } from './poll-turn.js'
 import {
+  collapseOrphanMarkdownFences,
   isDevspecRemoteControlCommand,
-  prepareMirrorText,
-  shouldClaimConnectTurnSuppress,
   shouldDeferInjectDuringConnect,
-  shouldSkipConnectTurnMirror,
+  unwrapSingleOuterMarkdownFence,
 } from './mirror-chrome.js'
 import { logRemoteControlStory } from './remote-control-story.js'
 import {
@@ -71,15 +70,9 @@ import {
 } from './opencode-control-slash.js'
 
 export {
-  REMOTE_STATUS_BANNER,
   collapseOrphanMarkdownFences,
   isDevspecRemoteControlCommand,
-  isOperationalChrome,
-  prepareMirrorText,
-  shouldClaimConnectTurnSuppress,
   shouldDeferInjectDuringConnect,
-  shouldSkipConnectTurnMirror,
-  stripRemoteControlBanner,
   unwrapSingleOuterMarkdownFence,
 } from './mirror-chrome.js'
 
@@ -374,10 +367,24 @@ interface ConnectionState {
    */
   nonMirrorMessageIds?: string[]
   /**
-   * Set on register / first attach so a connect-turn mirror that races ahead
-   * of `command.executed` is still skipped. Cleared once that skip lands or
-   * a real post-inject mirror runs. Not set on re-attach to an already-bound
-   * session (avoids eating a normal TUI reply after a mid-session reattach).
+   * This turn is the plugin's OWN protocol (a DevSpec connect handshake), so
+   * it produces no room post — item 68cc567c.
+   *
+   * Set the moment `tool.execute.after` observes `register_connection` /
+   * `attach_connection`, which happens DURING the turn, and cleared when that
+   * turn settles. It records WHAT THE TURN DID, not what it said.
+   *
+   * The predecessor was a pair of message-id/flag heuristics with a text-shaped
+   * override: suppression was claimed only when the model's output looked like
+   * pure chrome, so a connect turn that printed anything else fell through and
+   * posted. That is how the word "Done." reached DevSpec session 8fd18ec0 on
+   * 2026-08-17, months after c13d846c marked the case fixed. b156e680 and
+   * 1f1bafa4 were both patches to the same guess.
+   *
+   * Marking at tool-call time also removes b156e680's failure mode at the root:
+   * it existed because `command.executed` arrives at the END of a turn and could
+   * tag a LATER answer turn, which then had to be rescued by inspecting text. A
+   * flag that starts and ends with the connect turn cannot tag a later one.
    */
   connectMirrorSuppressed?: boolean
   /**
@@ -4149,78 +4156,58 @@ async function mirrorLatestReply(
     return
   }
 
-  // Connect skill turn (e7ecc1de): never post — would settle unanswered
-  // owner dispatches that landed during attach. command.executed ids +
-  // post-handshake suppress; not NLP chrome.
-  if (
-    shouldSkipConnectTurnMirror({
-      messageId: last.info.id,
-      nonMirrorMessageIds: fresh.nonMirrorMessageIds,
-      connectMirrorSuppressed: fresh.connectMirrorSuppressed,
-      awaitingRemoteReply: fresh.awaitingRemoteReply,
+  // ---- The only egress gate: what the turn DID, never what it said ---------
+  //
+  // A turn that performed the DevSpec connect handshake is the plugin's own
+  // protocol and produces no room post. That fact is observed from the tool
+  // calls the turn made (`tool.execute.after` sees register/attach mid-turn),
+  // so there is nothing here to infer from the model's prose and no override
+  // to fall through — the previous version peeked at the text, decided "Done."
+  // looked like a real answer, and published it into a room the conversation
+  // had never chosen.
+  //
+  // Everything else posts: an answer to a delivered owner command, and an
+  // ordinary local turn in an attached chat (the room is a shared transcript).
+  // The model's words go through verbatim, exactly as the work trail already
+  // does — chrome filtering is what this deletes, not a thing it preserves.
+  //
+  // `awaitingRemoteReply` exempts a turn that is answering a delivered owner
+  // command: a stale handshake flag must never swallow a real answer. That was
+  // the structural half of the old check and it is kept — b156e680 needed a
+  // text override only because `command.executed` could tag a LATER turn's
+  // message id, which marking at tool-call time no longer does.
+  const isHandshakeTurn =
+    !fresh.awaitingRemoteReply &&
+    (Boolean(fresh.connectMirrorSuppressed) ||
+      (fresh.nonMirrorMessageIds ?? []).includes(last.info.id))
+  if (isHandshakeTurn) {
+    logPoll(
+      `mirrorLatestReply: skip (connect handshake turn) last.id=${last.info.id} — ` +
+        `this turn ran the DevSpec handshake, so it has no answer to post`,
+    )
+    logRemoteControlStory({
+      phase: 'mirror_decision',
+      outcome: 'skip',
+      connectionId: fresh.connectionId,
+      sessionId: fresh.sessionId,
+      agent: AGENT_NAME,
+      codename: fresh.codename,
+      tool: 'mirrorLatestReply',
+      reason: 'connect_turn_suppress',
+      data: { message_id: last.info.id },
     })
-  ) {
-    // Peek at postable text before claiming. A late connect-skill tag on a
-    // real answer (banner + "-1") must fall through and post (b156e680).
-    const suppressText = assistantTextFromMessage(last)
-    const suppressPrepared = suppressText ? prepareMirrorText(suppressText) : null
-    if (
-      !shouldClaimConnectTurnSuppress({
-        awaitingRemoteReply: fresh.awaitingRemoteReply,
-        preparedText: suppressPrepared,
-      })
-    ) {
-      if (fresh.awaitingRemoteReply) {
-        logPoll(
-          `mirrorLatestReply: refuse connect-skip claim while awaiting last.id=${last.info.id}`,
-        )
-        return
-      }
-      logPoll(
-        `mirrorLatestReply: connect-skip overridden — real answer text last.id=${last.info.id}`,
-      )
-      logRemoteControlStory({
-        phase: 'mirror_decision',
-        outcome: 'continue',
-        connectionId: fresh.connectionId,
-        sessionId: fresh.sessionId,
-        agent: AGENT_NAME,
-        codename: fresh.codename,
-        tool: 'mirrorLatestReply',
-        reason: 'connect_suppress_real_answer',
-        data: { message_id: last.info.id },
-      })
-      // Fall through to the normal prepare/post path below.
-    } else {
-      logPoll(
-        `mirrorLatestReply: skip (connect skill / handshake suppress) last.id=${last.info.id} ` +
-          `suppressed=${Boolean(fresh.connectMirrorSuppressed)} awaiting=${Boolean(fresh.awaitingRemoteReply)}`,
-      )
-      logRemoteControlStory({
-        phase: 'mirror_decision',
-        outcome: 'skip',
-        connectionId: fresh.connectionId,
-        sessionId: fresh.sessionId,
-        agent: AGENT_NAME,
-        codename: fresh.codename,
-        tool: 'mirrorLatestReply',
-        reason: 'connect_turn_suppress',
-        data: { message_id: last.info.id },
-      })
-      alreadyMirrored.add(last.info.id)
-      patchState({
-        lastMirroredMessageId: last.info.id,
-        mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-        connectMirrorSuppressed: false,
-        // Handshake skip only — awaitingRemoteReply is already false above.
-        replyAfterOpenCodeMessageId: null,
-        replyBaselineCaptured: undefined,
-        currentTurnMessageIds: null,
-        manualAnswerPostedThisTurn: false,
-      })
-      await setBusy(directory, false)
-      return
-    }
+    alreadyMirrored.add(last.info.id)
+    patchState({
+      lastMirroredMessageId: last.info.id,
+      mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
+      connectMirrorSuppressed: false,
+      replyAfterOpenCodeMessageId: null,
+      replyBaselineCaptured: undefined,
+      currentTurnMessageIds: null,
+      manualAnswerPostedThisTurn: false,
+    })
+    await setBusy(directory, false)
+    return
   }
 
   const text = assistantTextFromMessage(last)
@@ -4242,26 +4229,20 @@ async function mirrorLatestReply(
     return
   }
 
-  // Real bug found live-testing: baseline correlation (above) only decides
-  // WHICH message is new post-inject — it has no opinion on WHAT the message
-  // says. The devspec.remote command tells the model to print its connect
-  // status block "in the terminal only", but OpenCode has no channel for
-  // that: every assistant turn the model produces is both shown locally AND
-  // becomes "the latest assistant message" here. So a model that dutifully
-  // follows that instruction produces the status block (or a bare
-  // "connected, ready" line) as a real, correctly-correlated new turn —
-  // confirmed live: it mirrored into a shared session as a reply to an owner
-  // command it never actually answered. prepareMirrorText strips a pasted
-  // banner from an otherwise-real reply, and returns null for pure chrome.
-  const preparedText = prepareMirrorText(text)
+  // The model's words, verbatim. `prepareMirrorText` used to classify text here
+  // — stripping a pasted banner, returning null for anything it judged to be
+  // "pure chrome" — because the connect turn had no other channel and its
+  // status block would otherwise land in the room as an answer. The handshake
+  // turn is now excluded structurally above, so there is nothing left for a
+  // classifier to catch, and the work trail already sets the precedent of
+  // keeping assistant text exactly as written.
+  const preparedText = collapseOrphanMarkdownFences(unwrapSingleOuterMarkdownFence(text.trim()))
 
-  // Item 5f75c2cb: never post empty/whitespace. `prepareMirrorText` already
-  // trims and returns null for nothing-postable, so `!preparedText.trim()`
-  // should be unreachable in practice — this is explicit defense-in-depth
-  // against a future regression there, not a workaround for one today.
+  // Nothing to post is not a judgement about content — it is the absence of
+  // any. A textless turn (pure tool calls) still has to settle, or the room
+  // sits at "working…" for ever.
   if (!preparedText || !preparedText.trim()) {
-    // Claim + treat as a finished (non-)turn so busy clears, but never post.
-    logPoll(`mirrorLatestReply: skip (operational chrome) last.id=${last.info.id}`)
+    logPoll(`mirrorLatestReply: skip (turn produced no text) last.id=${last.info.id}`)
     logRemoteControlStory({
       phase: 'mirror_decision',
       outcome: 'skip',
@@ -4270,7 +4251,7 @@ async function mirrorLatestReply(
       agent: AGENT_NAME,
       codename: fresh.codename,
       tool: 'mirrorLatestReply',
-      reason: 'operational_chrome',
+      reason: 'no_text',
       data: { message_id: last.info.id },
     })
     // A live trail bubble opened by this turn would otherwise stream for ever:
