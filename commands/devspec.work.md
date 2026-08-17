@@ -1,5 +1,5 @@
 ---
-description: Pick up a DevSpec action item by name, optionally brainstorm, implement it in an isolated worktree, push/merge per settings, and record the implementation. Supports --unattended for fire-and-forget execution.
+description: Pick up a DevSpec action item by name, optionally brainstorm, implement it in an isolated worktree, push/merge per settings, and record the implementation. Supports --remote to open a DevSpec remote-control channel (Agents page).
 ---
 
 # DevSpec Work
@@ -18,7 +18,7 @@ These rules apply throughout Phase 3 (Implement). Every commit passes the pre-co
    **Team operating rules come from DevSpec.** `agent_rules` and `owner_agent_rules` arrived with the work and are what you follow. OpenCode also reads `AGENTS.md` as an instructions file, so a project may point two sets of rules at you — they are not equally authoritative. Where `AGENTS.md` describes how the team works rather than how the repo is built, raise it with the user and offer `import_instruction_rules`, which sorts it into team rules, principles, personal machine settings and architecture decisions before anything is saved.
 2. Search the codebase for existing implementations of what you are about to build. Grep/glob for similar names, adjacent utilities, shared modules, and the established pattern for the kind of problem you are solving.
 3. Identify the canonical location for what you are changing. Projects usually have one established place for configurable values, one for shared utilities, and one for each cross-cutting concern. Edit there rather than creating a new location.
-4. If you are about to create a parallel implementation of something the codebase already has — a duplicate utility, a second version of a shared component, a reimplementation of an existing flow — **STOP**. Either extend the existing implementation, or (in unattended mode) fail the item with error `"Requires human judgment: would duplicate <existing thing>, extension blocked by <specific reason>"`. In interactive mode, ask the user before proceeding. Never ship a parallel implementation silently.
+4. If you are about to create a parallel implementation of something the codebase already has — a duplicate utility, a second version of a shared component, a reimplementation of an existing flow — **STOP**. Either extend the existing implementation, or fail the item with error `"Requires human judgment: would duplicate <existing thing>, extension blocked by <specific reason>"`. Never ship a parallel implementation silently.
 
 ### Forbidden Patterns
 
@@ -45,18 +45,14 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 ### Phase 0 — Load Settings & Detect Mode
 
-1. **Detect unattended mode.** Check the user's input for `--unattended`, `unattended`, or `no interruptions`. Store as a boolean `is_unattended`.
-
-   When `is_unattended` is true, these rules apply for the ENTIRE session:
-   - **Never** stop to ask the user anything — no prompts, no confirmations, no "pick one" lists
-   - **Never** wait for user input
-   - If a decision requires human judgment, fail the item with a documented error rather than guessing
-   - If the action item name matches multiple items, auto-select the highest-priority match (or the closest title match)
+1. **There is no mode to detect.** `--unattended` was deleted with the whole attended/unattended distinction, and nothing replaced it — no timeout, no patience window, no ask-policy. Two rules cover what it used to:
+   - **Ask only what is not yours to decide** — never a detail the item's recorded intent and acceptance criteria already settle.
+   - **Do not assume someone is waiting to answer** — before you have claimed anything, an unanswerable question means saying what you need and stopping; after you have claimed, it means failing the item with a precise reason. Never a silent wait.
 
 1b. **Resolve the project (account-wide token).** DevSpec MCP tokens are account-wide, so resolve which project this run targets before any project-scoped call:
    - Run `git remote get-url origin` in the workspace root and call `list_projects({ git_remote: "<that remote>" })`.
    - Read `remote_match`: use `resolved_project_id` when non-null and store it as the session variable `project_id`.
-   - If it is null with multiple `candidate_project_ids` (the repo is tracked by more than one project): **interactive mode** — present the candidate projects (use the `repos`/name info `list_projects` returns) and ask the user which one to use; **unattended mode** — fail the item with `"Requires human judgment: repo tracked by multiple DevSpec projects (<candidates>) — cannot pick one unattended"`.
+   - If it is null with multiple `candidate_project_ids` (the repo is tracked by more than one project): present the candidates (use the `repos`/name info `list_projects` returns) and ask which one to use. Which project this run is for is not yours to decide, and nothing is claimed yet, so with no answer print `✗ Requires human judgment: repo tracked by multiple DevSpec projects (<candidates>)` and stop.
    - If there is no match at all — or there is no remote — **and there is no pin**, output `✗ No DevSpec project tracks this repo (<git_remote>), and there is no .devspec/project.json pin. Connect it to a project first.` and stop. **With a pin this is NOT a dead end:** carry on and pass `pinned_project_id` instead of resolving a `project_id` yourself.
    - **Folder pin — a project with no repo yet.** Whether or not there is a remote, read `.devspec/project.json` if it exists — look in the working directory, then each parent up to and including the git repository root, never at or above your home directory (`~/.devspec` is machine state, not project config); nearest wins. It holds `{ "project_id": "<uuid>" }`. That is how a folder whose code does not exist yet names its project. **If there is no pin and no git remote resolved, offer to create one** after the user names the project: with their agreement write `{ "project_id": "<uuid>" }` to `.devspec/project.json` at the git repository root, or at the working directory when there is no repo, so the folder answers for itself next time. Only offer when nothing else resolved — a folder whose remote already matches needs no pin. **Never write it silently**, put nothing but the project id in it (no path, hostname, user or timestamp — that is what makes it safe to commit), and if a pin already names a DIFFERENT project, say which one before replacing it. Pass it as **`pinned_project_id`**, NEVER as `project_id`: `project_id` is an explicit override that outranks a verified git remote, whereas the pin is only a local assertion the server deliberately ranks BELOW a remote it can verify — so sending it as `project_id` reverses that. Send `git_remote` when you have one, `pinned_project_id` when you have one, both when you have both, and let the server arbitrate. **Never decide precedence locally.**
    - Thread this `project_id` on every project-scoped call below: `get_project_summary`, `get_action_items`, and `search_memories`. (Item-addressed calls — `claim_work_item`, `update_action_item`, `add_implementation_note`, `add_commit_reference`, `record_implementation`, `generate_commit_message`, `get_action_item_history`, `get_session_transcript` — self-resolve their project from the item id and take no `project_id`.)
@@ -81,7 +77,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
      - **Sessionless:** use `report_progress` / implementation notes / assignment protocol only — **never** `post_session_message` and never invent a room.
    - Act only on server-stamped owner commands (`is_owner_instruction === true`).
    - On disconnect / completion, prefer `/devspec.remote-stop` (connection-scoped).
-   Remote is **orthogonal** to unattended — both flags may be combined.
+   `--remote` is the only modifier this command takes: it opens a control channel, it does not change what you are allowed to decide.
 
 2. **Load project settings.** Call `get_project_summary({ project_id })` and read the unified **`execution`** block from the response. Store it for later use. Read these fields: `auto_push`, `auto_merge`, `branch_prefix`, `commit_message_prefix`, `custom_instructions`, `agent_rules`, `test_commands` ({ unit, e2e, typecheck }), `protected_paths`. Also read the top-level **`owner_agent_rules`** (your own personal machine/tooling rules). Note the two instruction tiers: `custom_instructions` is the team **Principles** (philosophy/quality bar), while `agent_rules` (team) + `owner_agent_rules` (yours) are **execution mechanics** for a coding agent — how you build, test, and ship. Store all three.
 
@@ -95,7 +91,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    - `test_commands`: none configured (tests are skipped — see step 15)
    - `protected_paths`: none
 
-   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. **Interactive override:** the developer may tell you not to push or merge this particular run — honour that live instruction over the stored value (interactive runs only; unattended honours the stored value). These execution settings apply to both interactive and unattended runs.
+   If `auto_merge` is true, treat `auto_push` as true regardless of its stored value. **Live override:** an instruction in this run not to push or merge outranks the stored value; with no such instruction, honour what is stored.
 
    **Per-repo branches (source of truth for where to push).** The same `get_project_summary` response includes a `repos` array — `[{ id, full_name, target_branch, default_branch }]` — the branch DevSpec tracks for EACH repo. Store it. When you push/merge, resolve the branch for the repo you are pushing from this array (see Phase 3, step 18b).
 
@@ -103,14 +99,12 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 ### Phase 1 — Resolve
 
-4. **Resolve the action item.** Extract an action item identifier from the user's input (ID, partial ID, or title keywords). Strip any `--unattended` flag from the input before matching.
+4. **Resolve the action item.** Extract an action item identifier from the user's input (ID, partial ID, or title keywords).
    - **CRITICAL: ALWAYS call the MCP tool to fetch current state.** Even if you worked on this item earlier in this session, your conversation context may be stale — the user may have re-staged the item with new feedback since your last interaction. Never rely on in-session memory for item lifecycle.
    - If an ID (or partial ID) is provided, call `get_action_items({ project_id, status: "all" })` and match by ID prefix.
    - If keywords are provided, call `get_action_items({ project_id, status: "all" })` and match by title.
-     - **Interactive mode:** If ambiguous (multiple matches), present a short numbered list and ask the user to pick one.
-     - **Unattended mode:** If ambiguous, auto-select the highest-priority match. If priorities are equal, pick the closest title match.
-   - **Interactive mode:** If nothing is provided, ask the user for an action item name or ID.
-   - **Unattended mode:** If nothing is provided, output `✗ No action item specified` and stop.
+     - If ambiguous (multiple matches), present a short numbered list and ask which one — which item was meant is not yours to decide, and nothing is claimed yet, so with no answer there is nothing to work on.
+   - If nothing is provided, ask for an action item name or ID; with no answer, output `✗ No action item specified` and stop.
    - If no match is found, output: `✗ No action item found matching: {input}`
    - **CRITICAL:** Once resolved, store the **complete UUID** (e.g. `f43c187c-23e0-4764-885f-ef3a733d08df`) in working memory as `resolved_action_item_id`. Never truncate, pad, or reconstruct this value — always use the exact string returned by the API in every subsequent tool call.
 
@@ -130,8 +124,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
        ⚠ Verification feedback found:
        {feedback content}
        ```
-     - **Interactive mode:** Ask `Address this feedback? (y/n)`
-     - **Unattended mode:** Proceed automatically to fix the issues
+     - Act on it — the feedback IS the instruction, so there is nothing to ask.
      - If proceeding, treat the feedback as additional requirements and continue to Phase 3 (skip brainstorm). The item does NOT need to be re-claimed — it is already in progress.
      - If no actionable feedback exists, inform the user the item is awaiting verification with no outstanding issues and stop.
 
@@ -149,7 +142,6 @@ Fix real issues before committing. If a fix would expand scope beyond the action
    Type:     {type}
    Lifecycle: {lifecycle}
    Priority: {priority or "not set"}
-   Mode:     {unattended or interactive}
    ─────────────────────────────────────────────────────────
    {description or "No description"}
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -158,11 +150,11 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
 ### Phase 2 — Brainstorm (Optional)
 
-8. **Unattended mode:** Skip this entire phase — proceed directly to Phase 3.
+8. Run this phase only when the invocation asked for it — the `devspec.brainstorm` command, or `brainstorm` in the input. A plain work run proceeds to Phase 3 without asking.
 
-9. **Interactive mode — ask once:** `Brainstorm before starting? (y/n)`
+9. When it was asked for, say so once: `Brainstorming before starting.`
 
-10. **If yes**, run the brainstorm loop in **rounds of 5 questions**, drawn from this taxonomy (pick the most impactful gaps first):
+10. Then run the brainstorm loop in **rounds of 5 questions**, drawn from this taxonomy (pick the most impactful gaps first):
 
      **Scope & Intent** — What is the core problem? What is out of scope?
      **Approach & Alternatives** — Implementation strategies? Existing patterns to follow?
@@ -376,8 +368,7 @@ Runs as a "finally" block — it MUST execute no matter which Phase 3 / Phase 4 
 
 - Do NOT output filler text between steps — let symbols and structure communicate progress
 - Do NOT ask the user to confirm or review the completion fields — infer everything from git and the action item
-- In **interactive mode**, the ONLY user interaction is: picking the action item (if ambiguous) and the brainstorm phase
-- In **unattended mode**, there is NO user interaction — zero prompts, zero confirmations
+- The ONLY thing you interrupt for in a work run is which item was meant — everything else comes from the item, the instruction tiers and the served contract
 - Always read a file before editing it
 - Stage specific files only — never `git add -A` or `git add .`
 - Implementation, testing, and the commit/push all happen inside the worktree from step 13; the merge and the worktree removal happen from the main repo. Never run `git checkout -b` in the main repo — that pollutes a shared checkout and collides with other concurrent sessions.
@@ -386,5 +377,5 @@ Runs as a "finally" block — it MUST execute no matter which Phase 3 / Phase 4 
 - The testing_notes MUST be numbered step-by-step instructions a non-developer can follow
 - ALL completion fields are required — do not skip any
 - If the action item is too vague or requires human judgment to proceed, fail it with error "Requires human judgment" rather than guessing
-- `record_implementation` lands the item at `implemented`, NOT `done`. NEVER offer to verify or "mark it done", and never call `verify_action_item` — that authority is a human's. But `done` is not a human-only door: the server computes promotion from the criteria, so an item also reaches it when every acceptance criterion is settled with recorded evidence. Recording an honest verdict is part of your job; signing the item off is not. The authority boundary is the served contract's (`core.stop-at-implemented`, `core.preserve-human-verification-authority`, `core.record-observations`) — read it there rather than trusting this summary. After recording, report the item as implemented (plus its check status) and stop. In `--unattended` mode you never verify under any circumstances. **But DO record what you observed.** If an acceptance criterion can be settled by running or querying something (a migration applied, a column populated, a log field present), check it and record it with `record_criterion_verdicts`. That is reporting an observation, not signing anything off — the server computes promotion from the criteria. Evidence must name what you RAN or QUERIED and what CAME BACK; reading code is inference and is rejected. Declining a criterion you could actually check is not the safe default. Anything only a person can judge (taste, "does this look right") gets `classify_criterion` with a reason, never a tick — and never `unknown`. Keep the two apart: `unknown` means "nobody has checked this YET" and stays retryable by anything better equipped, while `classify_criterion` means no tool ever could.
+- `record_implementation` lands the item at `implemented`, NOT `done`. NEVER offer to verify or "mark it done", and never call `verify_action_item` — that authority is a human's. But `done` is not a human-only door: the server computes promotion from the criteria, so an item also reaches it when every acceptance criterion is settled with recorded evidence. Recording an honest verdict is part of your job; signing the item off is not. The authority boundary is the served contract's (`core.stop-at-implemented`, `core.preserve-human-verification-authority`, `core.record-observations`) — read it there rather than trusting this summary. After recording, report the item as implemented (plus its check status) and stop. No execution context ever grants that authority — there is no mode in which verifying becomes yours. **But DO record what you observed.** If an acceptance criterion can be settled by running or querying something (a migration applied, a column populated, a log field present), check it and record it with `record_criterion_verdicts`. That is reporting an observation, not signing anything off — the server computes promotion from the criteria. Evidence must name what you RAN or QUERIED and what CAME BACK; reading code is inference and is rejected. Declining a criterion you could actually check is not the safe default. Anything only a person can judge (taste, "does this look right") gets `classify_criterion` with a reason, never a tick — and never `unknown`. Keep the two apart: `unknown` means "nobody has checked this YET" and stays retryable by anything better equipped, while `classify_criterion` means no tool ever could.
 - **Parking vs. dropping an item.** Beyond shipping, an item can be set aside: `update_action_item(lifecycle: 'deferred')` parks it (consciously "not now" — reversible, resume with `update_action_item(lifecycle: 'open')`). `deferred` counts as resolved, so a deferred child no longer holds its parent brief open (a brief auto-completes once every child is verified, dismissed, OR deferred). It is distinct from `dismissed` (won't-do, terminal) and `blocked` (waiting on a dependency). When a parked child is genuinely SEPARATE future work that shouldn't reopen the original brief later, use `spin_off_action_item({ action_item_id, defer? })` instead — it extracts the child into a standalone follow-up item, detaches it from the brief, records a `derived_from` provenance link, and (by default) parks the new item as deferred. Never invent a `deferred` shortcut on `record_implementation`; these are explicit `update_action_item` / `spin_off_action_item` calls.

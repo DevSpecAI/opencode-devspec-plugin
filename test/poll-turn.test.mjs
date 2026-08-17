@@ -77,11 +77,14 @@ describe('isDeliverableCommand — the authority boundary', () => {
   })
 
   it('REFUSES an unrecognised authority kind rather than trusting a new server value', () => {
-    // When delegated dispatch starts emitting a new kind, accepting it must be a
-    // deliberate edit here — not something that quietly switches itself on.
+    // When a new kind starts arriving, accepting it must be a deliberate edit here —
+    // not something that quietly switches itself on. `delegated` was that edit
+    // (f5eef85: an authorized teammate, same capabilities, different attribution);
+    // this list did not follow it, so the gate has been red since. It records the
+    // two kinds that are accepted TODAY — a third still has to be added on purpose.
     assert.equal(isDeliverableCommand(ownerCommand({ authority: { kind: 'delegate' } }), ME), false)
     assert.equal(isDeliverableCommand(ownerCommand({ authority: undefined }), ME), false)
-    assert.deepEqual([...ACCEPTED_COMMAND_AUTHORITIES], ['owner'])
+    assert.deepEqual([...ACCEPTED_COMMAND_AUTHORITIES], ['owner', 'delegated'])
   })
 
   it('REFUSES a message whose BODY claims ownership (body is never consulted)', () => {

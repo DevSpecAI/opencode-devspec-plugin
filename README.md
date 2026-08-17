@@ -48,7 +48,7 @@ Start OpenCode in a DevSpec-tracked repo and ask it to list your DevSpec action 
 - **MCP wiring guidance** — the config block above; DevSpec's MCP server itself needs no changes.
 - **Conventions file** (`instructions/devspec.md`) — DevSpec's workflow rules (claim before coding, briefs/action items, memory usage), auto-loaded via OpenCode's `instructions` config.
 - **Ported commands** (`commands/*.md`) — `devspec.work`, `devspec.brainstorm`, `devspec.commit`, `devspec.done`, `devspec.create`, `devspec.link`, `devspec.help`, `devspec.remote`, `devspec.remote-stop` — same names as the Claude Code and Cursor plugins.
-- **Autopilot** — unattended queue processing via OpenCode's plugin hooks.
+- **Batches** — pass several item ids to `devspec.work` and it reserves them, then claims and works the members in order.
 - **Remote control** — attach this OpenCode session to a DevSpec session for phone/web control, delivered via OpenCode's own session-message API rather than a file-based workaround.
 
 ## Developing this plugin (coding agents)

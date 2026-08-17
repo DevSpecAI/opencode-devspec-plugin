@@ -2,12 +2,24 @@
 
 ## Unreleased
 
+### `--unattended` is gone from `devspec.work`, and nothing replaced it
+
+The command took a flag that installed a mode for the whole session: never ask, never wait, auto-select the highest-priority match when a name was ambiguous. It read as a safety feature and was really a licence to guess.
+
+Deleted: the flag, the `Mode:` line in the item header, every "interactive mode / unattended mode" fork, and the two mode-specific contract resources — the served contract is now one document at `devspec://product/implementation-contract`.
+
+Nothing takes its place — no timeout, no patience window, no ask-policy. **Ask only what is not yours to decide** (never a detail the item's intent and criteria already settle), and **do not assume someone is waiting to answer** (before a claim, say what you need and stop; after a claim, fail the item with a precise reason). Brainstorm no longer asks whether you want it either: it runs when the invocation asked for it.
+
+### The delegated-authority gate is green again
+
+`ACCEPTED_COMMAND_AUTHORITIES` gained `delegated` deliberately, but the test that exists to make that edit deliberate was not updated with it, so the suite has been red since. The assertion now records both accepted kinds; a third still has to be added on purpose.
+
 ### The `/autopilot.*` commands are gone — staged batches arrive at any idle connection
 
 **Migration:** if you used `/autopilot.start` (or its queue flags), stage the items in DevSpec instead (**Stage for Autopilot** / approve a plan) and keep an ordinary remote-control session idle — DevSpec hands the batch to it. Status is the Agents page; stop is `devspec.remote-stop`; history is the assignment and item record.
 
 - **The plugin no longer chooses its own work.** The old commands pulled a global queue and decided locally what to take; the server now routes a staged batch to a connection and the plugin only works what it was handed.
-- **Unattended is a mode, not a command.** The assignment-dispatch text the plugin injects now says so explicitly: batch rules override conversational rules for the duration of the batch, a member that cannot be done safely is failed loudly with `fail_work_item` (never stalled on a question nobody is there to answer), and the connection returns to ordinary available capacity when the batch resolves.
+- **There is no unattended mode at all.** An earlier draft of these notes said unattended was "a mode, not a command"; the mode itself is now gone. The assignment-dispatch text the plugin injects says what replaced it: nothing. Working a batch installs no rules a single item does not already carry — ask only what is not yours to decide, never assume someone is waiting to answer, fail a member that cannot be done safely with `fail_work_item` rather than stalling, and return to ordinary available capacity when the batch resolves.
 - No replacement command or flag is created. Same deletion across the Claude Code, Cursor, Grok, Antigravity and Codex plugins under the same item (`3f2f390c`).
 
 ### Remote control — OpenCode control slashes via SDK (not promptAsync)

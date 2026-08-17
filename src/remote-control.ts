@@ -2810,12 +2810,13 @@ export async function pollAndDeliver(
           `Run the assignment protocol: get_assignment → acknowledge_assignment → ` +
           `claim_work_item (each member, in position order) → implement → record_implementation → ` +
           `resolve_assignment.\n` +
-          `Until resolve_assignment lands, batch mode overrides conversation mode: do not answer ` +
-          `the room, do not react to ambient chatter, do not pause for clarification — there may ` +
-          `be nobody watching. A member that cannot be implemented safely is failed loudly with ` +
-          `fail_work_item (precise error + partial_work_notes), then CONTINUE with the next member — ` +
-          `a blocked member fails the member, not the batch. When the batch resolves you are ` +
-          `ordinary available capacity again; nothing about the connection changed.\n` +
+          `There is no batch mode: working a batch installs no rules a single item does not ` +
+          `already carry. Ask only what is not yours to decide, never assume someone is waiting to ` +
+          `answer, and never pause on a question nobody may read. A member that cannot be ` +
+          `implemented safely is failed loudly with fail_work_item (precise error + ` +
+          `partial_work_notes), then CONTINUE with the next member — a blocked member fails the ` +
+          `member, not the batch. When the batch resolves you are ordinary available capacity ` +
+          `again; nothing about the connection changed.\n` +
           `While sessionless, report progress with report_progress / item notes — do not invent a chat room.`
         )
     return {
