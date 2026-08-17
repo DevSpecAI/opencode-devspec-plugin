@@ -3731,7 +3731,17 @@ export async function mirrorNow(
     }
   }
   if (bondKey === undefined) {
-    await run()
+    // FAIL CLOSED (item 2a5d212b). `undefined` means this OpenCode session has no
+    // bond — an @explore child, a sibling tab, an ordinary interactive chat that
+    // never ran /devspec.remote. It used to mean "run against whatever the
+    // process-global bind happens to be", and on 2026-08-17 that published an
+    // unbonded child's 3,886-token internal handoff into DevSpec session
+    // 8fd18ec0 under bonded connection 7695c4dc's identity.
+    //
+    // A remote identity speaks only from the session bonded to it. There is
+    // nothing sensible to fall back to here: the whole question this answers is
+    // WHICH room this text belongs in, and an unbonded session has no answer.
+    logPoll(`mirrorNow: opencodeSession=${sessionId} has no bond — inert`)
     return
   }
   await runWithBoundSessionAsync(bondKey, run)
@@ -3919,7 +3929,11 @@ export async function postWorkTrail(
     }
   }
   if (bondKey === undefined) {
-    await run()
+    // FAIL CLOSED (item 2a5d212b) — same rule as mirrorNow above. An unbonded
+    // session's tool calls and reasoning are not a trail of any remote turn, and
+    // publishing them under the bonded connection's identity is a leak, not a
+    // best effort.
+    logPoll(`postWorkTrail: opencodeSession=${sessionId} has no bond — inert`)
     return
   }
   await runWithBoundSessionAsync(bondKey, run)

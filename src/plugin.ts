@@ -133,11 +133,13 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   // when a serve password is set. No-op on builds that already inject it.
   applyServeAuthToPluginClient(client, interactiveServeAuth)
 
-  // Fallback when an event lacks sessionID (rare). Prefer the event's own
-  // sessionID for mirror/idle so multi-bond mirrors stay on the right room.
-  // Bonds themselves live in remote-control's openCodeBonds map — never a
-  // single lastKnown overwrite (7a9b7b0f).
-  let fallbackSessionId: string | null = null
+  // There is deliberately NO fallback session id here (item 2a5d212b). An event
+  // that carries no sessionID cannot be attributed to a bond, and "the last
+  // session that ran a connect handshake" was never a correct answer to "which
+  // room does this belong in" — it is how an unbonded @explore child published
+  // 3,886 tokens of internal handoff into DevSpec session 8fd18ec0 as the bonded
+  // agent on 2026-08-17. Bonds live in remote-control's openCodeBonds map; an
+  // event whose session is absent from it is inert.
 
   // ---- The long-poll pump (item c9457ab8 + multi-bond 7a9b7b0f) ---------------------
   // One self-scheduling loop: for each active bond, issue a held request (scoped
@@ -216,6 +218,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
      * Auto-allow only while a DevSpec bond is live in this process.
      */
     'permission.ask': async (input, output) => {
+      // Bond-scoped, not process-wide (item 2a5d212b). Auto-allow is the
+      // unattended equivalent of yolo for a REMOTE turn; granting it to an
+      // ordinary interactive chat because some *other* chat in this process is
+      // bonded silently removes a human safety prompt from a session nobody
+      // connected. A remote turn runs in its own bonded session, so this still
+      // fires exactly where it is meant to.
+      const askingSession = typeof input?.sessionID === 'string' ? input.sessionID : undefined
+      if (!askingSession || stateKeyForOpenCodeBond(askingSession) === undefined) return
       if (!shouldAutoAllowRemoteControlPermission()) return
       output.status = 'allow'
       const kind = typeof input?.type === 'string' ? input.type : 'unknown'
@@ -247,6 +257,24 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       // register/attach adds bonds (see comment historically on lastKnownSessionId).
       const props = (event as { properties?: Record<string, unknown> }).properties
       const sessionId = typeof props?.sessionID === 'string' ? props.sessionID : undefined
+
+      // ---- The bond gate (item 2a5d212b) -------------------------------------
+      // One gate for every branch below, deliberately here rather than repeated
+      // inside each one: a branch added later cannot forget it. An event whose
+      // OpenCode session holds no bond is INERT — no post, no trail, no busy
+      // mutation, no state write — and an event with no sessionID at all cannot
+      // be attributed to a bond, so it is inert too.
+      //
+      // Unbonded sessions are the common case in a TUI someone is also using
+      // normally, so they get one short line and no props dump: this log is
+      // per-process and grew to 24MB in three weeks, most of it other people's
+      // conversations.
+      const bondKey = sessionId === undefined ? undefined : stateKeyForOpenCodeBond(sessionId)
+      if (sessionId === undefined || bondKey === undefined) {
+        logPoll(`event skipped (no bond): type=${event.type} sessionID=${sessionId ?? '(none)'}`)
+        return
+      }
+
       let propsSummary = ''
       try {
         propsSummary = props ? JSON.stringify(props) : ''
@@ -255,94 +283,54 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         propsSummary = String(props)
       }
       logPoll(`event received: type=${event.type} sessionID=${sessionId} props=${propsSummary}`)
+
+      /** Run a state-touching side effect scoped to THIS event's bond. */
+      const inBond = <T>(fn: () => Promise<T>): Promise<T> =>
+        runWithBoundSessionAsync(bondKey, fn)
+
       if (event.type === 'session.idle') {
         // Turn finished: clear busy and mirror the reply immediately. Delivery is the
         // pump's job now, so this no longer needs to poll. Flush any pending settle
         // timer from message.updated so we do not double-fire after the idle path.
-        const target = sessionId ?? fallbackSessionId
-        if (target) {
-          const stateKey = stateKeyForOpenCodeBond(target)
-          if (stateKey !== undefined) {
-            await runWithBoundSessionAsync(stateKey, () => setBusy(directory, false))
-          } else {
-            await setBusy(directory, false)
-          }
-          flushMirrorNow(client, directory, target)
-        }
+        await inBond(() => setBusy(directory, false))
+        flushMirrorNow(client, directory, sessionId)
       } else if (event.type === 'message.updated') {
         // MIRRORING is event-driven now, not a side-effect of the poll tick (see
         // scheduleMirrorNow). Debounce so a model that still calls
         // post_session_message (against skill docs) can record its content hash
         // before we mirror — otherwise text lands first and we double-post.
-        const target = sessionId ?? fallbackSessionId
-        if (target) {
-          scheduleMirrorNow(client, directory, target)
-          // The live work trail (item bfca2495) rides the SAME event but must not
-          // wait for the mirror's settle debounce: the whole point is that the
-          // room sees progress while the turn is still running, so this publishes
-          // on its own throttle and closes nothing.
-          scheduleWorkTrailPost(client, directory, target)
-        }
+        scheduleMirrorNow(client, directory, sessionId)
+        // The live work trail (item bfca2495) rides the SAME event but must not
+        // wait for the mirror's settle debounce: the whole point is that the
+        // room sees progress while the turn is still running, so this publishes
+        // on its own throttle and closes nothing.
+        scheduleWorkTrailPost(client, directory, sessionId)
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the
         // type line landed in poll.log and the UI stayed "working…".
-        await handleSessionError(directory, event)
+        await inBond(() => handleSessionError(directory, event))
       } else if (event.type === 'command.executed') {
         // `/devspec.remote` / `/devspec.remote-stop` assistant turns must never
         // mirror into the room (session e7ecc1de connect-turn race).
-        recordRemoteControlSkillCommand(directory, props ?? null)
+        await inBond(async () => {
+          recordRemoteControlSkillCommand(directory, props ?? null)
+        })
       } else if (isPermissionAskedEvent(event.type)) {
         // Hung permission wait is NOT stall progress — mark so checkBusyStall
         // never slides on the still-"running" tool (bb633917). OpenCode emits
         // `permission.asked` live; SDK Event typings may lag — compare as string.
-        const target = sessionId ?? fallbackSessionId
-        const mark = async () => {
+        await inBond(async () => {
           markPermissionAsked(directory)
-        }
-        if (target) {
-          const stateKey = stateKeyForOpenCodeBond(target)
-          if (stateKey !== undefined) {
-            await runWithBoundSessionAsync(stateKey, mark)
-          } else {
-            await mark()
-          }
-        } else {
-          await mark()
-        }
+        })
       } else if (isPermissionResolvedEvent(event.type)) {
-        const target = sessionId ?? fallbackSessionId
-        const clear = async () => {
+        await inBond(async () => {
           clearPermissionAsked(directory)
-        }
-        if (target) {
-          const stateKey = stateKeyForOpenCodeBond(target)
-          if (stateKey !== undefined) {
-            await runWithBoundSessionAsync(stateKey, clear)
-          } else {
-            await clear()
-          }
-        } else {
-          await clear()
-        }
+        })
       } else if (isQuestionAskedEvent(event.type)) {
-        const target = sessionId ?? fallbackSessionId
-        const ask = async () => {
-          await handleQuestionAsked(directory, props ?? null)
-        }
-        if (target) {
-          const stateKey = stateKeyForOpenCodeBond(target)
-          if (stateKey !== undefined) {
-            await runWithBoundSessionAsync(stateKey, ask)
-          } else {
-            await ask()
-          }
-        } else {
-          await ask()
-        }
+        await inBond(() => handleQuestionAsked(directory, props ?? null))
       } else if (isQuestionResolvedEvent(event.type)) {
-        const target = sessionId ?? fallbackSessionId
-        const clear = async () => {
+        await inBond(async () => {
           // Terminal dismiss without our reply: fail the open trail so the room
           // does not sit at Needs your input forever. A successful question.reply
           // already cleared pendingQuestion before this event arrives.
@@ -355,24 +343,24 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
           } else {
             clearPendingQuestion(directory)
           }
-        }
-        if (target) {
-          const stateKey = stateKeyForOpenCodeBond(target)
-          if (stateKey !== undefined) {
-            await runWithBoundSessionAsync(stateKey, clear)
-          } else {
-            await clear()
-          }
-        } else {
-          await clear()
-        }
+        })
       }
     },
     'tool.execute.after': async (input, output) => {
       try {
         const opencodeSessionId = typeof input.sessionID === 'string' ? input.sessionID : null
+        // NOT bond-gated: this is the call that CREATES the bond, so requiring one
+        // first would mean no session could ever connect.
         recordConnectionEventFromTool(directory, input.tool, input.args, output, opencodeSessionId)
-        recordManualPostSessionMessage(directory, input.tool, input.args)
+        // Bond-gated (2a5d212b): a model posting from an unbonded session must not
+        // stamp a content hash onto some other session's remote-turn state.
+        const manualPostBond =
+          opencodeSessionId === null ? undefined : stateKeyForOpenCodeBond(opencodeSessionId)
+        if (manualPostBond !== undefined) {
+          await runWithBoundSessionAsync(manualPostBond, async () => {
+            recordManualPostSessionMessage(directory, input.tool, input.args)
+          })
+        }
         if (
           (input.tool === 'devspec_register_connection' ||
             input.tool.endsWith('register_connection') ||
@@ -380,7 +368,6 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
             input.tool.endsWith('attach_connection')) &&
           opencodeSessionId
         ) {
-          fallbackSessionId = opencodeSessionId
           logPoll(
             `bond handshake tool=${input.tool} opencodeSession=${opencodeSessionId} ` +
               `active=${listOpenCodeBondSessions().length}`,
