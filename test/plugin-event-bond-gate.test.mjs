@@ -189,6 +189,35 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
     assert.deepEqual(client.calls, [])
   })
 
+  it('question.asked from an unbonded child does not touch the bonded state', async () => {
+    await hooks.event({
+      event: {
+        type: 'question.asked',
+        properties: { sessionID: CHILD, questionID: 'q1', text: 'child question?' },
+      },
+    })
+    assert.equal(
+      readBonded()?.pendingQuestion ?? null,
+      null,
+      "a child's question must not become the bonded turn's Needs-your-input",
+    )
+  })
+
+  it('command.executed from an unbonded child does not touch the bonded state', async () => {
+    const before = readBonded()?.nonMirrorMessageIds ?? []
+    await hooks.event({
+      event: {
+        type: 'command.executed',
+        properties: { sessionID: CHILD, name: 'devspec.remote', messageID: 'msg_child' },
+      },
+    })
+    assert.deepEqual(
+      readBonded()?.nonMirrorMessageIds ?? [],
+      before,
+      "a child's command must not record a skip-mirror id on the bonded connection",
+    )
+  })
+
   it('permission.ask auto-allow is scoped to the bonded session', async () => {
     const unbondedOutput = { status: 'ask' }
     await hooks['permission.ask']({ sessionID: CHILD, type: 'bash' }, unbondedOutput)
