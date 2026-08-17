@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Reserve-and-claim replaces the dispatch protocol
+
+The server retired `get_assignment`, `acknowledge_assignment` and `resolve_assignment`, along with `get_next_work_item` (DevSpec item 1e455001). Nothing dispatches work to an agent, so there was nothing left for them to do: no batch to receive, no receipt to give, nothing to close.
+
+One verb replaces them. **`reserve_work_items({ action_item_ids, connection_id })`** holds the ordered set you are about to work so no other agent takes one mid-run; then `claim_work_item` per item as you reach it. `devspec.work` reserves up front when handed several ids, and the batch closes itself when its last member is recorded, failed or released.
+
+The dispatch inbox now serves playbook runs ONLY, so the plugin's assignment-dispatch wake became unreachable. It now reports "the server is ahead of this plugin" instead of instructing an agent to call three tools that no longer exist.
+
+**Only the agent holding an item can release or fail it.** `release_work_item` and `fail_work_item` had no ownership check at all, and `claim_work_item`'s compared USERS — which cannot tell two of your own agents apart, because a DevSpec token is account-wide. All three now check the reservation against the `connection_id` you pass, server-side. A stale hold stays releasable with `force` and a reason, recorded as a takeover naming who did it.
+
 ### `--unattended` is gone from `devspec.work`, and nothing replaced it
 
 The command took a flag that installed a mode for the whole session: never ask, never wait, auto-select the highest-priority match when a name was ambiguous. It read as a safety feature and was really a licence to guess.

@@ -100,6 +100,10 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 ### Phase 1 — Resolve
 
 4. **Resolve the action item.** Extract an action item identifier from the user's input (ID, partial ID, or title keywords).
+
+4b. **Several ids? Reserve the set before starting the first.** The app emits one command carrying every selected id (`/devspec.work id1,id2,id3`) so that ONE agent works them in order. Call `reserve_work_items({ action_item_ids: [<ids in the order given>], connection_id })` once, up front: that is what stops another agent picking up the last id while you are still on the first. Then work them one at a time, claiming each as you reach it.
+
+   Read `skipped` in the response and SAY what it says — an item another agent already holds comes back with a reason naming the holder rather than an error. Work the rest; never report the whole batch as yours. There is nothing to resolve at the end: the reservation closes itself when its last member is recorded, failed or released.
    - **CRITICAL: ALWAYS call the MCP tool to fetch current state.** Even if you worked on this item earlier in this session, your conversation context may be stale — the user may have re-staged the item with new feedback since your last interaction. Never rely on in-session memory for item lifecycle.
    - If an ID (or partial ID) is provided, call `get_action_items({ project_id, status: "all" })` and match by ID prefix.
    - If keywords are provided, call `get_action_items({ project_id, status: "all" })` and match by title.
