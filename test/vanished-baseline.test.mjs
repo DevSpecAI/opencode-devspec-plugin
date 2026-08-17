@@ -11,16 +11,31 @@ import {
   clearAbandonedInjectCursor,
   decideAwaitingBaseline,
   readState,
-  resetBoundSessionIdForTests,
+  resetBondsForTests,
   writeState,
+  runWithBondAsync,
 } from '../dist/remote-control.js'
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-devspec-baseline-'))
 }
 
+
+/**
+ * State reads and writes are scoped to a bond now (item a72a4e22) — there is no
+ * process-global to fall back on. These cases exercise the state layer itself,
+ * so each runs inside one explicit test bond.
+ */
+// Each suite gets its own bond AND its own home: state files are keyed on the
+// bond alone now, so a shared name would have these files racing each other in
+// the real ~/.devspec directory. (Before the rekey the folder was part of the
+// key, which isolated them by accident.)
+process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vanished_baseline-home-'))
+const TEST_BOND = 'ses_test_bond_vanished_baseline'
+const itInBond = (name, fn) => it(name, () => runWithBondAsync(TEST_BOND, async () => fn()))
+
 describe('decideAwaitingBaseline — vanished baseline recovery (8d0f1726)', () => {
-  it('still fails closed when the inject snapshot itself failed', () => {
+  itInBond('still fails closed when the inject snapshot itself failed', () => {
     assert.deepEqual(
       decideAwaitingBaseline({
         baseline: 'msg_x',
@@ -31,7 +46,7 @@ describe('decideAwaitingBaseline — vanished baseline recovery (8d0f1726)', () 
     )
   })
 
-  it('clears when a concrete baseline id is missing from the live session', () => {
+  itInBond('clears when a concrete baseline id is missing from the live session', () => {
     assert.deepEqual(
       decideAwaitingBaseline({
         baseline: 'msg_fd7f926c30015SvpQIbHzFDChC',
@@ -42,7 +57,7 @@ describe('decideAwaitingBaseline — vanished baseline recovery (8d0f1726)', () 
     )
   })
 
-  it('waits when baseline is the latest assistant', () => {
+  itInBond('waits when baseline is the latest assistant', () => {
     assert.deepEqual(
       decideAwaitingBaseline({
         baseline: 'msg_base',
@@ -53,7 +68,7 @@ describe('decideAwaitingBaseline — vanished baseline recovery (8d0f1726)', () 
     )
   })
 
-  it('slices candidates after the baseline when newer assistants exist', () => {
+  itInBond('slices candidates after the baseline when newer assistants exist', () => {
     assert.deepEqual(
       decideAwaitingBaseline({
         baseline: 'msg_base',
@@ -68,10 +83,10 @@ describe('decideAwaitingBaseline — vanished baseline recovery (8d0f1726)', () 
 describe('clearAbandonedInjectCursor', () => {
   const dirs = []
   beforeEach(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
   })
   after(() => {
-    resetBoundSessionIdForTests()
+    resetBondsForTests()
     for (const d of dirs) {
       try {
         fs.rmSync(d, { recursive: true, force: true })
@@ -81,10 +96,10 @@ describe('clearAbandonedInjectCursor', () => {
     }
   })
 
-  it('clears awaiting/baseline/busy on disk', () => {
+  itInBond('clears awaiting/baseline/busy on disk', () => {
     const dir = tmpDir()
     dirs.push(dir)
-    writeState(dir, {
+    writeState({
       connectionId: '5aa9129e-aa63-4b80-a2ad-ad8c5e336bde',
       sessionId: '5546c769-0cc2-4eac-9bcf-ca91b14151c4',
       codename: 'Fierce Eagle',
@@ -95,8 +110,8 @@ describe('clearAbandonedInjectCursor', () => {
       busySince: 123,
     })
 
-    assert.equal(clearAbandonedInjectCursor(dir, 'msg_gone'), true)
-    const fresh = readState(dir)
+    assert.equal(clearAbandonedInjectCursor('msg_gone'), true)
+    const fresh = readState()
     assert.equal(fresh?.awaitingRemoteReply, false)
     assert.equal(fresh?.replyAfterOpenCodeMessageId, null)
     assert.equal(fresh?.busy, false)

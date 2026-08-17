@@ -575,7 +575,7 @@ describe('shouldAdvanceMessageCursor — never skip uninjected deliverables', ()
   // then empty even though `liveRoomCommands` (pre-dedup) was not. Holding
   // here is still CORRECT in that instant: advancing would permanently skip
   // the command. The fix for the resulting hold loop is NOT a change to this
-  // function — it is `clearInjectTurnState(directory, { unclaim: true })`
+  // function — it is `clearInjectTurnState({ unclaim: true })`
   // removing the stalled turn's ids from `deliveredMessageIds` on the
   // abnormal-end paths (checkBusyStall / handleSessionError / an abandoned
   // baseline), so the NEXT poll's dedup filter no longer zeroes out
