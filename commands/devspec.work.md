@@ -120,7 +120,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
    **Understand the intent.** Read the item's spec fields: `intent` (the WHY — the problem and desired outcome), `acceptance_criteria` (your definition of done — the diff must satisfy it), and `ai_instructions` (constraints). `acceptance_criteria` is your target; a diff that doesn't meet it is not done. Don't judge the fields "complete enough" and move on — the originating conversation often holds nuance the fields lost. You pull that conversation right after you claim the item (Phase 3, step 12), because the claim response is what tells you whether the transcript is authoritative.
 
-6. **Handle non-staged activities.** After loading the history (from the MCP response, NOT from conversation memory), check the item's current `agent_activity`:
+6. **Check what state it is actually in.** After loading the history (from the MCP response, NOT from conversation memory), check the item's current `agent_activity`:
 
    - **`awaiting_verification`**: Scan the history for verification feedback (entries with type `verification_report`, `verification_failed`, `feedback`, or `comment` that were added *after* the most recent `completed` event). Pay special attention to `verification_report` entries with `change_data.verified === false` — these contain user feedback from the testing page. If feedback exists that indicates something is broken or missing:
      - Present the feedback prominently:
@@ -136,7 +136,7 @@ Fix real issues before committing. If a fix would expand scope beyond the action
 
    - **`in_progress`** (claimed by another agent): Output `✗ Item is currently being worked on by another agent` and stop. If claimed by this agent in a prior session, proceed.
 
-   - **`staged`** or **`ready`**: Proceed normally to Step 7.
+   - **`idle`**: nobody holds it — proceed normally to Step 7.
 
 7. **Present the item:**
    ```

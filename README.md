@@ -37,7 +37,7 @@ Create your token in DevSpec under **You → Connections** → **Connect a tool*
 
 The URL above (`https://devspec.ai/api/mcp`) is DevSpec's production MCP host. On a self-hosted DevSpec instance, use that instance's host instead.
 
-> **Node.js 18+** is only needed for remote control and working dispatched batches (isolated work branches, session mirroring) — plain MCP tool access works without it.
+> **Node.js 18+** is only needed for remote control and working a batch of items (isolated work branches, session mirroring) — plain MCP tool access works without it.
 
 ## 3. Verify
 
