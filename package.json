@@ -1,7 +1,7 @@
 {
   "name": "opencode-devspec-plugin",
-  "version": "0.4.1",
-  "description": "DevSpec integration plugin for OpenCode (opencode.ai) \u2014 MCP connection, project conventions, ported commands, and remote control.",
+  "version": "0.5.0",
+  "description": "DevSpec integration plugin for OpenCode (opencode.ai) — MCP connection, project conventions, ported commands, and remote control.",
   "type": "module",
   "main": "dist/plugin.js",
   "types": "dist/plugin.d.ts",
