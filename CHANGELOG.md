@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+### Attached wake: one-sentence trail ack, then the answer
+
+On an attached owner command, if real work will happen before the answer, write one sentence in this OpenCode session first. Work-trail already posts that as `phase: trail` (it seeds `Working…` at turn start). Then work, then the direct answer — the plugin still mirrors `phase: answer`. If the answer is ready immediately, skip the ack.
+
+Still never call `post_session_message` (item 5f75c2cb). Sessionless still invents no room. Native slashes and work-trail are unchanged.
+
+Item `74527435`. Convention `61e2a7a2`.
 
 ## 0.4.0
 

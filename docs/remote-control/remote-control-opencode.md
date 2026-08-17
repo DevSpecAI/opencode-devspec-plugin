@@ -113,7 +113,7 @@ OpenCode exposes an in-process session API. Poller+wait is a workaround for host
 
 ## Work trail / Show work (plugin-owned)
 
-While a remote turn runs, the plugin grows a live DevSpec bubble via `post_session_message({ phase: 'trail' })`. The owner expands it under **Show work**. This is **plugin-owned**, not model play-by-play — the skill forbids interim “still working…” posts; the trail already serializes what the session is producing.
+While a remote turn runs, the plugin grows a live DevSpec bubble via `post_session_message({ phase: 'trail' })`. The owner expands it under **Show work**. This is **plugin-owned**, not model `post_session_message`. The skill tells the model to emit one OpenCode sentence first when work will precede the answer (that text becomes the contentful trail); it still forbids the model calling `post_session_message` or narrating after the answer is known.
 
 | Piece | Behaviour |
 |---|---|
