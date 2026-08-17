@@ -47,8 +47,8 @@ Start OpenCode in a DevSpec-tracked repo and ask it to list your DevSpec action 
 
 - **MCP wiring guidance** — the config block above; DevSpec's MCP server itself needs no changes.
 - **Conventions file** (`instructions/devspec.md`) — DevSpec's workflow rules (claim before coding, briefs/action items, memory usage), auto-loaded via OpenCode's `instructions` config.
-- **Ported commands** (`commands/*.md`) — `devspec.work`, `devspec.brainstorm`, `devspec.commit`, `devspec.done`, `devspec.create`, `devspec.link`, `devspec.help`, `devspec.remote`, `devspec.remote-stop` — same names as the Claude Code and Cursor plugins.
-- **Batches** — pass several item ids to `devspec.work` and it reserves them, then claims and works the members in order.
+- **Two commands** (`commands/*.md`) — `devspec.remote` and `devspec.remote-stop`, same names as the Claude Code and Cursor plugins. They exist because connecting runs a real setup script; everything else is a sentence you say to the agent, which works in any host with the DevSpec MCP server.
+- **Batches** — tell the agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* and it reserves them so nobody else takes one mid-run, then claims and works them in order. DevSpec's web app has a copy button that writes that line.
 - **Remote control** — attach this OpenCode session to a DevSpec session for phone/web control, delivered via OpenCode's own session-message API rather than a file-based workaround.
 
 ## Developing this plugin (coding agents)

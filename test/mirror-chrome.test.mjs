@@ -173,7 +173,7 @@ describe('shouldSkipConnectTurnMirror — connect skill turn (e7ecc1de)', () => 
   it('recognises remote-control skill command names', () => {
     assert.equal(isDevspecRemoteControlCommand('devspec.remote'), true)
     assert.equal(isDevspecRemoteControlCommand('devspec.remote-stop'), true)
-    assert.equal(isDevspecRemoteControlCommand('devspec.work'), false)
+    assert.equal(isDevspecRemoteControlCommand('devspec.create'), false)
   })
 })
 

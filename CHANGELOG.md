@@ -1,5 +1,26 @@
 # Changelog
 
+
+## 0.4.0
+
+### Eight commands removed — devspec.remote and devspec.remote-stop remain
+
+`devspec.work`, `.create`, `.commit`, `.link`, `.help`, `.done`, `.brainstorm`
+and `.verify-connection` are deleted.
+
+A command must be a script, not a restatement. Connecting runs a deterministic
+setup a model improvises badly and that can be tested; the others were a page of
+prose each, telling a model to call one DevSpec MCP tool it could already see.
+
+What they taught now lives in the MCP tool schemas server-side, written once and
+reaching every host the moment it changes, instead of copied into six
+repositories with no way to notice when one drifts.
+
+Say it instead: *"Work on DevSpec action item 4f2a"*, *"Work these in order:
+4f2a, 9c1b, 2e7d"*. DevSpec's copy buttons emit exactly those lines, so copying
+and typing produce the same thing — and a sentence works in a host with no
+plugin at all.
+
 ## Unreleased
 
 ### Reserve-and-claim replaces the dispatch protocol

@@ -13,7 +13,9 @@ This project is connected to DevSpec over MCP. DevSpec indexes the codebase and 
 
 ## Naming consistency
 
-This plugin's commands are named identically to the equivalent Claude Code and Cursor DevSpec integrations — `devspec.work`, `devspec.brainstorm`, `devspec.commit`, `devspec.done`, `devspec.create`, `devspec.link`, `devspec.help`, `devspec.remote`, `devspec.remote-stop` — so guidance and muscle memory carry over between tools. Do not invent OpenCode-specific names for these.
+This plugin ships two commands, named identically to the equivalent Claude Code and Cursor DevSpec integrations — `devspec.remote` and `devspec.remote-stop` — so guidance and muscle memory carry over between tools. Do not invent OpenCode-specific names for them.
+
+There is no command for working an item, creating one, or recording finished work. Ask in plain language and use the DevSpec MCP tools directly; their schemas carry the guidance those commands used to.
 
 ## Git & worktrees
 
