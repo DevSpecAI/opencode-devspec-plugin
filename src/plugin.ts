@@ -401,7 +401,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     'tool.execute.before': async (input, output) => {
       // Independent of remote-control bonds and egress ownership: every session
       // must prove its own successful claim before local mutation.
-      mutationTracker.before(input.tool, input.sessionID)
+      mutationTracker.before(input.tool, input.sessionID, output.args)
 
       // ---- Single-writer enforcement (item 4c639620) -------------------------
       // While this session holds a bond, the plugin owns answer egress, so a

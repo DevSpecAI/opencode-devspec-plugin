@@ -15,6 +15,7 @@ import {
 import {
   classifyPreclaimTool,
   isMutationTool,
+  isReadOnlyShellCommand,
   TrackBeforeMutation,
 } from '../dist/track-before-mutation.js'
 
@@ -89,18 +90,35 @@ describe('fail-closed preclaim tool classification', () => {
     }
     for (const tool of ['credit', 'nutshell', 'shellfish', 'writer', 'readme']) {
       assert.equal(isMutationTool(tool), false, `${tool} is not a mutation alias`)
-      assert.equal(classifyPreclaimTool(tool), 'unknown', `${tool} remains fail-closed`)
+      assert.equal(classifyPreclaimTool(tool), 'unknown', `${tool} remains unclassified`)
     }
   })
 
-  it('blocks known mutation and unknown/custom tools before claim', () => {
+  it('blocks known mutation, allows unknown tools, and classifies read-only shell arguments before claim', () => {
     const tracker = new TrackBeforeMutation()
-    for (const tool of ['edit', 'bash', 'delete_file', 'credit', 'nutshell', 'custom_tool']) {
-      assert.throws(() => tracker.before(tool, 'session-a'), /blocked until/, tool)
-    }
+    for (const tool of ['edit', 'delete_file']) assert.throws(() => tracker.before(tool, 'session-a'), /blocked until/, tool)
     assert.throws(() => tracker.before('write', undefined), /local mutation/)
-    for (const tool of ['read', 'grep', 'devspec_create_action_item', 'devspec_search_index', 'devspec_claim_work_item']) {
+    for (const tool of ['credit', 'nutshell', 'custom_tool', 'read', 'grep', 'devspec_create_action_item', 'devspec_search_index', 'devspec_claim_work_item']) {
       assert.doesNotThrow(() => tracker.before(tool, 'session-a'), tool)
+    }
+    const inspection = [
+      'WT=/other/repo',
+      "printf '%s\\n' status",
+      'git -C "$WT" status --short --branch',
+      'git -C "$WT" diff --stat',
+      'git -C "$WT" ls-files --others --exclude-standard',
+      'git -C "$WT" log --oneline --decorate -8',
+    ].join('\n')
+    assert.equal(isReadOnlyShellCommand(inspection), true)
+    assert.doesNotThrow(() => tracker.before('bash', 'session-a', { command: inspection }))
+    for (const command of [
+      'touch changed', 'git status; touch changed', 'printf x > file', 'printf "$(touch changed)"',
+      'sort input -o owned', 'uniq input owned', 'find . -fprint0 owned', 'X=-delete; find . "$X"',
+      'PATH=.:$PATH git status', 'GIT_EXTERNAL_DIFF=rm git diff', 'git -c alias.status=touch status',
+      'git branch -D main', 'printf -v PATH .',
+    ]) {
+      assert.equal(isReadOnlyShellCommand(command), false, command)
+      assert.throws(() => tracker.before('bash', 'session-a', { command }), /Claim the covering item and retry/, command)
     }
   })
 })
