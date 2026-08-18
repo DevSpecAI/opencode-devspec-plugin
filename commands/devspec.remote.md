@@ -17,7 +17,7 @@ The plugin does the rest in-process: polling, delivery, identity, and posting yo
    - `--new` → not supported here yet (no `create_session` wiring in this plugin). Say so and offer to attach to an existing session instead.
    - bare → a sessionless connection, available on the Agents page with no session. Not a degraded state.
 
-2. **Resolve the project, then register.** Run `git remote get-url origin` in the project directory.
+2. **Resolve the project, then register.** Use OpenCode's read-only file tools, not a shell command, to discover the origin URL. Find the nearest `.git` entry at or above the working directory. If it is a directory, read its `config`; if it is a file, read its `gitdir:` target and then that git directory's `commondir` target (when present) to reach the common `config`. From `[remote "origin"]`, use the `url` value as `git_remote`. If there is no origin or the read-only files do not resolve it unambiguously, omit `git_remote` rather than guessing. **Do not call `bash` for Git discovery.**
 
    **Folder pin — a project whose code does not exist yet.** Whether or not there is a remote, read `.devspec/project.json` if it exists — working directory first, then each parent up to the git repository root, never at or above your home directory (`~/.devspec` is machine state, not project config); nearest wins. It holds `{ "project_id": "<uuid>" }`. **If nothing resolved — no pin and no remote — offer to create one** once the user names the project: write `{ "project_id": "<uuid>" }` at the repository root, or at the working directory when there is no repo. **Never write it silently**, put nothing but the project id in it (no path, hostname, user or timestamp — that is what makes it safe to commit), and if a pin already names a DIFFERENT project, say which one before replacing it.
 
@@ -31,8 +31,9 @@ The plugin does the rest in-process: polling, delivery, identity, and posting yo
 
    Then orient on a budgeted recent window, because a large room must not dump hundreds of messages into context:
 
+   Calculate the ISO-8601 timestamp for 48 hours before the current time without invoking a shell, then call:
+
    ```
-   node -e "console.log(new Date(Date.now()-48*60*60*1000).toISOString())"
    get_session_transcript({ session_id: <full UUID>, connection_id, since_created_at: <that ISO> })
    ```
 
