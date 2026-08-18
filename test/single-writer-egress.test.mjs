@@ -28,6 +28,7 @@ import {
 
 const BONDED = 'ses_bonded_chat'
 const UNBONDED = 'ses_plain_chat'
+const ITEM = 'cdd7a494-ed6a-414b-9f8f-bd0741b9de55'
 
 describe('model-owned post_session_message is refused while bonded (4c639620)', () => {
   let tmpHome
@@ -35,6 +36,28 @@ describe('model-owned post_session_message is refused while bonded (4c639620)', 
   let restoreHomedir
   let priorHome
   let hooks
+
+  const claimSession = (sessionID) =>
+    hooks['tool.execute.after'](
+      {
+        tool: 'devspec_claim_work_item',
+        sessionID,
+        callID: `claim-${sessionID}`,
+        args: { action_item_id: ITEM },
+      },
+      {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              claim_success: true,
+              action_item_id: ITEM,
+              action_item: { id: ITEM, status: 'claimed' },
+            }),
+          },
+        ],
+      },
+    )
 
   beforeEach(async () => {
     resetBondsForTests()
@@ -45,6 +68,10 @@ describe('model-owned post_session_message is refused while bonded (4c639620)', 
     process.env.HOME = tmpHome
     hooks = await DevSpecPlugin({ client: {}, directory: projectDir })
     rememberOpenCodeBond(BONDED, '8fd18ec0-2a4f-4242-8172-1c76e06a3b8e')
+    // These are egress tests, so establish mutation attestation first and verify
+    // the independent egress guard that must still run after a claim.
+    await claimSession(BONDED)
+    await claimSession(UNBONDED)
   })
 
   afterEach(async () => {
@@ -87,18 +114,22 @@ describe('model-owned post_session_message is refused while bonded (4c639620)', 
     )
   })
 
-  it('blocks nothing else — the boundary is answer egress, not the MCP server', async () => {
+  it('blocks no other DevSpec verb — the egress boundary remains independent', async () => {
     for (const tool of [
       'devspec_report_progress',
       'devspec_create_action_item',
       'devspec_record_memory',
       'devspec_get_action_items',
       'devspec_claim_work_item',
-      'bash',
-      'edit',
     ]) {
       await assert.doesNotReject(() => before(tool, BONDED, {}), `${tool} must not be blocked`)
     }
+  })
+
+  it('still enforces single-writer egress after a claim allows local mutation', async () => {
+    await assert.doesNotReject(() => before('bash', BONDED, {}))
+    await assert.doesNotReject(() => before('edit', BONDED, {}))
+    await assert.rejects(() => before('devspec_post_session_message', BONDED, { message: 'x' }))
   })
 
   it('a stale skill cannot produce an alternate answer, whatever it passes', async () => {
