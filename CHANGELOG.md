@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0
+
+### Commit provenance replaces claim-gated mutation blocking
+
+OpenCode no longer treats a missing DevSpec claim as permission to edit or run
+commands. `track-before-mutation.ts` and its classifier are deleted. Provenance
+assistance now acts only on a simple observable `bash` `git commit -m` in a
+pinned project: it can stamp exactly one active session claim, deny an untagged
+readable commit without terminating the session, and otherwise fails open.
+
+Readable commit shapes include isolated-worktree forms: `cd <single-path> && git
+commit …` and `git -C <path> commit …`. Unknown tools, opaque shell, push, and
+post-record follow-through are not claim-gated. Authority remains
+`devspec://product/implementation-contract`.
+
+Capability table: `docs/commit-provenance.md`. Item `f240d17f`. ADR `71c23b46`.
+
 ## 0.4.1
 
 ### Attached wake: one-sentence trail ack, then the answer

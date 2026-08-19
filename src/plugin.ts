@@ -26,7 +26,7 @@ import {
   applyServeAuthToPluginClient,
   ensureServeAuthEnv,
 } from './serve-auth.js'
-import { TrackBeforeMutation } from './track-before-mutation.js'
+import { CommitProvenance } from './commit-provenance.js'
 
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
 // OPENCODE_SERVER_PASSWORD as early as this module loads — same rule as rocket
@@ -145,9 +145,9 @@ function isQuestionResolvedEvent(type: string): boolean {
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
 export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
-  // Claim attestation is intentionally process-local. A plugin restart creates a
-  // fresh empty tracker, so local mutation fails closed until this session claims.
-  const mutationTracker = new TrackBeforeMutation()
+  // Commit provenance is process-local. A restart forgets claims, which only
+  // disables stamping — it never blocks edits or execution.
+  const provenance = new CommitProvenance({ directory })
 
   // Defensive: older OpenCode builds omit Authorization on the plugin client
   // when a serve password is set. No-op on builds that already inject it.
@@ -267,8 +267,8 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     dispose: async () => {
       stopped = true
       abort.abort()
-      mutationTracker.clearAll()
-      logPoll('dispose: pump stopped, in-flight hold aborted, and claim attestations cleared')
+      provenance.clearAll()
+      logPoll('dispose: pump stopped, in-flight hold aborted, and provenance state cleared')
     },
     config: async (cfg) => {
       registerBundledCommands(cfg)
@@ -288,11 +288,8 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
             ? eventInfo.id
             : undefined
 
-      // OpenCode exposes session deletion through the generic event hook. Clear
-      // claim attestation before the unrelated remote-control bond gate so an
-      // unbonded deleted session is cleaned up too.
       if (event.type === 'session.deleted' && sessionId) {
-        mutationTracker.clearSession(sessionId)
+        provenance.clearSession(sessionId)
       }
 
       // ---- The bond gate (item 2a5d212b) -------------------------------------
@@ -399,9 +396,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
      * a heuristic — it is the plugin providing a fact the model has no access to.
      */
     'tool.execute.before': async (input, output) => {
-      // Independent of remote-control bonds and egress ownership: every session
-      // must prove its own successful claim before local mutation.
-      mutationTracker.before(input.tool, input.sessionID, output.args)
+      provenance.before(input.tool, input.sessionID, output.args, input.callID)
 
       // ---- Single-writer enforcement (item 4c639620) -------------------------
       // While this session holds a bond, the plugin owns answer egress, so a
@@ -456,7 +451,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     'tool.execute.after': async (input, output) => {
       // Observe the raw structured result before unrelated remote-control work.
       // Malformed/failed results are inert; this observer never throws.
-      mutationTracker.after(input.tool, input.sessionID, input.args, output)
+      provenance.after(input.tool, input.sessionID, input.args, output, input.callID)
       try {
         const opencodeSessionId = typeof input.sessionID === 'string' ? input.sessionID : null
         // NOT bond-gated: this is the call that CREATES the bond, so requiring one
