@@ -68,8 +68,6 @@ describe('model-owned post_session_message is refused while bonded (4c639620)', 
     process.env.HOME = tmpHome
     hooks = await DevSpecPlugin({ client: {}, directory: projectDir })
     rememberOpenCodeBond(BONDED, '8fd18ec0-2a4f-4242-8172-1c76e06a3b8e')
-    // These are egress tests, so establish mutation attestation first and verify
-    // the independent egress guard that must still run after a claim.
     await claimSession(BONDED)
     await claimSession(UNBONDED)
   })
@@ -126,8 +124,8 @@ describe('model-owned post_session_message is refused while bonded (4c639620)', 
     }
   })
 
-  it('still enforces single-writer egress after a claim allows local mutation', async () => {
-    await assert.doesNotReject(() => before('bash', BONDED, {}))
+  it('still enforces single-writer egress independently of commit provenance', async () => {
+    await assert.doesNotReject(() => before('bash', BONDED, { command: 'echo hi' }))
     await assert.doesNotReject(() => before('edit', BONDED, {}))
     await assert.rejects(() => before('devspec_post_session_message', BONDED, { message: 'x' }))
   })
