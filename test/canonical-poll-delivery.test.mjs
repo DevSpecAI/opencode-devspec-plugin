@@ -76,6 +76,7 @@ let promptImpl
 let abortCalls
 let summarizeCalls
 let reloadCalls
+let controlAckResults
 
 function clientDouble() {
   return {
@@ -93,8 +94,11 @@ function clientDouble() {
 function statePath() {
   return path.join(os.homedir(), '.devspec', 'opencode-remote-control', `${bondLocalId(opencodeSessionId)}.json`)
 }
-async function tick(client = clientDouble()) {
-  return runWithBondAsync(opencodeSessionId, () => pollAndDeliver(client, process.cwd(), opencodeSessionId))
+async function tick(client = clientDouble(), opts = {}) {
+  return runWithBondAsync(
+    opencodeSessionId,
+    () => pollAndDeliver(client, process.cwd(), opencodeSessionId, opts),
+  )
 }
 async function settle() {
   await new Promise((resolve) => setTimeout(resolve, 25))
@@ -113,11 +117,17 @@ beforeEach(() => {
   abortCalls = 0
   summarizeCalls = 0
   reloadCalls = 0
+  controlAckResults = []
   globalThis.fetch = async (_url, init) => {
     const body = JSON.parse(init.body)
     calls.push(body.params)
     if (body.params.name === 'poll_connection' && !body.params.arguments.control_ack) {
       return mcpResponse(pollResults.shift() ?? { connection_id: connectionId, session_id: devspecSessionId, changed: false, cursor_v2: null, dispatch_cursor: null })
+    }
+    if (body.params.name === 'poll_connection' && body.params.arguments.control_ack) {
+      const result = controlAckResults.shift()
+      if (result instanceof Error) throw result
+      return mcpResponse(result ?? { ok: true, changed: false })
     }
     return mcpResponse({ ok: true, changed: false })
   }
@@ -201,6 +211,143 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(promptCalls.length, 2)
     assert.deepEqual(state.deliveredMessageIds, [message1])
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
+  })
+
+  it('finalizes canonical acceptance through every bookkeeping fault without duplicate or permanent defer', async () => {
+    const stages = [
+      'canonical_delivered_ids',
+      'canonical_conversation_cursor',
+      'canonical_advisory_carry',
+    ]
+    for (let index = 0; index < stages.length; index++) {
+      const stage = stages[index]
+      const messageId = `10000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+      const acceptedTurnId = `20000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+      const provenance = `30000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+      const cmd = command(messageId, index + 1, provenance, `fault ${stage}`, true)
+      cmd.delivery.turn_id = acceptedTurnId
+      cmd.delivery.primary_provenance_ref = provenance
+      const response = changed({ cursor_v2: `cursor-${stage}`, ingress: ingress([cmd]) })
+      pollResults.push(response)
+      let faulted = false
+      await tick(clientDouble(), {
+        acceptanceBookkeepingFault: (candidate, key) => {
+          if (!faulted && candidate === stage && key === `canonical:${acceptedTurnId}`) {
+            faulted = true
+            throw new Error(`injected ${stage}`)
+          }
+        },
+      })
+      await settle()
+      assert.equal(faulted, true)
+      assert.equal(promptCalls.length, index + 1)
+
+      pollResults.push(structuredClone(response))
+      await tick(); await settle()
+      assert.equal(promptCalls.length, index + 1, `${stage} reoffered promptAsync`)
+    }
+
+    const next = command(
+      '10000000-0000-4000-8000-000000000099',
+      9,
+      '30000000-0000-4000-8000-000000000099',
+      'later new turn',
+      true,
+    )
+    next.delivery.turn_id = '20000000-0000-4000-8000-000000000099'
+    next.delivery.primary_provenance_ref = next.delivery.provenance_ref
+    pollResults.push(changed({ cursor_v2: 'later-new-turn', ingress: ingress([next]) }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, stages.length + 1, 'later turn remained deferred')
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.ok(state.deliveredMessageIds.includes(next.message_id))
+    assert.equal(state.remoteIngressCursorV2, 'later-new-turn')
+  })
+
+  it('finalizes playbook acceptance through every bookkeeping fault without replay', async () => {
+    const stages = [
+      'playbook_memory_ids',
+      'playbook_persisted_ids',
+      'playbook_dispatch_cursor',
+    ]
+    for (let index = 0; index < stages.length; index++) {
+      const stage = stages[index]
+      const dispatchId = `play-fault-${index + 1}`
+      const response = changed({
+        dispatch_cursor: `dispatch-${stage}`,
+        dispatches: [{ id: dispatchId, kind: 'playbook_run', run_id: `run-${index + 1}`, instruction: stage }],
+      })
+      pollResults.push(response)
+      let faulted = false
+      await tick(clientDouble(), {
+        acceptanceBookkeepingFault: (candidate, key) => {
+          if (!faulted && candidate === stage && key === `playbook:${dispatchId}`) {
+            faulted = true
+            throw new Error(`injected ${stage}`)
+          }
+        },
+      })
+      await settle()
+      assert.equal(faulted, true)
+      assert.equal(promptCalls.length, index + 1)
+
+      pollResults.push(structuredClone(response))
+      await tick(); await settle()
+      assert.equal(promptCalls.length, index + 1, `${stage} replayed playbook prompt`)
+      const state = runWithBond(opencodeSessionId, () => readState())
+      assert.ok(state.deliveredPlaybookDispatchIds.includes(dispatchId))
+    }
+  })
+
+  it('does not let an old-room acceptance callback mutate new-room cursor or carry', async () => {
+    const old = command(message1, 1, provenance1, 'held old-room turn', true)
+    const oldResponse = changed({ cursor_v2: 'old-room-cursor', ingress: ingress([old]) })
+    let acceptOld
+    promptImpl = () => new Promise((resolve) => { acceptOld = resolve })
+    pollResults.push(oldResponse)
+    await tick()
+    assert.equal(promptCalls.length, 1)
+
+    const newRoomId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    pollResults.push(changed({ session_id: newRoomId, cursor_v2: 'discarded-adopt-cursor' }))
+    await tick()
+    let state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.sessionId, newRoomId)
+    assert.equal(state.remoteIngressCursorV2 ?? null, null)
+
+    const contextId = 'f1111111-1111-4111-8111-111111111111'
+    const entry = {
+      message_id: contextId,
+      order: point(2, contextId),
+      actor: { kind: 'human', user_id: ownerId, display_name: 'New Room', agent_tool: null, model: null },
+      source_type: 'session_message', relationship: 'within_window', content: 'NEW ROOM CARRY', advisory: true,
+    }
+    const context = { human_context: [entry], agent_context: [], ai_context: [], system_context: [] }
+    pollResults.push(changed({
+      session_id: newRoomId,
+      cursor_v2: 'new-room-context-cursor',
+      ingress: ingress([], { context }),
+    }))
+    await tick()
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.remoteIngressCursorV2, 'new-room-context-cursor')
+
+    acceptOld({ data: true })
+    await settle()
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.remoteIngressCursorV2, 'new-room-context-cursor')
+    assert.equal((state.deliveredMessageIds ?? []).includes(message1), false)
+
+    promptImpl = async () => ({ data: true })
+    const next = command(message2, 3, provenance2, 'new-room turn', true)
+    next.delivery.turn_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    next.delivery.primary_provenance_ref = provenance2
+    pollResults.push(changed({ session_id: newRoomId, cursor_v2: 'new-room-command-cursor', ingress: ingress([next]) }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
+    assert.match(promptCalls[1].body.parts[0].text, /NEW ROOM CARRY/)
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.remoteIngressCursorV2, 'new-room-command-cursor')
   })
 
   it('treats partial multi-command dedupe as an atomic delivered turn and never prompts the suffix', async () => {
@@ -457,6 +604,25 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.match(notice.arguments.message, /missing\/not-a-model/)
     const state = runWithBond(opencodeSessionId, () => readState())
     assert.equal(state.remoteControlModel ?? null, null)
+  })
+
+  it('retries a failed control acknowledgement without re-executing the host action', async () => {
+    const control = { id: controlId, verb: 'abort', issued_at: '2026-08-20T12:00:00.000Z', issued_by_user_id: ownerId }
+    const response = changed({
+      cursor_v2: 'cursor-after-control-ack',
+      ingress: ingress([], { wake: { kind: 'control', active: true, reason_id: 'owner_control' }, control }),
+    })
+    controlAckResults.push(new Error('ack transport failed'))
+    pollResults.push(response)
+    await tick(); await settle()
+    assert.equal(abortCalls, 1)
+
+    pollResults.push(structuredClone(response))
+    await tick(); await settle()
+    assert.equal(abortCalls, 1)
+    assert.equal(calls.filter((call) => call.arguments.control_ack === controlId).length, 2)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.remoteIngressCursorV2, 'cursor-after-control-ack')
   })
 
   it('does not acknowledge a typed control when the deterministic host action fails', async () => {

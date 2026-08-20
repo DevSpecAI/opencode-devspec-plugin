@@ -688,6 +688,8 @@ export interface PollOutcome {
 }
 export declare function pollAndDeliver(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string, opts?: {
     signal?: AbortSignal;
+    /** Test-only fault injection at named post-acceptance bookkeeping stages. */
+    acceptanceBookkeepingFault?: (stage: string, key: string) => void;
 }): Promise<PollOutcome>;
 /**
  * Reset OpenCode LLM context in place (item 8718be5a + siblings 37a7487b / 8a55a89b).

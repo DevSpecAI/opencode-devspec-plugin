@@ -1725,7 +1725,95 @@ async function reportPollError(auth, directory, state, stage, err, consecutiveEr
 }
 const pumpStates = new Map();
 function clearPromptTransactions(connectionId) {
-    pumpStates.get(connectionId)?.promptTransactions.clear();
+    const pump = pumpStates.get(connectionId);
+    if (!pump)
+        return;
+    // A host-accepted transaction with failed bookkeeping must remain an in-process
+    // dedupe barrier even if session.idle clears the ordinary prompt lifecycle.
+    for (const key of pump.promptTransactions.keys()) {
+        if (!pump.acceptanceRecoveries.has(key))
+            pump.promptTransactions.delete(key);
+    }
+}
+function runAcceptanceStages(stages) {
+    const retrySuffix = [];
+    let mustRetry = false;
+    for (const stage of stages) {
+        try {
+            stage.run();
+        }
+        catch (err) {
+            mustRetry = true;
+            logPoll(`accepted prompt bookkeeping stage ${stage.name} failed: ${err}`);
+        }
+        // Later bookkeeping may depend on an earlier stage (playbook persistence
+        // follows its in-memory id update), so retain the idempotent suffix from
+        // the first failure even when a later attempt happened to succeed now.
+        if (mustRetry)
+            retrySuffix.push(stage);
+    }
+    return retrySuffix;
+}
+function acceptanceRoomIsCurrent(pump, roomGeneration, devspecSessionId) {
+    return pump.roomGeneration === roomGeneration && (readState()?.sessionId ?? null) === devspecSessionId;
+}
+function retryAcceptanceRecoveries(pump) {
+    for (const recovery of [...pump.acceptanceRecoveries.values()]) {
+        if (recovery.roomGeneration !== null &&
+            !acceptanceRoomIsCurrent(pump, recovery.roomGeneration, recovery.devspecSessionId)) {
+            pump.acceptanceRecoveries.delete(recovery.key);
+            logPoll(`dropping stale old-room bookkeeping recovery for accepted prompt ${recovery.key}`);
+            continue;
+        }
+        const failed = runAcceptanceStages(recovery.stages);
+        if (failed.length === 0) {
+            pump.acceptanceRecoveries.delete(recovery.key);
+            logPoll(`accepted prompt ${recovery.key} bookkeeping recovered in process`);
+        }
+        else {
+            recovery.stages = failed;
+        }
+    }
+}
+/**
+ * Host acceptance is final even when local bookkeeping fails. Exact-key status
+ * and latch release therefore live in finally, while only failed idempotent
+ * stages are retained for an in-process retry.
+ */
+function finalizeAcceptedPrompt(input) {
+    const { pump, key, owner } = input;
+    let failed = [];
+    try {
+        const roomCurrent = input.roomGeneration === undefined || acceptanceRoomIsCurrent(pump, input.roomGeneration, input.devspecSessionId ?? null);
+        if (roomCurrent) {
+            failed = runAcceptanceStages(input.stages);
+        }
+        else {
+            logPoll(`accepted prompt ${key} belongs to an old room generation; room bookkeeping skipped`);
+        }
+    }
+    finally {
+        pump.promptTransactions.set(key, 'accepted');
+        if (owner === 'canonical') {
+            if (pump.acceptingTurn?.key === key)
+                pump.acceptingTurn = null;
+        }
+        else if (pump.acceptingPlaybook?.key === key) {
+            pump.acceptingPlaybook = null;
+        }
+    }
+    if (failed.length > 0) {
+        pump.acceptanceRecoveries.set(key, {
+            key,
+            stages: failed,
+            roomGeneration: input.roomGeneration ?? null,
+            devspecSessionId: input.devspecSessionId ?? null,
+        });
+        logPoll(`accepted prompt ${key} awaiting in-process bookkeeping recovery`);
+    }
+    else {
+        pump.acceptanceRecoveries.delete(key);
+    }
 }
 /** Epoch ms of last successful `poll_connection` per connection (presence breadcrumb). */
 const lastSuccessfulPollAt = new Map();
@@ -1744,6 +1832,7 @@ function pumpStateFor(connectionId, persisted) {
             needsSeed: true,
             consecutiveEmpty: 0,
             consecutiveErrors: 0,
+            roomGeneration: 0,
             consecutiveRecoverableEnds: 0,
             // Seeded from disk so a plugin restart cannot re-inject a playbook run it
             // already handed to the model.
@@ -1751,6 +1840,7 @@ function pumpStateFor(connectionId, persisted) {
             acceptingTurn: null,
             acceptingPlaybook: null,
             promptTransactions: new Map(),
+            acceptanceRecoveries: new Map(),
         };
         pumpStates.set(connectionId, s);
     }
@@ -1938,6 +2028,14 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         catchUpCursor: state.remoteIngressCatchUpCursor ?? null,
         dispatchCursor: state.remoteDispatchCursor ?? null,
         playbookDispatchIds: persistedPlaybookIds.ids,
+    });
+    retryAcceptanceRecoveries(pump);
+    const acceptanceStage = (name, key, run) => ({
+        name,
+        run: () => {
+            opts.acceptanceBookkeepingFault?.(name, key);
+            run();
+        },
     });
     const turnActive = state.busy === true;
     const hold = holdFor({ attached: !!state.sessionId, turnActive });
@@ -2145,6 +2243,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         // later with a backdated paint timestamp (session 23da0643 / item 2411dd5a).
         // Session 1383cbb8 needed the pending command delivered; a null-cursor re-poll
         // gets the catch-up window and does that correctly without the race.
+        pump.roomGeneration++;
         pump.cursorV2 = null;
         pump.catchUpCursor = null;
         pump.dispatchCursor = null;
@@ -2186,7 +2285,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     const commitPlaybookCursor = () => {
         if (playbookDispatchCursor)
             pump.dispatchCursor = playbookDispatchCursor;
-        patchState({ remoteDispatchCursor: pump.dispatchCursor });
+        return Boolean(patchState({ remoteDispatchCursor: pump.dispatchCursor }));
     };
     if (freshDispatches.length === 0) {
         commitPlaybookCursor();
@@ -2194,7 +2293,27 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     else {
         const playbookDispatchIds = freshDispatches.map((dispatch) => dispatch.id);
         const playbookKey = `playbook:${playbookDispatchIds.join(',')}`;
-        if (!pump.acceptingPlaybook) {
+        const playbookAcceptanceStages = () => [
+            acceptanceStage('playbook_memory_ids', playbookKey, () => {
+                for (const id of playbookDispatchIds)
+                    pump.deliveredPlaybookDispatchIds.add(id);
+            }),
+            acceptanceStage('playbook_persisted_ids', playbookKey, () => {
+                if (!patchState({
+                    deliveredPlaybookDispatchIds: [...pump.deliveredPlaybookDispatchIds].slice(-50),
+                })) {
+                    throw new Error('delivered playbook ids were not persisted');
+                }
+            }),
+            acceptanceStage('playbook_dispatch_cursor', playbookKey, () => {
+                if (!commitPlaybookCursor())
+                    throw new Error('playbook dispatch cursor was not persisted');
+            }),
+        ];
+        if (pump.promptTransactions.get(playbookKey) === 'accepted') {
+            logPoll(`suppressing in-process reoffer of host-accepted playbook ${playbookKey}`);
+        }
+        else if (!pump.acceptingPlaybook) {
             pump.acceptingPlaybook = { key: playbookKey, playbookDispatchIds };
             pump.promptTransactions.set(playbookKey, 'pending');
             const playbookCommands = freshDispatches.map((dispatch) => ({
@@ -2220,13 +2339,12 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                 model,
                 thinking: state.remoteControlThinking ?? undefined,
                 onAccepted: () => {
-                    for (const id of playbookDispatchIds)
-                        pump.deliveredPlaybookDispatchIds.add(id);
-                    patchState({ deliveredPlaybookDispatchIds: [...pump.deliveredPlaybookDispatchIds].slice(-50) });
-                    commitPlaybookCursor();
-                    pump.promptTransactions.set(playbookKey, 'accepted');
-                    if (pump.acceptingPlaybook?.key === playbookKey)
-                        pump.acceptingPlaybook = null;
+                    finalizeAcceptedPrompt({
+                        pump,
+                        key: playbookKey,
+                        owner: 'playbook',
+                        stages: playbookAcceptanceStages(),
+                    });
                 },
                 onRejected: () => {
                     pump.promptTransactions.delete(playbookKey);
@@ -2289,10 +2407,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             pump.cursorV2 = liveCursorCandidate;
         pump.catchUpCursor = catchUpCursorCandidate;
         pump.needsSeed = Boolean(catchUpCursorCandidate);
-        patchState({
+        return Boolean(patchState({
             remoteIngressCursorV2: pump.cursorV2,
             remoteIngressCatchUpCursor: pump.catchUpCursor,
-        });
+        }));
     };
     // Canonical typed controls never come from slash-looking conversation text.
     // Execute once, persist the execution marker, then acknowledge the exact id.
@@ -2378,13 +2496,15 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     const commandIds = roomCommands.map((command) => command.message_id);
     const canonicalTurnId = roomCommands[0].delivery.turn_id;
     const acceptanceKey = `canonical:${canonicalTurnId}`;
-    pump.acceptingTurn = { key: acceptanceKey, commandIds };
-    pump.promptTransactions.set(acceptanceKey, 'pending');
     // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
     // question, the next owner command answers THAT question — it must not start
     // a fresh promptAsync turn. Advisory chatter never reaches this branch
     // (commands are local_agent_dispatch only).
     if (state.pendingQuestion?.requestId && roomCommands.length > 0) {
+        // Keep this existing non-prompt transaction path independent from the
+        // promptAsync acceptance recovery introduced below.
+        pump.acceptingTurn = { key: acceptanceKey, commandIds };
+        pump.promptTransactions.set(acceptanceKey, 'pending');
         const pendingRequestId = state.pendingQuestion.requestId;
         const answerText = roomCommands
             .map((c) => typeof c?.content === 'string'
@@ -2416,6 +2536,37 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         logPoll('needs_input: question.reply failed — immutable command turn remains uncommitted');
         return { delayMs: 2000, stop: false };
     }
+    if (pump.promptTransactions.get(acceptanceKey) === 'accepted') {
+        logPoll(`suppressing in-process reoffer of host-accepted canonical turn ${acceptanceKey}`);
+        return { delayMs: 0, stop: false };
+    }
+    pump.acceptingTurn = { key: acceptanceKey, commandIds };
+    pump.promptTransactions.set(acceptanceKey, 'pending');
+    const acceptanceRoomGeneration = pump.roomGeneration;
+    const acceptanceDevspecSessionId = state.sessionId;
+    const canonicalAcceptanceStages = () => [
+        acceptanceStage('canonical_delivered_ids', acceptanceKey, () => {
+            const acceptedState = readState();
+            if (!acceptedState)
+                throw new Error('bond state unavailable');
+            const acceptedIds = new Set(acceptedState.deliveredMessageIds ?? []);
+            for (const id of commandIds)
+                acceptedIds.add(id);
+            if (!patchState({
+                deliveredMessageIds: [...acceptedIds].slice(-50),
+                currentTurnMessageIds: Array.from(new Set([...(acceptedState.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
+            })) {
+                throw new Error('delivered message ids were not persisted');
+            }
+        }),
+        acceptanceStage('canonical_conversation_cursor', acceptanceKey, () => {
+            if (!commitConversationCursor())
+                throw new Error('conversation cursor was not persisted');
+        }),
+        acceptanceStage('canonical_advisory_carry', acceptanceKey, () => {
+            pump.carry.take();
+        }),
+    ];
     // Slash-looking conversational bodies remain ordinary human commands. Only
     // ingress.control can enter the deterministic host-control path.
     // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
@@ -2519,19 +2670,14 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         model,
         thinking,
         onAccepted: () => {
-            const acceptedState = readState() ?? state;
-            const acceptedIds = new Set(acceptedState.deliveredMessageIds ?? []);
-            for (const id of commandIds)
-                acceptedIds.add(id);
-            patchState({
-                deliveredMessageIds: [...acceptedIds].slice(-50),
-                currentTurnMessageIds: Array.from(new Set([...(acceptedState.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
+            finalizeAcceptedPrompt({
+                pump,
+                key: acceptanceKey,
+                owner: 'canonical',
+                stages: canonicalAcceptanceStages(),
+                roomGeneration: acceptanceRoomGeneration,
+                devspecSessionId: acceptanceDevspecSessionId,
             });
-            commitConversationCursor();
-            pump.carry.take();
-            pump.promptTransactions.set(acceptanceKey, 'accepted');
-            if (pump.acceptingTurn?.key === acceptanceKey)
-                pump.acceptingTurn = null;
         },
         onRejected: () => {
             pump.promptTransactions.delete(acceptanceKey);
