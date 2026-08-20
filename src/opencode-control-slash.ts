@@ -65,12 +65,17 @@ export function resolveOwnerControlSlash(commands: unknown[]): OpencodeControlSl
   if (!Array.isArray(commands) || commands.length !== 1) return null
   const only = commands[0] as Record<string, unknown> | null
   if (!only || typeof only !== 'object') return null
+  const structured = only.content && typeof only.content === 'object'
+    ? (only.content as Record<string, unknown>)
+    : null
   const content =
     typeof only.content === 'string'
       ? only.content
-      : typeof only.text === 'string'
-        ? only.text
-        : null
+      : typeof structured?.body === 'string'
+        ? structured.body
+        : typeof only.text === 'string'
+          ? only.text
+          : null
   return parseOpencodeControlSlash(content)
 }
 

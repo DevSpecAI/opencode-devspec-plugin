@@ -107,6 +107,11 @@ export interface AdvisoryMessage {
   author?: { kind?: string; name?: string; user_id?: string; agent_tool?: string }
   is_voice_input?: boolean
   note?: string
+  /** Canonical typed advisory bucket; always rendered with actor attribution. */
+  context_bucket?: 'human_context' | 'agent_context' | 'ai_context' | 'system_context'
+  actor_model?: string | null
+  actor_agent_tool?: string | null
+  ingress_sequence?: number
   /** Parent quote when this message was a reply (MCP social metadata, item b6eff1a3). */
   reply_to?: {
     messageId?: string
@@ -184,10 +189,23 @@ export function trimAdvisoryCarry(
   return { kept, dropped: items.length - kept.length }
 }
 
+export interface AdvisoryWindowMetadata {
+  returned: number
+  total_known: number | null
+  truncated: boolean
+  has_more: boolean
+  next_cursor: string | null
+  fetch_id: string | null
+  omission_reason: string | null
+  source_window: { start: { sequence: number } | null; end: { sequence: number } | null }
+}
+
 export interface CarriedContext {
   owner_ambient: AdvisoryMessage[]
   room_context: AdvisoryMessage[]
   dropped: number
+  /** Latest canonical bounded-window disclosure carried with this advisory. */
+  window?: AdvisoryWindowMetadata | null
 }
 
 /**
@@ -208,23 +226,30 @@ export function createCarryBuffer() {
   let ownerAmbient: AdvisoryMessage[] = []
   let roomContext: AdvisoryMessage[] = []
   let dropped = 0
+  let window: AdvisoryWindowMetadata | null = null
 
   return {
     /** Merge a response's advisory into the buffer, trimming to budget. */
-    add(nextOwnerAmbient: AdvisoryMessage[], nextRoomContext: AdvisoryMessage[]): void {
+    add(
+      nextOwnerAmbient: AdvisoryMessage[],
+      nextRoomContext: AdvisoryMessage[],
+      nextWindow?: AdvisoryWindowMetadata | null,
+    ): void {
       const amb = trimAdvisoryCarry([...ownerAmbient, ...(nextOwnerAmbient ?? [])])
       const room = trimAdvisoryCarry([...roomContext, ...(nextRoomContext ?? [])])
       ownerAmbient = amb.kept
       roomContext = room.kept
       dropped += amb.dropped + room.dropped
+      if (nextWindow) window = nextWindow
     },
     /** Take (and clear) the carried context to attach to a command. */
     take(): CarriedContext | null {
       if (ownerAmbient.length === 0 && roomContext.length === 0) return null
-      const context: CarriedContext = { owner_ambient: ownerAmbient, room_context: roomContext, dropped }
+      const context: CarriedContext = { owner_ambient: ownerAmbient, room_context: roomContext, dropped, window }
       ownerAmbient = []
       roomContext = []
       dropped = 0
+      window = null
       return context
     },
     /** Drop everything — used when the server moves us to a different room. */
@@ -232,6 +257,7 @@ export function createCarryBuffer() {
       ownerAmbient = []
       roomContext = []
       dropped = 0
+      window = null
     },
     get size(): number {
       return ownerAmbient.length + roomContext.length
@@ -494,17 +520,23 @@ export function resolveServerAttachment(
 
 function authorLabel(m: AdvisoryMessage): string {
   const name = m?.author?.name?.trim()
-  if (name) return name
   const kind = m?.author?.kind
-  if (kind === 'in_session_ai') return 'DevSpec AI'
-  if (kind === 'external_agent') return 'another agent'
-  return 'someone in the room'
+  const actor = kind === 'in_session_ai' ? 'ai' : kind === 'external_agent' ? 'agent' : kind
+  const identity = name || (actor === 'ai' ? 'DevSpec AI' : actor === 'agent' ? 'another agent' : 'someone in the room')
+  const details = [m.context_bucket, actor ? `${actor} actor` : null, m.actor_agent_tool, m.actor_model]
+    .filter(Boolean)
+    .join('; ')
+  return details ? `${details} — ${identity}` : identity
 }
 
 function renderAdvisoryLine(m: AdvisoryMessage): string {
-  const body = typeof m?.content === 'string' ? m.content.trim() : ''
+  // Canonical context is already bounded server data: preserve its body exactly.
+  // Legacy advisory keeps its historical compact trim behavior.
+  const body = typeof m?.content === 'string'
+    ? m.context_bucket ? m.content : m.content.trim()
+    : ''
   const social = formatSocialMeta(m)
-  if (!body && !social) return ''
+  if (!body && !social && !m.context_bucket) return ''
   const text = social ? (body ? `${body} ${social}` : social) : body
   return `- **${authorLabel(m)}:** ${text}`
 }
@@ -585,12 +617,15 @@ export type MaterializeLargeAttachment = (input: {
  * Pass `materializeLarge` from the host (remote-control) to spill oversize-but-allowed
  * payloads to disk and return a `file://` URL — unit tests can stub this.
  */
+export interface AttachmentReference { filename: string; mime: string; resourceId: string; sizeBytes: number | null }
+
 export function buildAttachmentParts(
   commands: Array<{ attachments?: unknown }>,
   opts?: { materializeLarge?: MaterializeLargeAttachment },
-): { parts: FilePart[]; declined: Array<{ filename: string; reason: string }> } {
+): { parts: FilePart[]; declined: Array<{ filename: string; reason: string }>; references: AttachmentReference[] } {
   const parts: FilePart[] = []
   const declined: Array<{ filename: string; reason: string }> = []
+  const references: AttachmentReference[] = []
   const materializeLarge = opts?.materializeLarge
 
   for (const cmd of Array.isArray(commands) ? commands : []) {
@@ -599,7 +634,23 @@ export function buildAttachmentParts(
       if (!a || typeof a !== 'object') continue
       const filename = typeof a.filename === 'string' && a.filename ? a.filename : 'attachment'
       const mime =
-        typeof a.mimeType === 'string' && a.mimeType ? a.mimeType : 'application/octet-stream'
+        typeof a.mimeType === 'string' && a.mimeType
+          ? a.mimeType
+          : typeof (a as any).mime_type === 'string' && (a as any).mime_type
+            ? (a as any).mime_type
+            : 'application/octet-stream'
+
+      // Canonical metadata is a stable accepted reference, not an absent legacy
+      // inline payload. Preserve the identity verbatim for the model/tool surface.
+      if ((a as any).materialization === 'metadata' && typeof (a as any).resource_id === 'string') {
+        references.push({
+          filename,
+          mime,
+          resourceId: (a as any).resource_id,
+          sizeBytes: typeof (a as any).size_bytes === 'number' ? (a as any).size_bytes : null,
+        })
+        continue
+      }
 
       // dataUrl is content re-encoded; either is fine, prefer the ready-made one.
       let url: string | null = null
@@ -663,7 +714,7 @@ export function buildAttachmentParts(
     }
   }
 
-  return { parts, declined }
+  return { parts, declined, references }
 }
 
 /** The line that tells the model an attachment exists but did not make it through. */
@@ -682,6 +733,12 @@ export function renderInjectedTurn(input: {
   commands: Array<{
     content?: unknown
     addressed_to?: { label?: string; connection_id?: string }
+    addressee?: { label?: string; connection_id?: string; agent_name?: string | null; codename?: string | null }
+    message_id?: string
+    order?: { sequence?: number; created_at?: string; message_id?: string }
+    requester?: { user_id?: string; display_name?: string | null }
+    authority?: { kind?: string; mode?: string; requested_by_user_id?: string; connection_owner_user_id?: string; decision_source?: string }
+    delivery?: { provenance_ref?: string; turn_id?: string; primary_provenance_ref?: string; is_primary?: boolean }
     author?: { name?: string }
     reply_to?: unknown
     reactions?: unknown
@@ -689,6 +746,7 @@ export function renderInjectedTurn(input: {
   context?: CarriedContext | null
   deliveryContract?: string | null
   declinedAttachments?: Array<{ filename: string; reason: string }>
+  attachmentReferences?: AttachmentReference[]
 }): string {
   const commands = Array.isArray(input.commands) ? input.commands : []
   const ctx = input.context ?? null
@@ -713,14 +771,23 @@ export function renderInjectedTurn(input: {
       parts.push(`### Everyone else (teammates, other agents, DevSpec AI)\n${room.join('\n')}`)
     }
     if (ctx && ctx.dropped > 0) {
+      parts.push(`_(${ctx.dropped} older context message(s) trimmed by the local carry budget.)_`)
+    }
+    if (ctx?.window && (ctx.window.truncated || ctx.window.has_more || ctx.window.omission_reason)) {
+      const range = ctx.window.source_window.start && ctx.window.source_window.end
+        ? `${ctx.window.source_window.start.sequence}..${ctx.window.source_window.end.sequence}`
+        : 'empty'
       parts.push(
-        `_(${ctx.dropped} older context message(s) trimmed to stay within budget. ` +
-          'Call get_session_transcript if you need more history.)_',
+        `_Canonical ingress window: returned=${ctx.window.returned}, total_known=${ctx.window.total_known ?? 'unknown'}, ` +
+          `source=${range}, truncated=${ctx.window.truncated}, has_more=${ctx.window.has_more}, ` +
+          `omission_reason=${ctx.window.omission_reason ?? 'none'}, fetch_id=${ctx.window.fetch_id ?? 'none'}, ` +
+          `next_cursor=${ctx.window.next_cursor ?? 'none'}._`,
       )
     }
   }
 
-  const addressee = commands.find((c) => c?.addressed_to?.label)?.addressed_to?.label
+  const addressed = commands.find((c) => c?.addressee?.label ?? c?.addressed_to?.label)
+  const addressee = addressed?.addressee?.label ?? addressed?.addressed_to?.label
   const heading =
     commands.length > 1
       ? `## Your owner's commands — ACT ON THESE (${commands.length}, in order)`
@@ -729,11 +796,37 @@ export function renderInjectedTurn(input: {
 
   commands.forEach((cmd, i) => {
     const body =
-      typeof cmd?.content === 'string' ? cmd.content : JSON.stringify(cmd?.content ?? cmd)
+      typeof cmd?.content === 'string'
+        ? cmd.content
+        : cmd?.content && typeof cmd.content === 'object' && typeof (cmd.content as { body?: unknown }).body === 'string'
+          ? (cmd.content as { body: string }).body
+          : JSON.stringify(cmd?.content ?? cmd)
     const social = formatSocialMeta(cmd)
-    const block = social ? `${body}\n${social}` : body
+    const canonicalMeta = cmd.message_id && cmd.order && cmd.delivery
+      ? [
+          `message_id=${cmd.message_id}`,
+          `order=${cmd.order.sequence}@${cmd.order.created_at} message_id:${cmd.order.message_id}`,
+          `requester=${cmd.requester?.display_name ?? cmd.requester?.user_id ?? 'unknown'} (${cmd.requester?.user_id ?? 'unknown'})`,
+          `addressee=${cmd.addressee?.label ?? cmd.addressed_to?.label ?? 'unknown'} (${cmd.addressee?.connection_id ?? cmd.addressed_to?.connection_id ?? 'unknown'}) agent:${cmd.addressee?.agent_name ?? 'none'} codename:${cmd.addressee?.codename ?? 'none'}`,
+          `authority=${cmd.authority?.kind ?? 'unknown'}/${cmd.authority?.mode ?? 'unknown'} requested_by:${cmd.authority?.requested_by_user_id ?? 'unknown'} owner:${cmd.authority?.connection_owner_user_id ?? 'unknown'} decision_source=${cmd.authority?.decision_source ?? 'unknown'}`,
+          `delivery=turn:${cmd.delivery.turn_id} provenance:${cmd.delivery.provenance_ref} primary:${cmd.delivery.primary_provenance_ref} is_primary:${cmd.delivery.is_primary}`,
+        ].join('\n')
+      : null
+    const block = [canonicalMeta ? `Canonical command metadata (server-authored):\n${canonicalMeta}` : null, body, social]
+      .filter(Boolean)
+      .join('\n')
     parts.push(commands.length > 1 ? `### ${i + 1}.\n${block}` : block)
   })
+
+  const references = input.attachmentReferences ?? []
+  if (references.length > 0) {
+    parts.push(
+      '## Canonical attachment references\n' +
+        references.map((ref) =>
+          `- \`${ref.filename}\` (${ref.mime}, ${ref.sizeBytes ?? 'size unknown'} bytes) — resource_id: \`${ref.resourceId}\``
+        ).join('\n'),
+    )
+  }
 
   // After the commands, so the model has read what was asked before learning that
   // part of it did not arrive.

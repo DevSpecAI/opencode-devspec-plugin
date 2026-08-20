@@ -8,7 +8,7 @@
 ## Agent gotchas (read before editing)
 
 1. **Presence is the bond.** Server attached liveness is ~90s. `last_seen` updates only when a `poll_connection` (or equivalent heartbeat) succeeds — **not** when `report_keepalive` runs alone. Anything that blocks the next successful poll for ~90s ends the connection with `idle_timeout` while the UI can still look attached.
-2. **OpenCode’s pump is in-process** (`src/plugin.ts` → `pollAndDeliver`). Cursor keeps a **detached** Node poller. Do not “fix” OpenCode by copying Cursor’s wait/inbox scripts, and do not await inject / stall / hung `session.messages` on the path back to `poll_connection`.
+2. **OpenCode’s pump is in-process** (`src/plugin.ts` → `pollAndDeliver`). It negotiates canonical ingress using `ingress_version: 1`; the mutable wire and authority policy lives at `devspec://product/remote-ingress-contract`. Cursor keeps a **detached** Node poller. Do not “fix” OpenCode by copying Cursor’s wait/inbox scripts, and do not await inject / stall / hung `session.messages` on the path back to `poll_connection`.
 3. **Multi-bond in one process** (item 7a9b7b0f): several OpenCode chat sessions may each `/devspec.remote` into different DevSpec rooms. The pump iterates `listOpenCodeBondSessions()` — a second attach **adds** a bond; it must **not** overwrite a single `lastKnownSessionId` (that starved Ivory Panda when Racing Dolphin attached, 2026-08-07 → first room `idle_timeout`). Ending one bond removes only that entry. State reads/writes for each bond run under `runWithBoundSession(stateKey)`.
 4. **Critical path after claiming delivery:** `setBusy(true)` then fire-and-forget `deliverInjectedTurn` (baseline → `promptAsync` → mirror), ALS-scoped to the inject bond. Return `{ delayMs: 0 }` so the pump re-enters the hold immediately. `checkBusyStall` is also `void`’d, not awaited.
 5. **After changing `dist/`:** fully quit and relaunch OpenCode (or reinstall the local package). Partial reloads leave a stale pump in memory.
@@ -169,7 +169,8 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 |---|---|
 | `src/plugin.ts` | Self-scheduling long-poll pump; `command.executed` → skip-mirror ids; dispose aborts in-flight hold |
 | `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state, `extractOpenCodeReplyModel`, `resolveOpenCodeAssistantModel` |
-| `src/poll-turn.ts` | Pure hold tiers, command gate, `renderInjectedTurn`, `unansweredCommands`, cursor advance rules |
+| `src/remote-ingress.ts` | Strict negotiated v1 envelope validation; authoritative contract: `devspec://product/remote-ingress-contract` |
+| `src/poll-turn.ts` | Pure hold tiers, advisory carry/rendering, attachment references, cursor advance rules |
 | `src/mirror-chrome.ts` | Fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` |
 | `src/work-trail.ts` | Serialize in-flight turn → trail text (seed, throttle helpers, unfiltered parts) |
 | `src/agent-identity.ts` | `AGENT_NAME = 'OpenCode'` |

@@ -33,6 +33,13 @@ import { AGENT_NAME } from './agent-identity.js'
 import { McpTimeoutError, mcpToolsCall } from './devspec-client.js'
 import { resolveDevspecAuth } from './resolve-devspec-auth.js'
 import {
+  freezeCanonicalTurn,
+  parseCanonicalIngress,
+  REMOTE_INGRESS_VERSION,
+  selectCanonicalCommandsForPrompt,
+  type CanonicalContextEntry,
+} from './remote-ingress.js'
+import {
   HOLD_HTTP_GRACE_MS,
   createCarryBuffer,
   buildAttachmentParts,
@@ -2504,8 +2511,8 @@ export async function pollAndDeliver(
         // otherwise a long turn's busy:true decays to idle server-side mid-turn.
         busy: state.busy ?? false,
         ...(pump.cursor ? { cursor: pump.cursor } : {}),
-        ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
         ...(pump.needsSeed ? { catch_up: true } : {}),
+        ingress_version: REMOTE_INGRESS_VERSION,
       },
       timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
       signal: opts.signal,
@@ -2677,124 +2684,77 @@ export async function pollAndDeliver(
     return { delayMs: 0, stop: false }
   }
 
-  // ---- Something landed: consume the packaged, tiered turn --------------------------
-  const offered: any[] = Array.isArray(res.commands) ? res.commands : []
-  // Fail closed: only commands the endpoint addressed to US, with an authority we
-  // recognise, may drive the model. A rejected entry is logged, never silently eaten.
-  const roomCommands = offered.filter((m) => isDeliverableCommand(m, state!.connectionId))
-  if (roomCommands.length !== offered.length) {
-    logPoll(
-      `REJECTED ${offered.length - roomCommands.length} command(s) not addressed to this connection`,
-    )
+  // ---- Something landed: consume ONLY negotiated canonical ingress -----------------
+  // Once v1 is requested, legacy commands/context/dispatch arrays are additive data for
+  // unmigrated clients and are never a fallback. Missing, malformed, or unknown ingress
+  // therefore fails closed and cannot wake OpenCode.
+  const parsedIngress = parseCanonicalIngress(res?.ingress, state.connectionId)
+  if (!parsedIngress.ok) {
+    pump.consecutiveEmpty++
+    const delayMs = emptyTurnBackoffMs(pump.consecutiveEmpty, hold.waitMs)
+    logPoll(`REJECTED canonical ingress: ${parsedIngress.error}; no model wake`)
+    return { delayMs, stop: false }
   }
-  const ownerAmbient: AdvisoryMessage[] = Array.isArray(res.owner_ambient) ? res.owner_ambient : []
-  const roomContext: AdvisoryMessage[] = Array.isArray(res.room_context) ? res.room_context : []
-  const dispatches: any[] = Array.isArray(res.dispatches) ? res.dispatches : []
-
-  // Advisory NEVER wakes the model on its own — it is carried forward and attached to
-  // the next command. See createCarryBuffer for why attaching only this response's
-  // advisory would not have fixed the 1-2-3 failure.
-  if (ownerAmbient.length > 0 || roomContext.length > 0) {
-    pump.carry.add(ownerAmbient, roomContext)
-    logPoll(
-      `carried advisory: +${ownerAmbient.length} owner-ambient, +${roomContext.length} room-context (buffer ${pump.carry.size})`,
-    )
-  }
-
-  // Dispatched work becomes a command. Playbook runs and assignments share the
-  // same inbox — branch on kind so a look-only playbook is never described as
-  // an assignment (and never loses its permission line). Parity with Cursor's
-  // playbookRunCommandText (item 25a1c4e6 / Codex sibling 09ffbba9).
-  const freshDispatches = dispatches.filter(
-    (d) => typeof d?.id === 'string' && !pump.deliveredDispatchIds.has(d.id) &&
-      !['completed', 'released'].includes(String(d?.state ?? d?.status ?? 'pending')),
-  )
-  const dispatchCommands = freshDispatches.map((d) => {
-    const kind = typeof d?.kind === 'string' ? d.kind : 'assignment'
-    const content =
-      kind === 'playbook_run'
-        ? playbookRunCommandText(d)
-        : (
-          // Unreachable in normal operation: the dispatch inbox serves playbook runs
-          // ONLY now (DevSpec item 1e455001) — work assignments are not dispatched to
-          // anyone, so a non-playbook entry means the server is ahead of this plugin.
-          // Saying that is better than sending an agent to three deleted tools.
-          `📦 DevSpec dispatched \`${d.id}\` to this connection, and this plugin does not ` +
-          `recognise its kind.\n\n` +
-          `Work assignments are no longer dispatched: an agent reserves what it was asked ` +
-          `to work with reserve_work_items({ action_item_ids, connection_id }), then claims ` +
-          `each member in order with claim_work_item. Do NOT try get_assignment / ` +
-          `acknowledge_assignment / resolve_assignment — those tools are gone.\n` +
-          `Read the entry with get_connection_dispatch and report what you see rather than ` +
-          `guessing at a protocol.`
-        )
-    return {
-      id: `dispatch:${d.id}`,
-      created_at: typeof d?.created_at === 'string' ? d.created_at : new Date().toISOString(),
-      addressed_to: res.addressed_to,
-      authority: { kind: 'owner', capabilities: ['full'] },
-      content,
-    }
-  })
-
-  // On a seed window, filter out commands already answered before this process existed.
-  const wasSeed = pump.needsSeed
-  const liveRoomCommands = wasSeed
-    ? (unansweredCommands(roomCommands as any, roomContext, {
-        agentName: AGENT_NAME,
-        connectionId: state.connectionId,
-      }) as any[])
-    : roomCommands
-  if (wasSeed && roomCommands.length > 0) {
-    const keptIds = new Set(
-      liveRoomCommands.map((c) => (typeof c?.id === 'string' ? c.id : null)).filter(Boolean),
-    )
-    const dropped = roomCommands.filter(
-      (c) => typeof c?.id === 'string' && !keptIds.has(c.id),
-    )
-    if (dropped.length > 0) {
-      logPoll(
-        `seed filter dropped ${dropped.length} already-answered command(s): ` +
-          dropped.map((c) => c.id).join(', '),
-      )
-      logRemoteControlStory({
-        phase: 'seed_filter',
-        outcome: 'dropped',
-        connectionId: state.connectionId,
-        sessionId: state.sessionId,
-        agent: AGENT_NAME,
-        codename: state.codename,
-        tool: 'poll_connection',
-        reason: 'already_answered',
-        data: {
-          dropped: dropped.length,
-          kept: liveRoomCommands.length,
-          dropped_ids: dropped.map((c) => c.id).filter(Boolean),
+  const ingress = freezeCanonicalTurn(structuredClone(parsedIngress.ingress))
+  const contextRows: AdvisoryMessage[] = []
+  for (const [bucket, rows] of Object.entries(ingress.context) as Array<
+    [keyof typeof ingress.context, CanonicalContextEntry[]]
+  >) {
+    for (const row of rows) {
+      contextRows.push({
+        id: row.message_id,
+        content: row.content,
+        created_at: row.order.created_at,
+        message_type: row.source_type,
+        context_bucket: bucket,
+        actor_model: row.actor.model,
+        actor_agent_tool: row.actor.agent_tool,
+        ingress_sequence: row.order.sequence,
+        author: {
+          kind: row.actor.kind,
+          name: row.actor.display_name,
+          ...(row.actor.user_id ? { user_id: row.actor.user_id } : {}),
+          ...(row.actor.agent_tool ? { agent_tool: row.actor.agent_tool } : {}),
         },
       })
     }
-    if (liveRoomCommands.length > 0) {
-      logPoll(`seed window: ${liveRoomCommands.length} unanswered command(s) to inject`)
-      logRemoteControlStory({
-        phase: 'seed_filter',
-        outcome: 'kept',
-        connectionId: state.connectionId,
-        sessionId: state.sessionId,
-        agent: AGENT_NAME,
-        codename: state.codename,
-        tool: 'poll_connection',
-        reason: 'unanswered',
-        data: { kept: liveRoomCommands.length },
-      })
-    }
   }
+  const ownerAmbient: AdvisoryMessage[] = []
+  const roomContext = contextRows.sort((a, b) =>
+    (a.ingress_sequence ?? 0) - (b.ingress_sequence ?? 0),
+  )
+  if (roomContext.length > 0) {
+    pump.carry.add(ownerAmbient, roomContext, ingress.window)
+    logPoll(`carried canonical advisory: +${roomContext.length} typed actor context (buffer ${pump.carry.size})`)
+  }
+
+  // Only an active, live conversational_command wake is executable. Replay, reseed,
+  // advisory, system/AI/agent context, preview-like data, and controls never reach this set.
+  const canonicalSelection = selectCanonicalCommandsForPrompt(
+    { ok: true, ingress, executable: parsedIngress.executable },
+    new Set(state.deliveredMessageIds ?? []),
+  )
+  const unavailable = canonicalSelection.rejectedUnavailable
+  if (unavailable.length > 0) {
+    logPoll(
+      `REJECTED canonical command turn: ${unavailable.length} command(s) contain unavailable attachment(s); no model wake`,
+    )
+  }
+  const roomCommands: any[] = canonicalSelection.commands
+  const liveRoomCommands = roomCommands
+  const dispatchCommands: any[] = []
+  const freshDispatches: any[] = []
+  const wasSeed = false
   pump.needsSeed = false
 
   // Dedup against what we have already injected (a bounded set — the cursor alone is not
   // enough, as a racing/stale cursor read has caused triple-delivery in this file before).
   const deliveredIds = new Set(state.deliveredMessageIds ?? [])
   const pendingCommands = [...dispatchCommands, ...liveRoomCommands].filter(
-    (m) => !(typeof m?.id === 'string' && deliveredIds.has(m.id)),
+    (m) => {
+      const id = typeof m?.message_id === 'string' ? m.message_id : typeof m?.id === 'string' ? m.id : null
+      return !(id && deliveredIds.has(id))
+    },
   )
   // Item 6990fd9e: never inject owner commands into a still-settling connect turn.
   // Hold the cursor until connectMirrorSuppressed clears, then deliver on a later poll.
@@ -2821,12 +2781,13 @@ export async function pollAndDeliver(
     })
   }
 
-  if (typeof res.dispatch_cursor === 'string') pump.dispatchCursor = res.dispatch_cursor
+  // Canonical window continuation is the only message cursor after v1 negotiation.
+  // Legacy top-level cursor/dispatch_cursor fields are intentionally ignored.
   // Advance the message cursor only when the packaged turn was fully consumed.
   // Holding both the in-memory and persisted cursor is required — next poll's
   // `cursor` arg is what skips messages on the wire (session 1383cbb8).
   // MUST patchState — a full writeState of the pre-await snapshot wipes mirror claims.
-  const nextCursor = typeof res.cursor === 'string' && res.cursor ? res.cursor : null
+  const nextCursor = ingress.window.next_cursor
   const advanceCursor = shouldAdvanceMessageCursor({
     injectCount: commands.length,
     deliverableRoomCount: roomCommands.length,
@@ -2868,7 +2829,7 @@ export async function pollAndDeliver(
     // Changed, but nothing to deliver (advisory-only, or all already delivered).
     // Advisory-only is normal and must NOT back off — otherwise a chatty room slows
     // command delivery. Only a genuinely empty change escalates.
-    const advisoryOnly = ownerAmbient.length > 0 || roomContext.length > 0
+    const advisoryOnly = roomContext.length > 0 || !parsedIngress.executable || unavailable.length > 0
     if (advisoryOnly) {
       pump.consecutiveEmpty = 0
       logRemoteControlStory({
@@ -2904,7 +2865,9 @@ export async function pollAndDeliver(
   pump.consecutiveEmpty = 0
 
   const commandIds = commands
-    .map((m) => (typeof m?.id === 'string' ? m.id : null))
+    .map((m) =>
+      typeof m?.message_id === 'string' ? m.message_id : typeof m?.id === 'string' ? m.id : null,
+    )
     .filter((id): id is string => id != null)
   for (const id of commandIds) deliveredIds.add(id)
   for (const d of freshDispatches) pump.deliveredDispatchIds.add(d.id)
@@ -2936,7 +2899,15 @@ export async function pollAndDeliver(
   if (state.pendingQuestion?.requestId) {
     const pendingRequestId = state.pendingQuestion.requestId
     const answerText = commands
-      .map((c: any) => (typeof c?.content === 'string' ? c.content : typeof c?.text === 'string' ? c.text : ''))
+      .map((c: any) =>
+        typeof c?.content === 'string'
+          ? c.content
+          : typeof c?.content?.body === 'string'
+            ? c.content.body
+            : typeof c?.text === 'string'
+              ? c.text
+              : '',
+      )
       .filter((t: string) => t.trim())
       .join('\n\n')
     const replied = await replyPendingQuestion({ client, directory, answerText })
@@ -3000,14 +2971,19 @@ export async function pollAndDeliver(
   const context: CarriedContext | null = pump.carry.take()
   // Attachments ride the same turn as real file parts (item 99165e12). Anything too
   // large to inline is named in the text rather than vanishing.
-  const { parts: fileParts, declined: declinedAttachments } = buildAttachmentParts(commands as any, {
+  const {
+    parts: fileParts,
+    declined: declinedAttachments,
+    references: attachmentReferences,
+  } = buildAttachmentParts(commands as any, {
     materializeLarge: materializeLargeAttachmentToDisk,
   })
   const text = renderInjectedTurn({
     commands: commands as any,
     context,
-    deliveryContract: typeof res.delivery_contract === 'string' ? res.delivery_contract : null,
+    deliveryContract: null,
     declinedAttachments,
+    attachmentReferences,
   })
   logPoll(
     `injecting ${commands.length} command(s) with context: ` +
