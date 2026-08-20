@@ -190,6 +190,7 @@ export function trimAdvisoryCarry(
 }
 
 export interface AdvisoryWindowMetadata {
+  policy_version: string
   returned: number
   total_known: number | null
   truncated: boolean
@@ -197,7 +198,10 @@ export interface AdvisoryWindowMetadata {
   next_cursor: string | null
   fetch_id: string | null
   omission_reason: string | null
-  source_window: { start: { sequence: number } | null; end: { sequence: number } | null }
+  source_window: {
+    start: { sequence: number; created_at: string; message_id: string } | null
+    end: { sequence: number; created_at: string; message_id: string } | null
+  }
 }
 
 export interface CarriedContext {
@@ -761,12 +765,14 @@ export function renderInjectedTurn(input: {
     reactions?: unknown
   }>
   context?: CarriedContext | null
+  window?: AdvisoryWindowMetadata | null
   deliveryContract?: string | null
   declinedAttachments?: Array<{ filename: string; reason: string }>
   attachmentReferences?: AttachmentReference[]
 }): string {
   const commands = Array.isArray(input.commands) ? input.commands : []
   const ctx = input.context ?? null
+  const window = input.window ?? ctx?.window ?? null
   const parts: string[] = []
 
   const ambient = (ctx?.owner_ambient ?? []).map(renderAdvisoryLine).filter(Boolean)
@@ -790,25 +796,30 @@ export function renderInjectedTurn(input: {
     if (ctx && ctx.dropped > 0) {
       parts.push(`_(${ctx.dropped} older context message(s) trimmed by the local carry budget.)_`)
     }
-    if (ctx?.window && (ctx.window.truncated || ctx.window.has_more || ctx.window.omission_reason)) {
-      const range = ctx.window.source_window.start && ctx.window.source_window.end
-        ? `${ctx.window.source_window.start.sequence}..${ctx.window.source_window.end.sequence}`
-        : 'empty'
-      parts.push(
-        `_Canonical ingress window: returned=${ctx.window.returned}, total_known=${ctx.window.total_known ?? 'unknown'}, ` +
-          `source=${range}, truncated=${ctx.window.truncated}, has_more=${ctx.window.has_more}, ` +
-          `omission_reason=${ctx.window.omission_reason ?? 'none'}, fetch_id=${ctx.window.fetch_id ?? 'none'}, ` +
-          `next_cursor=${ctx.window.next_cursor ?? 'none'}._`,
-      )
-    }
+  }
+
+  if (window) {
+    const renderPoint = (point: AdvisoryWindowMetadata['source_window']['start']) =>
+      point ? `sequence=${point.sequence},created_at=${point.created_at},message_id=${point.message_id}` : 'null'
+    parts.push(
+      `_Canonical ingress window: policy_version=${window.policy_version}, returned=${window.returned}, ` +
+        `total_known=${window.total_known ?? 'unknown'}, source_window.start={${renderPoint(window.source_window.start)}}, ` +
+        `source_window.end={${renderPoint(window.source_window.end)}}, truncated=${window.truncated}, ` +
+        `has_more=${window.has_more}, next_cursor=${window.next_cursor ?? 'none'}, ` +
+        `fetch_id=${window.fetch_id ?? 'none'}, omission_reason=${window.omission_reason ?? 'none'}._`,
+    )
   }
 
   const addressed = commands.find((c) => c?.addressee?.label ?? c?.addressed_to?.label)
   const addressee = addressed?.addressee?.label ?? addressed?.addressed_to?.label
-  const heading =
-    commands.length > 1
-      ? `## Your owner's commands — ACT ON THESE (${commands.length}, in order)`
-      : "## Your owner's command — ACT ON THIS"
+  const canonical = commands.some((command) => command.message_id && command.authority)
+  const heading = canonical
+    ? commands.length > 1
+      ? `## Canonical requester-authorized commands — ACT ON THESE (${commands.length}, in order)`
+      : '## Canonical requester-authorized command — ACT ON THIS'
+    : commands.length > 1
+      ? `## Explicit playbook commands — ACT ON THESE (${commands.length}, in order)`
+      : '## Explicit playbook command — ACT ON THIS'
   parts.push(addressee ? `${heading}\nAddressed to: **${addressee}**` : heading)
 
   commands.forEach((cmd, i) => {

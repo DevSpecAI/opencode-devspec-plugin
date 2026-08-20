@@ -136,6 +136,7 @@ export declare function trimAdvisoryCarry(list: AdvisoryMessage[] | null | undef
     dropped: number;
 };
 export interface AdvisoryWindowMetadata {
+    policy_version: string;
     returned: number;
     total_known: number | null;
     truncated: boolean;
@@ -146,9 +147,13 @@ export interface AdvisoryWindowMetadata {
     source_window: {
         start: {
             sequence: number;
+            created_at: string;
+            message_id: string;
         } | null;
         end: {
             sequence: number;
+            created_at: string;
+            message_id: string;
         } | null;
     };
 }
@@ -471,6 +476,7 @@ export declare function renderInjectedTurn(input: {
         reactions?: unknown;
     }>;
     context?: CarriedContext | null;
+    window?: AdvisoryWindowMetadata | null;
     deliveryContract?: string | null;
     declinedAttachments?: Array<{
         filename: string;

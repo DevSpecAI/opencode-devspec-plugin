@@ -2272,6 +2272,8 @@ interface PumpState {
   deliveredDispatchIds: Set<string>
   /** Prompt transaction awaiting OpenCode acceptance; never schedule it twice. */
   acceptingTurn: { key: string; commandIds: string[]; dispatchIds: string[] } | null
+  /** Explicit playbook prompt acceptance is independent of conversation ingress. */
+  acceptingPlaybook: { key: string; dispatchIds: string[] } | null
 }
 
 const pumpStates = new Map<string, PumpState>()
@@ -2303,6 +2305,7 @@ function pumpStateFor(
       // have been a silent regression.
       deliveredDispatchIds: new Set(persisted.dispatchIds),
       acceptingTurn: null,
+      acceptingPlaybook: null,
     }
     pumpStates.set(connectionId, s)
   }
@@ -2743,6 +2746,64 @@ export async function pollAndDeliver(
     return { delayMs: 0, stop: false }
   }
 
+  // Explicit playbook dispatch is a separate top-level workflow. Extract and
+  // schedule it before canonical parsing so an unsupported conversation envelope
+  // cannot block a valid playbook, and never admit action-item assignments.
+  const offeredDispatches: any[] = Array.isArray(res?.dispatches) ? res.dispatches : []
+  const freshDispatches = offeredDispatches.filter((dispatch) =>
+    dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
+    !pump.deliveredDispatchIds.has(dispatch.id) &&
+    !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')),
+  )
+  const playbookDispatchCursor = typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor
+    ? res.dispatch_cursor
+    : null
+  const commitPlaybookCursor = () => {
+    if (playbookDispatchCursor) pump.dispatchCursor = playbookDispatchCursor
+    patchState({ remoteDispatchCursor: pump.dispatchCursor })
+  }
+  if (freshDispatches.length === 0) {
+    commitPlaybookCursor()
+  } else {
+    const dispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
+    const playbookKey = dispatchIds.join(',')
+    if (!pump.acceptingPlaybook) {
+      pump.acceptingPlaybook = { key: playbookKey, dispatchIds }
+      const playbookCommands = freshDispatches.map((dispatch) => ({
+        id: `dispatch:${dispatch.id}`,
+        created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
+        addressed_to: res.addressed_to,
+        authority: { kind: 'owner', capabilities: ['full'] },
+        content: playbookRunCommandText(dispatch),
+        dispatch_model: dispatch.dispatch_model,
+      }))
+      const text = renderInjectedTurn({ commands: playbookCommands, context: null })
+      const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model)
+      const model = modelExtract.model ?? state.remoteControlModel ?? undefined
+      await setBusy(directory, true)
+      const injectStateKey = sessionId
+      void runWithBondAsync(injectStateKey, () => deliverInjectedTurn({
+        client,
+        directory,
+        sessionId,
+        auth,
+        text,
+        fileParts: [],
+        model,
+        thinking: state.remoteControlThinking ?? undefined,
+        onAccepted: () => {
+          for (const id of dispatchIds) pump.deliveredDispatchIds.add(id)
+          patchState({ deliveredAssignmentIds: [...pump.deliveredDispatchIds].slice(-50) })
+          commitPlaybookCursor()
+          if (pump.acceptingPlaybook?.key === playbookKey) pump.acceptingPlaybook = null
+        },
+        onRejected: () => {
+          if (pump.acceptingPlaybook?.key === playbookKey) pump.acceptingPlaybook = null
+        },
+      })).catch((err) => logPoll(`playbook prompt delivery failed: ${err}`))
+    }
+  }
+
   // ---- Something landed: consume ONLY negotiated canonical ingress -----------------
   // Once v1 is requested, legacy commands/context/dispatch arrays are additive data for
   // unmigrated clients and are never a fallback. Missing, malformed, or unknown ingress
@@ -2797,26 +2858,7 @@ export async function pollAndDeliver(
     logPoll(`REJECTED canonical command turn: unavailable attachment; holding live cursor`)
   }
 
-  // Playbook dispatch is deliberately outside conversational ingress. It has its
-  // own cursor and deterministic text path; action-item assignments are ignored.
-  const offeredDispatches: any[] = Array.isArray(res?.dispatches) ? res.dispatches : []
-  const freshDispatches = offeredDispatches.filter((dispatch) =>
-    dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
-    !pump.deliveredDispatchIds.has(dispatch.id) &&
-    !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')),
-  )
-  const dispatchCommands = freshDispatches.map((dispatch) => ({
-    id: `dispatch:${dispatch.id}`,
-    created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
-    addressed_to: res.addressed_to,
-    authority: { kind: 'owner', capabilities: ['full'] },
-    content: playbookRunCommandText(dispatch),
-    dispatch_model: dispatch.dispatch_model,
-  }))
   const liveCursorCandidate = typeof res?.cursor_v2 === 'string' && res.cursor_v2 ? res.cursor_v2 : null
-  const dispatchCursorCandidate = typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor
-    ? res.dispatch_cursor
-    : null
   const catchUpCursorCandidate = ingress.window.has_more ? ingress.window.next_cursor : null
 
   const commitConversationCursor = () => {
@@ -2828,11 +2870,6 @@ export async function pollAndDeliver(
       remoteIngressCatchUpCursor: pump.catchUpCursor,
     })
   }
-  const commitDispatchCursor = () => {
-    if (dispatchCursorCandidate) pump.dispatchCursor = dispatchCursorCandidate
-    patchState({ remoteDispatchCursor: pump.dispatchCursor })
-  }
-
   // Canonical typed controls never come from slash-looking conversation text.
   // Execute once, persist the execution marker, then acknowledge the exact id.
   if (ingress.wake.kind === 'control' && ingress.control) {
@@ -2883,7 +2920,7 @@ export async function pollAndDeliver(
   }
 
   const roomCommands: any[] = canonicalSelection.commands
-  const pendingCommands = [...dispatchCommands, ...roomCommands]
+  const pendingCommands = [...roomCommands]
   const deferInject = shouldDeferInjectDuringConnect({
     connectMirrorSuppressed: state.connectMirrorSuppressed,
     awaitingRemoteReply: state.awaitingRemoteReply,
@@ -2894,13 +2931,10 @@ export async function pollAndDeliver(
   }
   const commands = pendingCommands
 
-  // Non-command canonical context/history can commit independently. Explicit
-  // dispatches likewise advance only their own watermark after inspection.
+  // Non-command canonical context/history commits independently.
   if (roomCommands.length === 0 && unavailable.length === 0 && !parsedIngress.executable) {
     commitConversationCursor()
   }
-  if (freshDispatches.length === 0) commitDispatchCursor()
-
   if (commands.length === 0) {
     pump.consecutiveEmpty = 0
     if (roomContext.length > 0 || !parsedIngress.executable || unavailable.length > 0 || canonicalSelection.alreadyDelivered) {
@@ -2913,10 +2947,9 @@ export async function pollAndDeliver(
   pump.consecutiveEmpty = 0
 
   const commandIds = roomCommands.map((command) => command.message_id as string)
-  const dispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
-  const canonicalTurnId = roomCommands[0]?.delivery?.turn_id ?? 'no-conversation'
-  const acceptanceKey = `${canonicalTurnId}|${dispatchIds.join(',')}`
-  pump.acceptingTurn = { key: acceptanceKey, commandIds, dispatchIds }
+  const canonicalTurnId = roomCommands[0]!.delivery.turn_id
+  const acceptanceKey = canonicalTurnId
+  pump.acceptingTurn = { key: acceptanceKey, commandIds, dispatchIds: [] }
 
   // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
   // question, the next owner command answers THAT question — it must not start
@@ -2973,6 +3006,7 @@ export async function pollAndDeliver(
   const text = renderInjectedTurn({
     commands: commands as any,
     context,
+    window: ingress.window,
     deliveryContract: null,
     declinedAttachments,
     attachmentReferences,
@@ -3072,16 +3106,11 @@ export async function pollAndDeliver(
         const acceptedState = readState() ?? state
         const acceptedIds = new Set(acceptedState.deliveredMessageIds ?? [])
         for (const id of commandIds) acceptedIds.add(id)
-        for (const id of dispatchIds) pump.deliveredDispatchIds.add(id)
         patchState({
           deliveredMessageIds: [...acceptedIds].slice(-50),
           currentTurnMessageIds: Array.from(new Set([...(acceptedState.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
-          ...(dispatchIds.length > 0
-            ? { deliveredAssignmentIds: [...pump.deliveredDispatchIds].slice(-50) }
-            : {}),
         })
-        if (roomCommands.length > 0) commitConversationCursor()
-        if (dispatchIds.length > 0) commitDispatchCursor()
+        commitConversationCursor()
         pump.carry.take()
         if (pump.acceptingTurn?.key === acceptanceKey) pump.acceptingTurn = null
       },

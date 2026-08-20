@@ -29,8 +29,8 @@ OpenCode process
                                                             ├─ busy? report_keepalive + void checkBusyStall
                                                             ├─ maybeWarnPresenceGap
                                                             ├─ held poll_connection (25s attended / 30s idle + 15s HTTP grace)
-                                                            ├─ canonical conversation + explicit playbook → renderInjectedTurn
-                                                            │                 └─ void deliverInjectedTurn (same ALS)
+                                                            ├─ canonical conversation → its own render/inject acceptance transaction
+                                                            ├─ explicit playbook → independent render/inject acceptance transaction
                                                             │                        ├─ session.messages (5s timeout) baseline
                                                             │                        ├─ session.promptAsync acceptance → commit independent cursors/ids
                                                             │                        └─ mirror → post_session_message
@@ -92,9 +92,9 @@ Do not “fix” an unsecured-server warning by putting a password into project 
 
 1. Owner dispatches to this connection in DevSpec.
 2. Plugin (inside the OpenCode process) long-polls via held `poll_connection`.
-3. On an active canonical conversational turn (plus any independent explicit playbook run), the plugin builds one immutable prompt via `renderInjectedTurn` (context labelled advisory; commands last).
-4. Plugin asserts `setBusy(true)`, then **kicks** `deliverInjectedTurn` without awaiting it. No live cursor or delivery id commits yet.
-5. Inside deliver: timed `session.messages` baseline → `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door. Only SDK acceptance atomically commits turn ids, top-level `cursor_v2`, and independent `dispatch_cursor`; `window.next_cursor` remains the older catch-up continuation.
+3. An active canonical conversational turn and an explicit playbook run are extracted independently and each gets its own immutable `renderInjectedTurn` / acceptance transaction. Malformed conversational ingress cannot block a valid playbook.
+4. Plugin asserts `setBusy(true)`, then **kicks** each `deliverInjectedTurn` without awaiting it. No corresponding cursor or delivery id commits yet.
+5. Inside deliver: timed `session.messages` baseline → `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door. Canonical SDK acceptance commits only turn ids and top-level `cursor_v2`; playbook acceptance commits only playbook ids and `dispatch_cursor`; `window.next_cursor` remains the older catch-up continuation.
 6. OpenCode model runs a normal turn in that session.
 7. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts). **Exception:** the `/devspec.remote` / `/devspec.remote-stop` skill turn itself is never mirrored (`shouldSkipConnectTurnMirror` / `command.executed` message id) — that turn is terminal-only status.
 8. Activity: pickup at inject kickoff; keepalive on later polls while busy; complete when mirror clears busy / idle path.
