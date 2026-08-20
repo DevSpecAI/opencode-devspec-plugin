@@ -107,6 +107,22 @@ describe('canonical remote ingress v1', () => {
     assert.equal(selection.rejectedUnavailable.length, 1)
   })
 
+  it('matches UUID/datetime/safe-integer schema boundaries', () => {
+    const nil = structuredClone(envelope())
+    nil.envelope_id = '00000000-0000-0000-0000-000000000000'
+    assert.equal(parseCanonicalIngress(nil, ids.connection).ok, true)
+
+    const unsafe = structuredClone(envelope())
+    unsafe.commands[0].order.sequence = Number.MAX_SAFE_INTEGER + 1
+    unsafe.window.source_window.start.sequence = Number.MAX_SAFE_INTEGER + 1
+    unsafe.window.source_window.end.sequence = Number.MAX_SAFE_INTEGER + 1
+    assert.equal(parseCanonicalIngress(unsafe, ids.connection).ok, false)
+
+    const badDate = structuredClone(envelope())
+    badDate.commands[0].order.created_at = '2026-02-30T12:00:00Z'
+    assert.equal(parseCanonicalIngress(badDate, ids.connection).ok, false)
+  })
+
   it('retains stable command ids/cursor for queued retries and dedup correlation', () => {
     const first = parseCanonicalIngress(envelope(), ids.connection)
     const retry = parseCanonicalIngress(structuredClone(envelope()), ids.connection)

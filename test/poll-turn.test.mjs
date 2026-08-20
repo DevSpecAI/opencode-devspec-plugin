@@ -307,6 +307,16 @@ describe('createCarryBuffer', () => {
     assert.equal(taken.room_context.length, ADVISORY_CARRY_MAX_COUNT)
   })
 
+  it('deduplicates repeated canonical context while an immutable prompt awaits acceptance', () => {
+    const carry = createCarryBuffer()
+    const row = advisory('canonical', { id: 'same-id', ingress_sequence: 7, context_bucket: 'human_context' })
+    carry.add([], [row])
+    carry.add([], [structuredClone(row)])
+    assert.equal(carry.size, 1)
+    assert.equal(carry.peek().room_context.length, 1)
+    assert.equal(carry.peek().dropped, 0)
+  })
+
   it('reset() drops everything (used when the server moves us to another room)', () => {
     const buf = createCarryBuffer()
     buf.add([advisory('old room')], [])

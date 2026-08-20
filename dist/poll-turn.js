@@ -160,13 +160,31 @@ export function createCarryBuffer() {
     return {
         /** Merge a response's advisory into the buffer, trimming to budget. */
         add(nextOwnerAmbient, nextRoomContext, nextWindow) {
-            const amb = trimAdvisoryCarry([...ownerAmbient, ...(nextOwnerAmbient ?? [])]);
-            const room = trimAdvisoryCarry([...roomContext, ...(nextRoomContext ?? [])]);
+            const mergeStable = (current, incoming) => {
+                const byId = new Map();
+                const anonymous = [];
+                for (const item of [...current, ...(incoming ?? [])]) {
+                    if (typeof item?.id === 'string' && item.id)
+                        byId.set(item.id, item);
+                    else
+                        anonymous.push(item);
+                }
+                return [...byId.values(), ...anonymous].sort((a, b) => (a.ingress_sequence ?? Number.MAX_SAFE_INTEGER) -
+                    (b.ingress_sequence ?? Number.MAX_SAFE_INTEGER));
+            };
+            const amb = trimAdvisoryCarry(mergeStable(ownerAmbient, nextOwnerAmbient));
+            const room = trimAdvisoryCarry(mergeStable(roomContext, nextRoomContext));
             ownerAmbient = amb.kept;
             roomContext = room.kept;
             dropped += amb.dropped + room.dropped;
             if (nextWindow)
                 window = nextWindow;
+        },
+        /** Read the current carry without consuming it (prompt acceptance is the commit point). */
+        peek() {
+            if (ownerAmbient.length === 0 && roomContext.length === 0)
+                return null;
+            return { owner_ambient: [...ownerAmbient], room_context: [...roomContext], dropped, window };
         },
         /** Take (and clear) the carried context to attach to a command. */
         take() {

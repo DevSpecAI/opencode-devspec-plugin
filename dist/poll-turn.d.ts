@@ -176,6 +176,8 @@ export interface CarriedContext {
 export declare function createCarryBuffer(): {
     /** Merge a response's advisory into the buffer, trimming to budget. */
     add(nextOwnerAmbient: AdvisoryMessage[], nextRoomContext: AdvisoryMessage[], nextWindow?: AdvisoryWindowMetadata | null): void;
+    /** Read the current carry without consuming it (prompt acceptance is the commit point). */
+    peek(): CarriedContext | null;
     /** Take (and clear) the carried context to attach to a command. */
     take(): CarriedContext | null;
     /** Drop everything — used when the server moves us to a different room. */

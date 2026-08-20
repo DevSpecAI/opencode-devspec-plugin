@@ -1,5 +1,6 @@
 import type { Plugin } from '@opencode-ai/plugin';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
+import { type CanonicalControl } from './remote-ingress.js';
 import { type OpencodeControlSlash } from './opencode-control-slash.js';
 export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
@@ -91,6 +92,23 @@ interface ConnectionState {
      * model-override work, not a hypothetical one.
      */
     lastDeliveredMessageId?: string | null;
+    /** Canonical live transcript cursor returned as top-level cursor_v2. */
+    remoteIngressCursorV2?: string | null;
+    /** Independent older-page continuation from ingress.window.next_cursor. */
+    remoteIngressCatchUpCursor?: string | null;
+    /** Independent explicit playbook dispatch watermark. */
+    remoteDispatchCursor?: string | null;
+    /** Host-selected model for subsequent remote promptAsync turns. */
+    remoteControlModel?: OpenCodeModelStamp | null;
+    /** Host-selected OpenCode model variant for subsequent remote turns. */
+    remoteControlThinking?: string | null;
+    /** Canonical controls executed locally; retained so ack retries never re-execute. */
+    executedControlIds?: string[];
+    /** list_models payload retained until its exact control acknowledgement succeeds. */
+    pendingControlCatalog?: {
+        controlId: string;
+        catalog: unknown;
+    } | null;
     /**
      * Bounded list of DevSpec message ids already delivered via promptAsync.
      * Real bug found live-testing: the SAME owner message got delivered to
@@ -694,6 +712,12 @@ export declare function wipeOpenCodeContextInPlace(input: {
     newOpenCodeSessionId: string;
     preservedDevspecSessionId: string | null;
 }>;
+export declare function executeCanonicalControl(input: {
+    client: Parameters<Plugin>[0]['client'];
+    directory: string;
+    sessionId: string;
+    control: CanonicalControl;
+}): Promise<unknown | undefined>;
 /**
  * Run a native OpenCode control slash via SDK (item b315fe42).
  * Posts a short DevSpec answer for most commands; `/new` is silent (8718be5a).
@@ -730,6 +754,9 @@ export declare function deliverInjectedTurn(input: {
         providerID: string;
         modelID: string;
     };
+    thinking?: string;
+    onAccepted?: () => void;
+    onRejected?: () => void;
 }): Promise<void>;
 /**
  * Decide how to correlate assistants while awaiting a remote inject reply.

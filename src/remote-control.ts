@@ -38,6 +38,7 @@ import {
   REMOTE_INGRESS_VERSION,
   selectCanonicalCommandsForPrompt,
   type CanonicalContextEntry,
+  type CanonicalControl,
 } from './remote-ingress.js'
 import {
   HOLD_HTTP_GRACE_MS,
@@ -72,7 +73,6 @@ import {
 } from './work-trail.js'
 import {
   controlSlashSuccessMessage,
-  resolveOwnerControlSlash,
   type OpencodeControlSlash,
 } from './opencode-control-slash.js'
 
@@ -217,6 +217,21 @@ export function withTimeout<T>(
   })
 }
 
+function assertSdkAccepted(result: unknown, label: string): void {
+  if (!result || typeof result !== 'object') return
+  const value = result as Record<string, unknown>
+  if (value.error != null) {
+    const detail = typeof value.error === 'string'
+      ? value.error
+      : JSON.stringify(value.error)
+    throw new Error(`${label} was rejected: ${detail}`)
+  }
+  const response = value.response
+  if (response && typeof response === 'object' && 'ok' in response && (response as { ok?: unknown }).ok === false) {
+    throw new Error(`${label} was rejected by the OpenCode server`)
+  }
+}
+
 interface ConnectionState {
   connectionId: string
   sessionId: string | null
@@ -250,6 +265,20 @@ interface ConnectionState {
    * model-override work, not a hypothetical one.
    */
   lastDeliveredMessageId?: string | null
+  /** Canonical live transcript cursor returned as top-level cursor_v2. */
+  remoteIngressCursorV2?: string | null
+  /** Independent older-page continuation from ingress.window.next_cursor. */
+  remoteIngressCatchUpCursor?: string | null
+  /** Independent explicit playbook dispatch watermark. */
+  remoteDispatchCursor?: string | null
+  /** Host-selected model for subsequent remote promptAsync turns. */
+  remoteControlModel?: OpenCodeModelStamp | null
+  /** Host-selected OpenCode model variant for subsequent remote turns. */
+  remoteControlThinking?: string | null
+  /** Canonical controls executed locally; retained so ack retries never re-execute. */
+  executedControlIds?: string[]
+  /** list_models payload retained until its exact control acknowledgement succeeds. */
+  pendingControlCatalog?: { controlId: string; catalog: unknown } | null
   /**
    * Bounded list of DevSpec message ids already delivered via promptAsync.
    * Real bug found live-testing: the SAME owner message got delivered to
@@ -2228,7 +2257,8 @@ async function reportPollError(
  * rebuilt from the cursor-less catch-up window on the first poll after a restart.
  */
 interface PumpState {
-  cursor: string | null
+  cursorV2: string | null
+  catchUpCursor: string | null
   dispatchCursor: string | null
   carry: ReturnType<typeof createCarryBuffer>
   needsSeed: boolean
@@ -2240,6 +2270,8 @@ interface PumpState {
    */
   consecutiveRecoverableEnds: number
   deliveredDispatchIds: Set<string>
+  /** Prompt transaction awaiting OpenCode acceptance; never schedule it twice. */
+  acceptingTurn: { key: string; commandIds: string[]; dispatchIds: string[] } | null
 }
 
 const pumpStates = new Map<string, PumpState>()
@@ -2251,13 +2283,14 @@ const lastPresenceGapWarnedAt = new Map<string, number>()
 
 function pumpStateFor(
   connectionId: string,
-  persisted: { cursor: string | null; dispatchIds: string[] },
+  persisted: { cursorV2: string | null; catchUpCursor: string | null; dispatchCursor: string | null; dispatchIds: string[] },
 ): PumpState {
   let s = pumpStates.get(connectionId)
   if (!s) {
     s = {
-      cursor: persisted.cursor,
-      dispatchCursor: null,
+      cursorV2: persisted.cursorV2,
+      catchUpCursor: persisted.catchUpCursor,
+      dispatchCursor: persisted.dispatchCursor,
       carry: createCarryBuffer(),
       // First poll of a process is a SEED: ask for the catch-up window and treat
       // already-answered commands in it as history rather than as new work.
@@ -2269,6 +2302,7 @@ function pumpStateFor(
       // handed to the model — the interval version persisted this and losing it would
       // have been a silent regression.
       deliveredDispatchIds: new Set(persisted.dispatchIds),
+      acceptingTurn: null,
     }
     pumpStates.set(connectionId, s)
   }
@@ -2466,7 +2500,9 @@ export async function pollAndDeliver(
   authFailureLogged = false
 
   const pump = pumpStateFor(state.connectionId, {
-    cursor: state.lastDeliveredMessageId ?? null,
+    cursorV2: state.remoteIngressCursorV2 ?? null,
+    catchUpCursor: state.remoteIngressCatchUpCursor ?? null,
+    dispatchCursor: state.remoteDispatchCursor ?? null,
     dispatchIds: state.deliveredAssignmentIds ?? [],
   })
   const turnActive = state.busy === true
@@ -2510,8 +2546,10 @@ export async function pollAndDeliver(
         // Re-assert our own last-known busy on every poll, per the tool's contract —
         // otherwise a long turn's busy:true decays to idle server-side mid-turn.
         busy: state.busy ?? false,
-        ...(pump.cursor ? { cursor: pump.cursor } : {}),
+        ...(pump.cursorV2 ? { cursor_v2: pump.cursorV2 } : {}),
         ...(pump.needsSeed ? { catch_up: true } : {}),
+        ...(pump.catchUpCursor ? { catch_up_cursor: pump.catchUpCursor } : {}),
+        ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
         ingress_version: REMOTE_INGRESS_VERSION,
       },
       timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
@@ -2658,7 +2696,17 @@ export async function pollAndDeliver(
       patchState({
         sessionId: adopt.sessionId,
         lastDeliveredMessageId: null,
-      }) ?? { ...state, sessionId: adopt.sessionId, lastDeliveredMessageId: null }
+        remoteIngressCursorV2: null,
+        remoteIngressCatchUpCursor: null,
+        remoteDispatchCursor: null,
+      }) ?? {
+        ...state,
+        sessionId: adopt.sessionId,
+        lastDeliveredMessageId: null,
+        remoteIngressCursorV2: null,
+        remoteIngressCatchUpCursor: null,
+        remoteDispatchCursor: null,
+      }
     // Fresh room: drop the cursor and any carried context from the old one, and treat
     // the NEXT poll (cursor:null + catch_up) as the seed. Never consume this hold's
     // package as a completed seed — it was opened under the previous room's cursor,
@@ -2667,7 +2715,9 @@ export async function pollAndDeliver(
     // later with a backdated paint timestamp (session 23da0643 / item 2411dd5a).
     // Session 1383cbb8 needed the pending command delivered; a null-cursor re-poll
     // gets the catch-up window and does that correctly without the race.
-    pump.cursor = null
+    pump.cursorV2 = null
+    pump.catchUpCursor = null
+    pump.dispatchCursor = null
     pump.carry.reset()
     pump.needsSeed = true
     if (adoptRequiresNullCursorRepoll()) {
@@ -2678,8 +2728,17 @@ export async function pollAndDeliver(
       return { delayMs: 0, stop: false }
     }
   } else if (res?.changed !== true) {
-    // The hold ran its course with nothing new. No sleep: holding IS the wait.
+    // Idle responses echo all independent cursors. They contain no turn to accept,
+    // so applying them cannot skip work.
+    if (typeof res?.cursor_v2 === 'string' && res.cursor_v2) pump.cursorV2 = res.cursor_v2
+    if (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor) pump.dispatchCursor = res.dispatch_cursor
+    pump.catchUpCursor = null
     pump.needsSeed = false
+    patchState({
+      remoteIngressCursorV2: pump.cursorV2,
+      remoteIngressCatchUpCursor: null,
+      remoteDispatchCursor: pump.dispatchCursor,
+    })
     pump.consecutiveEmpty = 0
     return { delayMs: 0, stop: false }
   }
@@ -2728,177 +2787,144 @@ export async function pollAndDeliver(
     logPoll(`carried canonical advisory: +${roomContext.length} typed actor context (buffer ${pump.carry.size})`)
   }
 
-  // Only an active, live conversational_command wake is executable. Replay, reseed,
-  // advisory, system/AI/agent context, preview-like data, and controls never reach this set.
+  const deliveredIds = new Set(state.deliveredMessageIds ?? [])
   const canonicalSelection = selectCanonicalCommandsForPrompt(
     { ok: true, ingress, executable: parsedIngress.executable },
-    new Set(state.deliveredMessageIds ?? []),
+    deliveredIds,
   )
   const unavailable = canonicalSelection.rejectedUnavailable
   if (unavailable.length > 0) {
-    logPoll(
-      `REJECTED canonical command turn: ${unavailable.length} command(s) contain unavailable attachment(s); no model wake`,
-    )
+    logPoll(`REJECTED canonical command turn: unavailable attachment; holding live cursor`)
   }
-  const roomCommands: any[] = canonicalSelection.commands
-  const liveRoomCommands = roomCommands
-  const dispatchCommands: any[] = []
-  const freshDispatches: any[] = []
-  const wasSeed = false
-  pump.needsSeed = false
 
-  // Dedup against what we have already injected (a bounded set — the cursor alone is not
-  // enough, as a racing/stale cursor read has caused triple-delivery in this file before).
-  const deliveredIds = new Set(state.deliveredMessageIds ?? [])
-  const pendingCommands = [...dispatchCommands, ...liveRoomCommands].filter(
-    (m) => {
-      const id = typeof m?.message_id === 'string' ? m.message_id : typeof m?.id === 'string' ? m.id : null
-      return !(id && deliveredIds.has(id))
-    },
+  // Playbook dispatch is deliberately outside conversational ingress. It has its
+  // own cursor and deterministic text path; action-item assignments are ignored.
+  const offeredDispatches: any[] = Array.isArray(res?.dispatches) ? res.dispatches : []
+  const freshDispatches = offeredDispatches.filter((dispatch) =>
+    dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
+    !pump.deliveredDispatchIds.has(dispatch.id) &&
+    !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')),
   )
-  // Item 6990fd9e: never inject owner commands into a still-settling connect turn.
-  // Hold the cursor until connectMirrorSuppressed clears, then deliver on a later poll.
+  const dispatchCommands = freshDispatches.map((dispatch) => ({
+    id: `dispatch:${dispatch.id}`,
+    created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
+    addressed_to: res.addressed_to,
+    authority: { kind: 'owner', capabilities: ['full'] },
+    content: playbookRunCommandText(dispatch),
+    dispatch_model: dispatch.dispatch_model,
+  }))
+  const liveCursorCandidate = typeof res?.cursor_v2 === 'string' && res.cursor_v2 ? res.cursor_v2 : null
+  const dispatchCursorCandidate = typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor
+    ? res.dispatch_cursor
+    : null
+  const catchUpCursorCandidate = ingress.window.has_more ? ingress.window.next_cursor : null
+
+  const commitConversationCursor = () => {
+    if (liveCursorCandidate) pump.cursorV2 = liveCursorCandidate
+    pump.catchUpCursor = catchUpCursorCandidate
+    pump.needsSeed = Boolean(catchUpCursorCandidate)
+    patchState({
+      remoteIngressCursorV2: pump.cursorV2,
+      remoteIngressCatchUpCursor: pump.catchUpCursor,
+    })
+  }
+  const commitDispatchCursor = () => {
+    if (dispatchCursorCandidate) pump.dispatchCursor = dispatchCursorCandidate
+    patchState({ remoteDispatchCursor: pump.dispatchCursor })
+  }
+
+  // Canonical typed controls never come from slash-looking conversation text.
+  // Execute once, persist the execution marker, then acknowledge the exact id.
+  if (ingress.wake.kind === 'control' && ingress.control) {
+    const controlKey = `control:${ingress.control.id}`
+    if (pump.acceptingTurn?.key !== controlKey) {
+      if (pump.acceptingTurn) return { delayMs: 1000, stop: false }
+      pump.acceptingTurn = { key: controlKey, commandIds: [], dispatchIds: [] }
+      const injectStateKey = sessionId
+      void runWithBondAsync(injectStateKey, async () => {
+        try {
+          const beforeControl = readState() ?? state
+          const executed = new Set(beforeControl.executedControlIds ?? [])
+          let modelCatalog: unknown = beforeControl.pendingControlCatalog?.controlId === ingress.control!.id
+            ? beforeControl.pendingControlCatalog.catalog
+            : undefined
+          if (!executed.has(ingress.control!.id)) {
+            modelCatalog = await executeCanonicalControl({
+              client,
+              directory,
+              sessionId,
+              control: ingress.control!,
+            })
+            patchState({
+              executedControlIds: [...executed, ingress.control!.id].slice(-50),
+              ...(modelCatalog ? { pendingControlCatalog: { controlId: ingress.control!.id, catalog: modelCatalog } } : {}),
+            })
+          }
+          await acknowledgeCanonicalControl({ auth, state: readState() ?? state, controlId: ingress.control!.id, modelCatalog })
+          patchState({ pendingControlCatalog: null })
+          commitConversationCursor()
+        } catch (err) {
+          logPoll(`canonical control ${ingress.control!.verb} failed; not acknowledged: ${err}`)
+        } finally {
+          if (pump.acceptingTurn?.key === controlKey) pump.acceptingTurn = null
+        }
+      })
+      return { delayMs: 0, stop: false }
+    }
+    return { delayMs: 1000, stop: false }
+  }
+
+  // A partial legacy dedupe marker means the immutable envelope was previously
+  // accepted as a whole. Normalize all ids and continue; never replay a suffix.
+  if (canonicalSelection.alreadyDelivered) {
+    for (const command of ingress.commands) deliveredIds.add(command.message_id)
+    patchState({ deliveredMessageIds: [...deliveredIds].slice(-50) })
+    commitConversationCursor()
+  }
+
+  const roomCommands: any[] = canonicalSelection.commands
+  const pendingCommands = [...dispatchCommands, ...roomCommands]
   const deferInject = shouldDeferInjectDuringConnect({
     connectMirrorSuppressed: state.connectMirrorSuppressed,
     awaitingRemoteReply: state.awaitingRemoteReply,
   })
-  const commands = deferInject ? [] : pendingCommands
-  if (deferInject && pendingCommands.length > 0) {
-    logPoll(
-      `deferring inject of ${pendingCommands.length} command(s) — connect handshake still settling ` +
-        `(connectMirrorSuppressed); will retry after suppress clears`,
-    )
-    logRemoteControlStory({
-      phase: 'inject',
-      outcome: 'deferred',
-      connectionId: state.connectionId,
-      sessionId: state.sessionId,
-      agent: AGENT_NAME,
-      codename: state.codename,
-      tool: 'promptAsync',
-      reason: 'connect_handshake',
-      data: { commands: pendingCommands.length },
-    })
+  if ((deferInject || pump.acceptingTurn) && pendingCommands.length > 0) {
+    logPoll(`deferring immutable turn until prior host acceptance settles`)
+    return { delayMs: 1000, stop: false }
   }
+  const commands = pendingCommands
 
-  // Canonical window continuation is the only message cursor after v1 negotiation.
-  // Legacy top-level cursor/dispatch_cursor fields are intentionally ignored.
-  // Advance the message cursor only when the packaged turn was fully consumed.
-  // Holding both the in-memory and persisted cursor is required — next poll's
-  // `cursor` arg is what skips messages on the wire (session 1383cbb8).
-  // MUST patchState — a full writeState of the pre-await snapshot wipes mirror claims.
-  const nextCursor = ingress.window.next_cursor
-  const advanceCursor = shouldAdvanceMessageCursor({
-    injectCount: commands.length,
-    deliverableRoomCount: roomCommands.length,
-    seedKeptCount: liveRoomCommands.length,
-    wasSeed,
-    dispatchCount: dispatchCommands.length,
-  })
-  if (nextCursor && advanceCursor) {
-    pump.cursor = nextCursor
-    if (pump.cursor !== state.lastDeliveredMessageId) {
-      state =
-        patchState({ lastDeliveredMessageId: pump.cursor }) ?? {
-          ...state,
-          lastDeliveredMessageId: pump.cursor,
-        }
-    }
-  } else if (nextCursor && !advanceCursor) {
-    logPoll(
-      `holding message cursor — deliverable work not injected ` +
-        `(room=${roomCommands.length}, seedKept=${liveRoomCommands.length}, ` +
-        `dispatch=${dispatchCommands.length}, inject=${commands.length}` +
-        `${deferInject ? ', deferred=connect_handshake' : ''}); will retry`,
-    )
-    // Keep seed semantics so the next poll still asks for catch-up.
-    if (wasSeed || liveRoomCommands.length > 0 || dispatchCommands.length > 0) {
-      pump.needsSeed = true
-    }
+  // Non-command canonical context/history can commit independently. Explicit
+  // dispatches likewise advance only their own watermark after inspection.
+  if (roomCommands.length === 0 && unavailable.length === 0 && !parsedIngress.executable) {
+    commitConversationCursor()
   }
-
-  // Deferred mid-connect inject: do not fall into empty-change backoff — the
-  // package had real owner work; we deliberately held it.
-  if (deferInject && pendingCommands.length > 0) {
-    pump.consecutiveEmpty = 0
-    await mirrorNow(client, directory, sessionId)
-    return { delayMs: 0, stop: false }
-  }
+  if (freshDispatches.length === 0) commitDispatchCursor()
 
   if (commands.length === 0) {
-    // Changed, but nothing to deliver (advisory-only, or all already delivered).
-    // Advisory-only is normal and must NOT back off — otherwise a chatty room slows
-    // command delivery. Only a genuinely empty change escalates.
-    const advisoryOnly = roomContext.length > 0 || !parsedIngress.executable || unavailable.length > 0
-    if (advisoryOnly) {
-      pump.consecutiveEmpty = 0
-      logRemoteControlStory({
-        phase: 'wake',
-        outcome: 'advisory_only',
-        connectionId: state.connectionId,
-        sessionId: state.sessionId,
-        agent: AGENT_NAME,
-        codename: state.codename,
-        tool: 'poll_connection',
-        reason: 'room_delta',
-        data: {
-          owner_ambient: ownerAmbient.length,
-          room_context: roomContext.length,
-        },
-      })
-      // Event-driven mirroring owns replies; advisory echo must not bypass the
-      // in-flight / min-gap guard with a bare mirrorLatestReply (double-post race).
+    pump.consecutiveEmpty = 0
+    if (roomContext.length > 0 || !parsedIngress.executable || unavailable.length > 0 || canonicalSelection.alreadyDelivered) {
       await mirrorNow(client, directory, sessionId)
       return { delayMs: 0, stop: false }
     }
-    pump.consecutiveEmpty++
-    const floor = emptyTurnBackoffMs(pump.consecutiveEmpty, hold.waitMs)
-    if (pump.consecutiveEmpty === 1 || pump.consecutiveEmpty % 10 === 0) {
-      logPoll(
-        `empty change (${pump.consecutiveEmpty}) — backing off ${floor}ms. ` +
-          `Repeated empty changes mean a server-side marker is hot for a reason the ` +
-          `response does not carry (see item 85f5c74e) — investigate, do not normalise.`,
-      )
-    }
+    const floor = emptyTurnBackoffMs(++pump.consecutiveEmpty, hold.waitMs)
     return { delayMs: floor, stop: false }
   }
   pump.consecutiveEmpty = 0
 
-  const commandIds = commands
-    .map((m) =>
-      typeof m?.message_id === 'string' ? m.message_id : typeof m?.id === 'string' ? m.id : null,
-    )
-    .filter((id): id is string => id != null)
-  for (const id of commandIds) deliveredIds.add(id)
-  for (const d of freshDispatches) pump.deliveredDispatchIds.add(d.id)
-  // Claim BEFORE injecting and persist immediately, so a concurrent poll — or a restarted
-  // process — sees these ids as delivered rather than independently delivering them again.
-  // patchState only — never clobber mirror claim fields with a stale full snapshot.
-  {
-    const deliveryPatch: Partial<ConnectionState> = {
-      deliveredMessageIds: Array.from(deliveredIds).slice(-50),
-      // Item 40279ae0: also track which ids belong to the turn currently in
-      // flight (unioned, not replaced — a needs_input answer can extend an
-      // already-open turn) so an abnormal end can unclaim exactly these ids
-      // from deliveredMessageIds via clearInjectTurnState, without touching
-      // anything an earlier, already-answered turn delivered.
-      currentTurnMessageIds: Array.from(
-        new Set([...(state.currentTurnMessageIds ?? []), ...commandIds]),
-      ).slice(-50),
-    }
-    if (freshDispatches.length > 0) {
-      deliveryPatch.deliveredAssignmentIds = Array.from(pump.deliveredDispatchIds).slice(-50)
-    }
-    state = patchState(deliveryPatch) ?? { ...state, ...deliveryPatch }
-  }
+  const commandIds = roomCommands.map((command) => command.message_id as string)
+  const dispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
+  const canonicalTurnId = roomCommands[0]?.delivery?.turn_id ?? 'no-conversation'
+  const acceptanceKey = `${canonicalTurnId}|${dispatchIds.join(',')}`
+  pump.acceptingTurn = { key: acceptanceKey, commandIds, dispatchIds }
 
   // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
   // question, the next owner command answers THAT question — it must not start
   // a fresh promptAsync turn. Advisory chatter never reaches this branch
   // (commands are local_agent_dispatch only).
-  if (state.pendingQuestion?.requestId) {
+  if (state.pendingQuestion?.requestId && roomCommands.length > 0) {
     const pendingRequestId = state.pendingQuestion.requestId
-    const answerText = commands
+    const answerText = roomCommands
       .map((c: any) =>
         typeof c?.content === 'string'
           ? c.content
@@ -2912,63 +2938,29 @@ export async function pollAndDeliver(
       .join('\n\n')
     const replied = await replyPendingQuestion({ client, directory, answerText })
     if (replied) {
-      pump.carry.take() // discard carried advisory — it must not become the answer
+      for (const id of commandIds) deliveredIds.add(id)
+      patchState({
+        deliveredMessageIds: [...deliveredIds].slice(-50),
+        currentTurnMessageIds: Array.from(new Set([...(state.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
+      })
+      commitConversationCursor()
+      pump.carry.take()
+      pump.acceptingTurn = null
       logPoll(`needs_input: delivered owner reply to question ${pendingRequestId}`)
       return { delayMs: 0, stop: false }
     }
-    logPoll('needs_input: question.reply failed — will retry owner command on next poll')
-    // Un-claim so the same dispatch is retried (ids already in delivered set would
-    // otherwise soft-drop). Drop only the last batch from the set.
-    for (const id of commandIds) deliveredIds.delete(id)
-    const stillCurrent = new Set(commandIds)
-    patchState({
-      deliveredMessageIds: Array.from(deliveredIds).slice(-50),
-      currentTurnMessageIds: (state.currentTurnMessageIds ?? []).filter((id) => !stillCurrent.has(id)),
-    })
+    pump.acceptingTurn = null
+    logPoll('needs_input: question.reply failed — immutable command turn remains uncommitted')
     return { delayMs: 2000, stop: false }
   }
 
-  // OpenCode control slashes (item b315fe42): exact `/compact` etc. run via SDK,
-  // never promptAsync of the slash text. Advisory context is discarded — control
-  // is not a model turn.
-  const controlSlash = resolveOwnerControlSlash(commands)
-  if (controlSlash) {
-    pump.carry.take()
-    const rawDispatchModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
-    const dispatchModelExtract = extractOpenCodeReplyModel(rawDispatchModel)
-    const model = dispatchModelExtract.model
-    logPoll(`control slash: /${controlSlash.kind} via SDK (not promptAsync)`)
-    logRemoteControlStory({
-      phase: 'inject',
-      outcome: 'queued',
-      connectionId: state.connectionId,
-      sessionId: state.sessionId,
-      agent: AGENT_NAME,
-      codename: state.codename,
-      tool: 'session.control',
-      reason: `/${controlSlash.kind}`,
-      data: { commands: commands.length, ...modelStoryData(model) },
-    })
-    const injectStateKey = sessionId
-    void runWithBondAsync(injectStateKey, () =>
-      executeOwnerControlSlash({
-        client,
-        directory,
-        sessionId,
-        auth,
-        command: controlSlash,
-        model,
-      }),
-    ).catch((err) => {
-      logPoll(`executeOwnerControlSlash failed: ${err}`)
-    })
-    return { delayMs: 0, stop: false }
-  }
+  // Slash-looking conversational bodies remain ordinary human commands. Only
+  // ingress.control can enter the deterministic host-control path.
 
   // ONE prompt for the whole delivered turn: the room context (labelled inert) followed
   // by every command in the delta. Injecting per-command would queue separate OpenCode
   // turns, and only the first would carry the context they all share.
-  const context: CarriedContext | null = pump.carry.take()
+  const context: CarriedContext | null = pump.carry.peek()
   // Attachments ride the same turn as real file parts (item 99165e12). Anything too
   // large to inline is named in the text rather than vanishing.
   const {
@@ -2993,8 +2985,9 @@ export async function pollAndDeliver(
   // Per-message provider/model override — only meaningful for provider-agnostic hosts.
   const rawDispatchModel = (commands.find((c: any) => c?.dispatch_model) as any)?.dispatch_model
   const dispatchModelExtract = extractOpenCodeReplyModel(rawDispatchModel)
-  const model = dispatchModelExtract.model
-  if (rawDispatchModel != null && !model) {
+  const model = dispatchModelExtract.model ?? state.remoteControlModel ?? undefined
+  const thinking = state.remoteControlThinking ?? undefined
+  if (rawDispatchModel != null && !dispatchModelExtract.model) {
     logPoll(
       `inject: dispatch_model shape rejected (${dispatchModelExtract.missingReason}): ` +
         `${dispatchModelExtract.rawSnippet ?? summarizeModelShapeSnippet(rawDispatchModel)}`,
@@ -3074,6 +3067,27 @@ export async function pollAndDeliver(
       text,
       fileParts,
       model,
+      thinking,
+      onAccepted: () => {
+        const acceptedState = readState() ?? state
+        const acceptedIds = new Set(acceptedState.deliveredMessageIds ?? [])
+        for (const id of commandIds) acceptedIds.add(id)
+        for (const id of dispatchIds) pump.deliveredDispatchIds.add(id)
+        patchState({
+          deliveredMessageIds: [...acceptedIds].slice(-50),
+          currentTurnMessageIds: Array.from(new Set([...(acceptedState.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
+          ...(dispatchIds.length > 0
+            ? { deliveredAssignmentIds: [...pump.deliveredDispatchIds].slice(-50) }
+            : {}),
+        })
+        if (roomCommands.length > 0) commitConversationCursor()
+        if (dispatchIds.length > 0) commitDispatchCursor()
+        pump.carry.take()
+        if (pump.acceptingTurn?.key === acceptanceKey) pump.acceptingTurn = null
+      },
+      onRejected: () => {
+        if (pump.acceptingTurn?.key === acceptanceKey) pump.acceptingTurn = null
+      },
     }),
   ).catch((err) => {
     logPoll(`deliverInjectedTurn failed: ${err}`)
@@ -3216,6 +3230,108 @@ export async function wipeOpenCodeContextInPlace(input: {
   return { newOpenCodeSessionId: newId, preservedDevspecSessionId }
 }
 
+export async function executeCanonicalControl(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+  sessionId: string
+  control: CanonicalControl
+}): Promise<unknown | undefined> {
+  const { client, directory, sessionId, control } = input
+  switch (control.verb) {
+    case 'abort': {
+      const result = await withTimeout(
+        (client as any).session.abort({ path: { id: sessionId } }),
+        OPENCODE_SESSION_API_TIMEOUT_MS,
+        'canonical-control.abort',
+      )
+      assertSdkAccepted(result, 'canonical-control.abort')
+      await setBusy(directory, false)
+      clearInjectTurnState()
+      return undefined
+    }
+    case 'compact': {
+      const preferred = readState()?.remoteControlModel ?? undefined
+      const model = await resolveControlSlashModel(client, sessionId, preferred)
+      if (!model) throw new Error('No provider/model available to compact this session')
+      const result = await withTimeout(
+        (client as any).session.summarize({ path: { id: sessionId }, body: model }),
+        OPENCODE_CONTROL_COMPACT_TIMEOUT_MS,
+        'canonical-control.compact',
+      )
+      assertSdkAccepted(result, 'canonical-control.compact')
+      return undefined
+    }
+    case 'set_model': {
+      const parsed = extractOpenCodeReplyModel(control.args?.model)
+      if (!parsed.model) throw new Error(`Invalid OpenCode model: ${control.args?.model ?? '(missing)'}`)
+      patchState({ remoteControlModel: parsed.model })
+      return undefined
+    }
+    case 'set_thinking':
+      patchState({ remoteControlThinking: control.args?.thinking ?? null })
+      return undefined
+    case 'reload': {
+      // OpenCode's documented instance disposal is its deterministic reload
+      // boundary: the next request recreates the project instance and plugins.
+      const result = await withTimeout(
+        (client as any).instance.dispose(),
+        OPENCODE_SESSION_API_TIMEOUT_MS,
+        'canonical-control.reload',
+      )
+      assertSdkAccepted(result, 'canonical-control.reload')
+      return undefined
+    }
+    case 'list_models': {
+      const raw = await withTimeout(
+        (client as any).config.providers({ query: { directory } }),
+        OPENCODE_SESSION_API_TIMEOUT_MS,
+        'canonical-control.list_models',
+      )
+      const data = unwrapSdkData<any>(raw) ?? {}
+      const providers = Array.isArray(data.providers) ? data.providers : []
+      const models = providers.flatMap((provider: any) =>
+        Object.entries(provider?.models ?? {}).map(([id, model]: [string, any]) => ({
+          provider: String(provider.id),
+          id,
+          ...(typeof model?.name === 'string' && model.name ? { name: model.name } : {}),
+        })),
+      ).slice(0, 400)
+      const current = readState()?.remoteControlModel
+      return {
+        v: 1,
+        current: current ? `${current.providerID}/${current.modelID}` : null,
+        models,
+        at: new Date().toISOString(),
+        ...(models.length >= 400 ? { truncated: true } : {}),
+      }
+    }
+  }
+}
+
+async function acknowledgeCanonicalControl(input: {
+  auth: { ok: boolean; token?: string; mcp_url?: string }
+  state: ConnectionState
+  controlId: string
+  modelCatalog?: unknown
+}): Promise<void> {
+  if (!input.auth.ok || !input.auth.token || !input.auth.mcp_url) throw new Error('DevSpec auth unavailable for control acknowledgement')
+  await mcpToolsCall({
+    mcpUrl: input.auth.mcp_url,
+    token: input.auth.token,
+    name: 'poll_connection',
+    arguments: {
+      connection_id: input.state.connectionId,
+      agent_name: AGENT_NAME,
+      wait_ms: 0,
+      busy: input.state.busy ?? false,
+      ingress_version: REMOTE_INGRESS_VERSION,
+      control_ack: input.controlId,
+      ...(input.modelCatalog ? { model_catalog: input.modelCatalog } : {}),
+    },
+    timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+  })
+}
+
 /**
  * Run a native OpenCode control slash via SDK (item b315fe42).
  * Posts a short DevSpec answer for most commands; `/new` is silent (8718be5a).
@@ -3349,10 +3465,17 @@ export async function deliverInjectedTurn(input: {
   text: string
   fileParts: unknown[]
   model?: { providerID: string; modelID: string }
+  thinking?: string
+  onAccepted?: () => void
+  onRejected?: () => void
 }): Promise<void> {
-  const { client, directory, sessionId, auth, text, fileParts, model } = input
+  const { client, directory, sessionId, auth, text, fileParts, model, thinking, onAccepted, onRejected } = input
   let state = readState()
-  if (!state) return
+  let promptAccepted = false
+  if (!state) {
+    onRejected?.()
+    return
+  }
 
   try {
     // Baseline: only mirror assistant messages that appear AFTER the last one present at
@@ -3402,13 +3525,23 @@ export async function deliverInjectedTurn(input: {
         ...freshTurnTrail,
       }
 
-    await (client as any).session.promptAsync({
+    const promptResult = await (client as any).session.promptAsync({
       path: { id: sessionId },
       body: {
         parts: [{ type: 'text', text }, ...fileParts],
         ...(model ? { model } : {}),
+        ...(thinking ? { variant: thinking } : {}),
       },
     })
+    assertSdkAccepted(promptResult, 'promptAsync')
+    promptAccepted = true
+    try {
+      onAccepted?.()
+    } catch (err) {
+      // OpenCode accepted the entire immutable turn. Never route a local
+      // bookkeeping failure through rejection/retry and duplicate the prompt.
+      logPoll(`inject acceptance bookkeeping failed after promptAsync accepted: ${err}`)
+    }
     logRemoteControlStory({
       phase: 'inject',
       outcome: 'kicked',
@@ -3439,6 +3572,9 @@ export async function deliverInjectedTurn(input: {
       logPoll(`deliverInjectedTurn: eager trail seed failed (non-fatal): ${err}`)
     }
   } catch (err) {
+    if (!promptAccepted) {
+      try { onRejected?.() } catch { /* best-effort local rollback */ }
+    }
     const reason = err instanceof Error ? err.message : String(err)
     const freshForNotice = readState() ?? state
     if (freshForNotice.sessionId && auth.ok && auth.token && auth.mcp_url) {

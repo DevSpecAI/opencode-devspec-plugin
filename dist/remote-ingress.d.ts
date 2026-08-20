@@ -81,6 +81,16 @@ export interface CanonicalWindow {
     fetch_id: string | null;
     omission_reason: string | null;
 }
+export interface CanonicalControl {
+    id: string;
+    verb: 'abort' | 'set_model' | 'set_thinking' | 'compact' | 'reload' | 'list_models';
+    issued_at: string;
+    issued_by_user_id: string;
+    args?: {
+        model?: string;
+        thinking?: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    };
+}
 export interface CanonicalIngress {
     kind: 'devspec.remote_ingress';
     schema_version: 1;
@@ -96,7 +106,7 @@ export interface CanonicalIngress {
     delivery_state: 'live' | 'replay' | 'reseed';
     command_message_ids: string[];
     commands: CanonicalCommand[];
-    control: unknown | null;
+    control: CanonicalControl | null;
     context: {
         human_context: CanonicalContextEntry[];
         agent_context: CanonicalContextEntry[];
@@ -118,5 +128,6 @@ export declare function parseCanonicalIngress(input: unknown, expectedConnection
 export declare function selectCanonicalCommandsForPrompt(parsed: CanonicalIngressResult, deliveredMessageIds: ReadonlySet<string>): {
     commands: CanonicalCommand[];
     rejectedUnavailable: CanonicalCommand[];
+    alreadyDelivered: boolean;
 };
 export declare function freezeCanonicalTurn<T>(value: T): T;

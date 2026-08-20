@@ -29,11 +29,12 @@ OpenCode process
                                                             ├─ busy? report_keepalive + void checkBusyStall
                                                             ├─ maybeWarnPresenceGap
                                                             ├─ held poll_connection (25s attended / 30s idle + 15s HTTP grace)
-                                                            ├─ commands → renderInjectedTurn → setBusy(true)
+                                                            ├─ canonical conversation + explicit playbook → renderInjectedTurn
                                                             │                 └─ void deliverInjectedTurn (same ALS)
                                                             │                        ├─ session.messages (5s timeout) baseline
-                                                            │                        ├─ session.promptAsync
+                                                            │                        ├─ session.promptAsync acceptance → commit independent cursors/ids
                                                             │                        └─ mirror → post_session_message
+                                                            ├─ canonical typed control → deterministic SDK action → control_ack
                                                             └─ delayMs 0 → next bond / loop again (hold IS the wait)
 ```
 
@@ -91,9 +92,9 @@ Do not “fix” an unsecured-server warning by putting a password into project 
 
 1. Owner dispatches to this connection in DevSpec.
 2. Plugin (inside the OpenCode process) long-polls via held `poll_connection`.
-3. On deliverable commands, plugin builds a turn via `renderInjectedTurn` (context labelled advisory; commands last).
-4. Plugin asserts `setBusy(true)`, then **kicks** `deliverInjectedTurn` without awaiting it.
-5. Inside deliver: timed `session.messages` baseline → `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door.
+3. On an active canonical conversational turn (plus any independent explicit playbook run), the plugin builds one immutable prompt via `renderInjectedTurn` (context labelled advisory; commands last).
+4. Plugin asserts `setBusy(true)`, then **kicks** `deliverInjectedTurn` without awaiting it. No live cursor or delivery id commits yet.
+5. Inside deliver: timed `session.messages` baseline → `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door. Only SDK acceptance atomically commits turn ids, top-level `cursor_v2`, and independent `dispatch_cursor`; `window.next_cursor` remains the older catch-up continuation.
 6. OpenCode model runs a normal turn in that session.
 7. Plugin mirrors the latest assistant reply via `prepareMirrorText` then `post_session_message` (chrome stripped; dedup against model-initiated posts). **Exception:** the `/devspec.remote` / `/devspec.remote-stop` skill turn itself is never mirrored (`shouldSkipConnectTurnMirror` / `command.executed` message id) — that turn is terminal-only status.
 8. Activity: pickup at inject kickoff; keepalive on later polls while busy; complete when mirror clears busy / idle path.
@@ -105,7 +106,7 @@ Do not “fix” an unsecured-server warning by putting a password into project 
 | Keyboard / TUI | OpenCode command layer | Real slash command may run |
 | `session.promptAsync` text parts | Model prompt | Sees the characters as prose — does **not** execute host clear |
 
-OpenCode SDK also documents `session.command` and session create/delete. Those are how you would remotely run command-like or “fresh context” operations **if productised later**. Today’s remote path uses **prompt only**.
+Conversational bodies always use the prompt door, even when they look like `/abort` or `/clear`. Canonical typed controls use a separate deterministic SDK path and acknowledge the server only after that host action succeeds.
 
 ## Why this family exists
 
@@ -137,8 +138,8 @@ While a remote turn runs, the plugin grows a live DevSpec bubble via `post_sessi
 - **Awaiting inject or stall before the next `poll_connection`** — presence starve → `idle_timeout`.
 - Weakening fence-aware chrome filtering in `mirror-chrome.ts` (`prepareMirrorText` / `isOperationalChrome`) — models wrap the connect banner in markdown fences because the skill shows it that way.
 - Letting empty / chrome-only `external_agent` rows settle commands in `unansweredCommands` — that permanently suppresses a still-unanswered owner dispatch.
-- Returning early on `adopt.changed` without a follow-up null-cursor seed — fixed by always re-polling with `cursor:null` + `catch_up` after adopt (session `23da0643` / item `2411dd5a`). Do **not** fall through and consume the pre-adopt package: it was opened under the previous room's cursor, and advisory-only advance permanently skips a cold-launch dispatch that lands moments later (often with a backdated paint timestamp).
-- Advancing the message cursor (in-memory `pump.cursor` **or** persisted `lastDeliveredMessageId`) when deliverable commands were present but not injected — the next poll’s `cursor` arg permanently skips them (`shouldAdvanceMessageCursor`).
+- Returning early on `adopt.changed` without a follow-up null-cursor seed — always re-poll with no `cursor_v2` plus `catch_up` after adopt. Do **not** consume the pre-adopt package: it was opened against the previous room.
+- Advancing top-level live `cursor_v2`, independent `dispatch_cursor`, delivery ids, or `window.next_cursor` catch-up continuation before the corresponding immutable turn is accepted — a rejected `promptAsync` must mechanically retry the whole turn.
 - Cold-launch paint timestamp reused as server `created_at` for `local_agent_dispatch` — wire order must be insertion time (DevSpecV2 chat route); optimistic UI may keep paint time locally.
 - Mirroring the `/devspec.remote` connect turn (or NLP-guessing its narration as chrome) — connect skill replies are terminal-only; skipping them is by `command.executed` message id + handshake suppress (`shouldSkipConnectTurnMirror`), not by widening `isOperationalChrome`.
 
@@ -169,7 +170,7 @@ Cursor keeps a **detached** Node poller (`devspec-remote-poll.mjs`) that heartbe
 |---|---|
 | `src/plugin.ts` | Self-scheduling long-poll pump; `command.executed` → skip-mirror ids; dispose aborts in-flight hold |
 | `src/remote-control.ts` | `pollAndDeliver`, `deliverInjectedTurn`, busy/stall, mirror, presence stories, disk state, `extractOpenCodeReplyModel`, `resolveOpenCodeAssistantModel` |
-| `src/remote-ingress.ts` | Strict negotiated v1 envelope validation; authoritative contract: `devspec://product/remote-ingress-contract` |
+| `src/remote-ingress.ts` | Strict negotiated v1 envelope validation and atomic turn selection; authoritative contract: `devspec://product/remote-ingress-contract` |
 | `src/poll-turn.ts` | Pure hold tiers, advisory carry/rendering, attachment references, cursor advance rules |
 | `src/mirror-chrome.ts` | Fence-aware status strip / `prepareMirrorText` / `shouldSkipConnectTurnMirror` |
 | `src/work-trail.ts` | Serialize in-flight turn → trail text (seed, throttle helpers, unfiltered parts) |

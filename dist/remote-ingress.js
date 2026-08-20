@@ -6,8 +6,22 @@
 export const REMOTE_INGRESS_VERSION = 1;
 const CONTRACT_VERSION = '1.1.0';
 const POLICY_VERSION = '2026-08-19.2';
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const OFFSET_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const UUID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+const OFFSET_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
+function validOffsetDateTime(value) {
+    if (typeof value !== 'string')
+        return false;
+    const match = OFFSET_DATETIME.exec(value);
+    if (!match)
+        return false;
+    const [, year, month, day, hour, minute, second, zone, , offsetHour, offsetMinute] = match;
+    const parts = [year, month, day, hour, minute, second].map(Number);
+    const [y, mo, d, h, mi, s] = parts;
+    if (h > 23 || mi > 59 || s > 59 || (zone !== 'Z' && (Number(offsetHour) > 23 || Number(offsetMinute) > 59)))
+        return false;
+    const calendar = new Date(Date.UTC(y, mo - 1, d));
+    return calendar.getUTCFullYear() === y && calendar.getUTCMonth() === mo - 1 && calendar.getUTCDate() === d && !Number.isNaN(Date.parse(value));
+}
 const record = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 function exact(v, keys, at) {
     if (!record(v))
@@ -35,10 +49,9 @@ function oneOf(v, values, at) {
 }
 function order(v, at) {
     exact(v, ['sequence', 'created_at', 'message_id'], at);
-    if (!Number.isInteger(v.sequence) || v.sequence <= 0)
+    if (!Number.isSafeInteger(v.sequence) || v.sequence <= 0)
         throw new Error(`${at}.sequence is invalid`);
-    str(v.created_at, `${at}.created_at`);
-    if (!OFFSET_DATETIME.test(v.created_at) || Number.isNaN(Date.parse(v.created_at)))
+    if (!validOffsetDateTime(v.created_at))
         throw new Error(`${at}.created_at is invalid`);
     uuid(v.message_id, `${at}.message_id`);
 }
@@ -67,7 +80,7 @@ function attachment(v, at) {
     str(v.filename, `${at}.filename`);
     str(v.mime_type, `${at}.mime_type`);
     str(v.type, `${at}.type`);
-    if (v.size_bytes !== null && (!Number.isInteger(v.size_bytes) || v.size_bytes < 0))
+    if (v.size_bytes !== null && (!Number.isSafeInteger(v.size_bytes) || v.size_bytes < 0))
         throw new Error(`${at}.size_bytes is invalid`);
 }
 function command(v, at) {
@@ -124,9 +137,9 @@ function contextEntry(v, kind, at) {
 }
 function bounded(v, at) {
     exact(v, ['policy_version', 'returned', 'total_known', 'source_window', 'truncated', 'has_more', 'next_cursor', 'fetch_id', 'omission_reason'], at);
-    if (v.policy_version !== POLICY_VERSION || !Number.isInteger(v.returned) || v.returned < 0)
+    if (v.policy_version !== POLICY_VERSION || !Number.isSafeInteger(v.returned) || v.returned < 0)
         throw new Error(`${at} version/count is invalid`);
-    if (v.total_known !== null && (!Number.isInteger(v.total_known) || v.total_known < v.returned))
+    if (v.total_known !== null && (!Number.isSafeInteger(v.total_known) || v.total_known < v.returned))
         throw new Error(`${at}.total_known is invalid`);
     exact(v.source_window, ['start', 'end'], `${at}.source_window`);
     if (v.source_window.start !== null)
@@ -177,8 +190,7 @@ export function parseCanonicalIngress(input, expectedConnectionId) {
             exact(input.control, ['id', 'verb', 'issued_at', 'issued_by_user_id', ...(record(input.control) && input.control.args !== undefined ? ['args'] : [])], 'ingress.control');
             uuid(input.control.id, 'ingress.control.id');
             uuid(input.control.issued_by_user_id, 'ingress.control.issued_by_user_id');
-            str(input.control.issued_at, 'ingress.control.issued_at');
-            if (!OFFSET_DATETIME.test(input.control.issued_at) || Number.isNaN(Date.parse(input.control.issued_at)))
+            if (!validOffsetDateTime(input.control.issued_at))
                 throw new Error('ingress.control.issued_at is invalid');
             oneOf(input.control.verb, ['abort', 'set_model', 'set_thinking', 'compact', 'reload', 'list_models'], 'ingress.control.verb');
             if (input.control.args !== undefined) {
@@ -243,16 +255,15 @@ export function parseCanonicalIngress(input, expectedConnectionId) {
 }
 export function selectCanonicalCommandsForPrompt(parsed, deliveredMessageIds) {
     if (!parsed.ok || !parsed.executable)
-        return { commands: [], rejectedUnavailable: [] };
+        return { commands: [], rejectedUnavailable: [], alreadyDelivered: false };
     const rejectedUnavailable = parsed.ingress.commands.filter((command) => command.attachments.some((attachment) => attachment.materialization === 'unavailable'));
-    // Commands in one canonical envelope are one immutable turn. If any member is
-    // unavailable, fail the turn closed rather than prompt a partial command set.
-    if (rejectedUnavailable.length > 0)
-        return { commands: [], rejectedUnavailable };
-    return {
-        commands: parsed.ingress.commands.filter((command) => !deliveredMessageIds.has(command.message_id)),
-        rejectedUnavailable,
-    };
+    // One envelope is one immutable command turn. Never select only the unseen
+    // suffix: even a partial legacy dedupe marker suppresses the whole turn.
+    const alreadyDelivered = parsed.ingress.commands.some((command) => deliveredMessageIds.has(command.message_id));
+    if (rejectedUnavailable.length > 0 || alreadyDelivered) {
+        return { commands: [], rejectedUnavailable, alreadyDelivered };
+    }
+    return { commands: [...parsed.ingress.commands], rejectedUnavailable, alreadyDelivered: false };
 }
 export function freezeCanonicalTurn(value) {
     const visit = (v) => { if (!v || typeof v !== 'object' || Object.isFrozen(v))

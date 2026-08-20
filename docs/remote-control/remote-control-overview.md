@@ -19,7 +19,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 |---|---|
 | Identity | `register_connection` → `connection_id` + server-minted `codename`. Fixed `AGENT_NAME` per plugin. |
 | Tick / ingress | Use one held `poll_connection` with numeric `ingress_version: 1`. The negotiated wire contract is `devspec://product/remote-ingress-contract`. |
-| Authority and advisory | Consume canonical `ingress` only; do not restate mutable server policy here. Validate and apply `devspec://product/remote-ingress-contract` fail-closed. |
+| Authority and advisory | Consume canonical `ingress` only for conversation/context; explicit playbook `dispatches[]` remains an independent host workflow with its own cursor. Do not restate mutable server policy here; validate `devspec://product/remote-ingress-contract` fail-closed. |
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
 | Answers (sessionless) | Assignment / `report_progress` only — never invent chat. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
