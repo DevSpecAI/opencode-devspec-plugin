@@ -410,10 +410,11 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       // (a70cdf78). Two OpenCode sessions posted contradictory answers under one
       // connection that way.
       //
-      // This blocks the MODEL's tool surface only. The plugin's own delivery is
-      // raw JSON-RPC from this process and never passes through here, and every
-      // other DevSpec verb — report_progress, action items, memories — is
-      // untouched: the boundary is answer egress, not the MCP server.
+      // This blocks the MODEL's tool surface only. The plugin's canonical
+      // answer delivery is raw JSON-RPC from this process and never passes
+      // through here. Current work-pull verbs — reserve_work_items,
+      // claim_work_item, record_implementation — and memories remain untouched:
+      // the boundary is answer egress, not the MCP server.
       if (isPostSessionMessageTool(input.tool)) {
         const bonded =
           typeof input.sessionID === 'string' && isBondedOpenCodeSession(input.sessionID)

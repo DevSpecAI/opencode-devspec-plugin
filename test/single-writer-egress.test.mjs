@@ -112,13 +112,12 @@ describe('model-owned post_session_message is refused while bonded (4c639620)', 
     )
   })
 
-  it('blocks no other DevSpec verb — the egress boundary remains independent', async () => {
+  it('leaves current work-pull and memory verbs available', async () => {
     for (const tool of [
-      'devspec_report_progress',
-      'devspec_create_action_item',
-      'devspec_record_memory',
-      'devspec_get_action_items',
+      'devspec_reserve_work_items',
       'devspec_claim_work_item',
+      'devspec_record_implementation',
+      'devspec_record_memory',
     ]) {
       await assert.doesNotReject(() => before(tool, BONDED, {}), `${tool} must not be blocked`)
     }
