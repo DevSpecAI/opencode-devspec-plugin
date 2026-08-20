@@ -204,6 +204,8 @@ export async function setBusy(directory, busy) {
     const state = readState();
     if (!auth.ok || !auth.token || !auth.mcp_url || !state)
         return;
+    if (!busy)
+        clearPromptTransactions(state.connectionId);
     if (state.busy === busy) {
         logPoll(`setBusy(${busy}) skipped — already ${state.busy}`);
         return; // already asserted — avoid a redundant call
@@ -1686,6 +1688,9 @@ async function reportPollError(auth, directory, state, stage, err, consecutiveEr
     });
 }
 const pumpStates = new Map();
+function clearPromptTransactions(connectionId) {
+    pumpStates.get(connectionId)?.promptTransactions.clear();
+}
 /** Epoch ms of last successful `poll_connection` per connection (presence breadcrumb). */
 const lastSuccessfulPollAt = new Map();
 /** Cooldown so presence_gap stories do not spam every tick. */
@@ -1710,6 +1715,7 @@ function pumpStateFor(connectionId, persisted) {
             deliveredDispatchIds: new Set(persisted.dispatchIds),
             acceptingTurn: null,
             acceptingPlaybook: null,
+            promptTransactions: new Map(),
         };
         pumpStates.set(connectionId, s);
     }
@@ -2123,9 +2129,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     }
     else {
         const dispatchIds = freshDispatches.map((dispatch) => dispatch.id);
-        const playbookKey = dispatchIds.join(',');
+        const playbookKey = `playbook:${dispatchIds.join(',')}`;
         if (!pump.acceptingPlaybook) {
             pump.acceptingPlaybook = { key: playbookKey, dispatchIds };
+            pump.promptTransactions.set(playbookKey, 'pending');
             const playbookCommands = freshDispatches.map((dispatch) => ({
                 id: `dispatch:${dispatch.id}`,
                 created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
@@ -2153,13 +2160,16 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                         pump.deliveredDispatchIds.add(id);
                     patchState({ deliveredAssignmentIds: [...pump.deliveredDispatchIds].slice(-50) });
                     commitPlaybookCursor();
+                    pump.promptTransactions.set(playbookKey, 'accepted');
                     if (pump.acceptingPlaybook?.key === playbookKey)
                         pump.acceptingPlaybook = null;
                 },
                 onRejected: () => {
+                    pump.promptTransactions.delete(playbookKey);
                     if (pump.acceptingPlaybook?.key === playbookKey)
                         pump.acceptingPlaybook = null;
                 },
+                shouldCleanupRejectedTurn: () => pump.promptTransactions.size === 0,
             })).catch((err) => logPoll(`playbook prompt delivery failed: ${err}`));
         }
     }
@@ -2299,8 +2309,9 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     pump.consecutiveEmpty = 0;
     const commandIds = roomCommands.map((command) => command.message_id);
     const canonicalTurnId = roomCommands[0].delivery.turn_id;
-    const acceptanceKey = canonicalTurnId;
+    const acceptanceKey = `canonical:${canonicalTurnId}`;
     pump.acceptingTurn = { key: acceptanceKey, commandIds, dispatchIds: [] };
+    pump.promptTransactions.set(acceptanceKey, 'pending');
     // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
     // question, the next owner command answers THAT question — it must not start
     // a fresh promptAsync turn. Advisory chatter never reaches this branch
@@ -2327,10 +2338,12 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             });
             commitConversationCursor();
             pump.carry.take();
+            pump.promptTransactions.set(acceptanceKey, 'accepted');
             pump.acceptingTurn = null;
             logPoll(`needs_input: delivered owner reply to question ${pendingRequestId}`);
             return { delayMs: 0, stop: false };
         }
+        pump.promptTransactions.delete(acceptanceKey);
         pump.acceptingTurn = null;
         logPoll('needs_input: question.reply failed — immutable command turn remains uncommitted');
         return { delayMs: 2000, stop: false };
@@ -2448,13 +2461,16 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             });
             commitConversationCursor();
             pump.carry.take();
+            pump.promptTransactions.set(acceptanceKey, 'accepted');
             if (pump.acceptingTurn?.key === acceptanceKey)
                 pump.acceptingTurn = null;
         },
         onRejected: () => {
+            pump.promptTransactions.delete(acceptanceKey);
             if (pump.acceptingTurn?.key === acceptanceKey)
                 pump.acceptingTurn = null;
         },
+        shouldCleanupRejectedTurn: () => pump.promptTransactions.size === 0,
     })).catch((err) => {
         logPoll(`deliverInjectedTurn failed: ${err}`);
     });
@@ -2746,7 +2762,7 @@ export async function executeOwnerControlSlash(input) {
  * Presence (`poll_connection`) must keep updating `last_seen` while this runs.
  */
 export async function deliverInjectedTurn(input) {
-    const { client, directory, sessionId, auth, text, fileParts, model, thinking, onAccepted, onRejected } = input;
+    const { client, directory, sessionId, auth, text, fileParts, model, thinking, onAccepted, onRejected, shouldCleanupRejectedTurn, } = input;
     let state = readState();
     let promptAccepted = false;
     if (!state) {
@@ -2869,12 +2885,16 @@ export async function deliverInjectedTurn(input) {
         else {
             logPoll(`promptAsync failed (sessionless): ${reason}`);
         }
-        // No turn is actually running, so clear the busy we just asserted. Item
-        // 40279ae0: `promptAsync` itself rejecting means OpenCode never even
-        // started this turn — unclaim so the command is eligible to re-inject on
-        // the next poll instead of being silently swallowed forever.
-        await setBusy(directory, false);
-        clearInjectTurnState({ unclaim: true });
+        // Clear global lifecycle only when no sibling prompt transaction still
+        // owns it. A rejected simultaneous enqueue must not erase an accepted
+        // sibling's busy state or reply baseline.
+        if (shouldCleanupRejectedTurn?.() ?? true) {
+            await setBusy(directory, false);
+            clearInjectTurnState({ unclaim: true });
+        }
+        else {
+            logPoll('promptAsync rejection preserved busy/reply correlation for a sibling transaction');
+        }
         return;
     }
     // Prefer the guarded path — session.idle / message.updated own the real flush;

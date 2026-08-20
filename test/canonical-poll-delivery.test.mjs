@@ -249,6 +249,9 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
+    assert.equal(state.busy, true)
+    assert.equal(state.awaitingRemoteReply, true)
+    assert.equal(state.replyBaselineCaptured, true)
 
     pollResults.push(changed({ ingress: ingress([cmd]), dispatches: [] }))
     promptImpl = async () => ({ data: true })
@@ -256,6 +259,27 @@ describe('pollAndDeliver canonical transaction integration', () => {
     state = runWithBond(opencodeSessionId, () => readState())
     assert.deepEqual(state.deliveredMessageIds, [message1])
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
+  })
+
+  it('preserves accepted canonical busy/reply correlation when simultaneous playbook prompt rejects', async () => {
+    const cmd = command(message1, 1, provenance1, 'canonical succeeds', true)
+    pollResults.push(changed({
+      ingress: ingress([cmd]),
+      dispatches: [{ id: 'play-rejects', kind: 'playbook_run', run_id: 'run-rejects', instruction: 'Rejected playbook.' }],
+    }))
+    promptImpl = async (args) => args.body.parts[0].text.includes('claim_playbook_run')
+      ? { error: { message: 'playbook queue failed' } }
+      : { data: true }
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredAssignmentIds ?? [], [])
+    assert.equal(state.remoteDispatchCursor ?? null, null)
+    assert.deepEqual(state.deliveredMessageIds, [message1])
+    assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
+    assert.equal(state.busy, true)
+    assert.equal(state.awaitingRemoteReply, true)
+    assert.equal(state.replyBaselineCaptured, true)
   })
 
   it('delivers only explicit playbook_run dispatches through playbook text and advances dispatch_cursor after acceptance', async () => {

@@ -757,6 +757,8 @@ export declare function deliverInjectedTurn(input: {
     thinking?: string;
     onAccepted?: () => void;
     onRejected?: () => void;
+    /** False while a sibling prompt transaction still owns busy/reply correlation. */
+    shouldCleanupRejectedTurn?: () => boolean;
 }): Promise<void>;
 /**
  * Decide how to correlate assistants while awaiting a remote inject reply.
