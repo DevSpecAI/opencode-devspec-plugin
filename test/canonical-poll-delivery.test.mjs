@@ -228,7 +228,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(promptCalls.length, 1)
     assert.match(promptCalls[0].body.parts[0].text, /claim_playbook_run/)
     const state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredAssignmentIds, ['play-malformed'])
+    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-malformed'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
   })
@@ -245,7 +245,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     await tick(); await settle()
     assert.equal(promptCalls.length, 2)
     let state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredAssignmentIds, ['play-simultaneous'])
+    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-simultaneous'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
@@ -273,7 +273,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     await tick(); await settle()
     assert.equal(promptCalls.length, 2)
     const state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredAssignmentIds ?? [], [])
+    assert.deepEqual(state.deliveredPlaybookDispatchIds ?? [], [])
     assert.equal(state.remoteDispatchCursor ?? null, null)
     assert.deepEqual(state.deliveredMessageIds, [message1])
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
@@ -297,8 +297,48 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.match(text, /LOOK ONLY/)
     assert.doesNotMatch(text, /must remain inert/)
     const state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredAssignmentIds, ['play-1'])
+    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-1'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
+  })
+
+  it('migrates legacy playbook dedupe state one way and does not re-inject an old run', async () => {
+    runWithBond(opencodeSessionId, () => writeState({
+      connectionId,
+      sessionId: devspecSessionId,
+      codename: 'Otter',
+      busy: false,
+      deliveredAssignmentIds: ['play-legacy', 'play-legacy', 42],
+    }))
+    forgetPumpState(connectionId)
+    pollResults.push(changed({
+      dispatches: [
+        { id: 'play-legacy', kind: 'playbook_run', run_id: 'run-legacy', instruction: 'Must stay deduped.' },
+        { id: 'play-new', kind: 'playbook_run', run_id: 'run-new', instruction: 'Run once.' },
+        { id: 'assignment-shaped', kind: 'assignment', instruction: 'Must remain inert.' },
+      ],
+    }))
+
+    await tick(); await settle()
+
+    assert.equal(promptCalls.length, 1)
+    const text = promptCalls[0].body.parts[0].text
+    assert.match(text, /run-new/)
+    assert.doesNotMatch(text, /run-legacy|assignment-shaped|Must remain inert/)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-legacy', 'play-new'])
+
+    // Once the new field exists it is authoritative; legacy data cannot be
+    // reintroduced into the runtime dedupe set.
+    runWithBond(opencodeSessionId, () => writeState({
+      ...state,
+      deliveredAssignmentIds: ['play-stale-legacy'],
+    }))
+    forgetPumpState(connectionId)
+    pollResults.push(changed({
+      dispatches: [{ id: 'play-stale-legacy', kind: 'playbook_run', run_id: 'run-stale', instruction: 'New field wins.' }],
+    }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
   })
 
   it('never wakes from legacy conversational arrays after v1 negotiation', async () => {

@@ -306,8 +306,8 @@ interface ConnectionState {
    * `clearInjectTurnState` on stall/error.
    */
   currentTurnMessageIds?: string[] | null
-  /** Assignment ids already injected into OpenCode (sessionless + attached). */
-  deliveredAssignmentIds?: string[]
+  /** Playbook dispatch ids already injected into OpenCode. */
+  deliveredPlaybookDispatchIds?: string[]
   /**
    * Our own last-known assertion of heartbeat_connection's `busy` flag —
    * the SOLE signal that drives the "OpenCode is working…" indicator on the
@@ -2305,11 +2305,11 @@ interface PumpState {
    * clean poll, so only a SUSTAINED absence stops the pump (brief e691c68a).
    */
   consecutiveRecoverableEnds: number
-  deliveredDispatchIds: Set<string>
+  deliveredPlaybookDispatchIds: Set<string>
   /** Prompt transaction awaiting OpenCode acceptance; never schedule it twice. */
-  acceptingTurn: { key: string; commandIds: string[]; dispatchIds: string[] } | null
+  acceptingTurn: { key: string; commandIds: string[] } | null
   /** Explicit playbook prompt acceptance is independent of conversation ingress. */
-  acceptingPlaybook: { key: string; dispatchIds: string[] } | null
+  acceptingPlaybook: { key: string; playbookDispatchIds: string[] } | null
   /** Pending/accepted prompt transactions sharing this bond's busy/correlation lifecycle. */
   promptTransactions: Map<string, 'pending' | 'accepted'>
 }
@@ -2327,7 +2327,12 @@ const lastPresenceGapWarnedAt = new Map<string, number>()
 
 function pumpStateFor(
   connectionId: string,
-  persisted: { cursorV2: string | null; catchUpCursor: string | null; dispatchCursor: string | null; dispatchIds: string[] },
+  persisted: {
+    cursorV2: string | null
+    catchUpCursor: string | null
+    dispatchCursor: string | null
+    playbookDispatchIds: string[]
+  },
 ): PumpState {
   let s = pumpStates.get(connectionId)
   if (!s) {
@@ -2342,10 +2347,9 @@ function pumpStateFor(
       consecutiveEmpty: 0,
       consecutiveErrors: 0,
       consecutiveRecoverableEnds: 0,
-      // Seeded from disk so a plugin restart cannot re-inject an assignment it already
-      // handed to the model — the interval version persisted this and losing it would
-      // have been a silent regression.
-      deliveredDispatchIds: new Set(persisted.dispatchIds),
+      // Seeded from disk so a plugin restart cannot re-inject a playbook run it
+      // already handed to the model.
+      deliveredPlaybookDispatchIds: new Set(persisted.playbookDispatchIds),
       acceptingTurn: null,
       acceptingPlaybook: null,
       promptTransactions: new Map(),
@@ -2353,6 +2357,32 @@ function pumpStateFor(
     pumpStates.set(connectionId, s)
   }
   return s
+}
+
+/**
+ * One-way local-state compatibility: old OpenCode versions persisted playbook
+ * dispatch ids under an assignment-shaped field. Read it only when the new
+ * field is absent; all current writes use the playbook-specific field.
+ */
+const LEGACY_PLAYBOOK_DISPATCH_IDS_FIELD = 'deliveredAssignmentIds'
+
+function persistedPlaybookDispatchIds(state: ConnectionState): {
+  ids: string[]
+  migratedFromLegacy: boolean
+} {
+  if (Array.isArray(state.deliveredPlaybookDispatchIds)) {
+    return {
+      ids: [...new Set(state.deliveredPlaybookDispatchIds.filter((id): id is string => typeof id === 'string'))].slice(-50),
+      migratedFromLegacy: false,
+    }
+  }
+
+  const legacy = (state as unknown as Record<string, unknown>)[LEGACY_PLAYBOOK_DISPATCH_IDS_FIELD]
+  if (!Array.isArray(legacy)) return { ids: [], migratedFromLegacy: false }
+  return {
+    ids: [...new Set(legacy.filter((id): id is string => typeof id === 'string'))].slice(-50),
+    migratedFromLegacy: true,
+  }
 }
 
 /** Drop pump state for a connection (teardown / stop). */
@@ -2452,9 +2482,9 @@ export interface PollOutcome {
 }
 
 /**
- * Wake text for a playbook_run dispatch. Must NOT send the agent down the
- * assignment protocol — wrong tools, and a look-only playbook would lose its
- * permission line. Keep in step with Cursor's playbookRunCommandText.
+ * Wake text for a playbook_run dispatch. It is a separate owner-scoped typed
+ * wake, not action-item delivery; a look-only playbook must retain its
+ * permission line.
  *
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
@@ -2545,11 +2575,18 @@ export async function pollAndDeliver(
   }
   authFailureLogged = false
 
+  const persistedPlaybookIds = persistedPlaybookDispatchIds(state)
+  if (persistedPlaybookIds.migratedFromLegacy) {
+    state = patchState({ deliveredPlaybookDispatchIds: persistedPlaybookIds.ids }) ?? {
+      ...state,
+      deliveredPlaybookDispatchIds: persistedPlaybookIds.ids,
+    }
+  }
   const pump = pumpStateFor(state.connectionId, {
     cursorV2: state.remoteIngressCursorV2 ?? null,
     catchUpCursor: state.remoteIngressCatchUpCursor ?? null,
     dispatchCursor: state.remoteDispatchCursor ?? null,
-    dispatchIds: state.deliveredAssignmentIds ?? [],
+    playbookDispatchIds: persistedPlaybookIds.ids,
   })
   const turnActive = state.busy === true
   const hold = holdFor({ attached: !!state.sessionId, turnActive })
@@ -2790,13 +2827,13 @@ export async function pollAndDeliver(
     return { delayMs: 0, stop: false }
   }
 
-  // Explicit playbook dispatch is a separate top-level workflow. Extract and
+  // Explicit playbook dispatch is a separate owner-scoped workflow. Extract and
   // schedule it before canonical parsing so an unsupported conversation envelope
-  // cannot block a valid playbook, and never admit action-item assignments.
+  // cannot block a valid playbook. Unknown work-shaped dispatches remain inert.
   const offeredDispatches: any[] = Array.isArray(res?.dispatches) ? res.dispatches : []
   const freshDispatches = offeredDispatches.filter((dispatch) =>
     dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
-    !pump.deliveredDispatchIds.has(dispatch.id) &&
+    !pump.deliveredPlaybookDispatchIds.has(dispatch.id) &&
     !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')),
   )
   const playbookDispatchCursor = typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor
@@ -2809,10 +2846,10 @@ export async function pollAndDeliver(
   if (freshDispatches.length === 0) {
     commitPlaybookCursor()
   } else {
-    const dispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
-    const playbookKey = `playbook:${dispatchIds.join(',')}`
+    const playbookDispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
+    const playbookKey = `playbook:${playbookDispatchIds.join(',')}`
     if (!pump.acceptingPlaybook) {
-      pump.acceptingPlaybook = { key: playbookKey, dispatchIds }
+      pump.acceptingPlaybook = { key: playbookKey, playbookDispatchIds }
       pump.promptTransactions.set(playbookKey, 'pending')
       const playbookCommands = freshDispatches.map((dispatch) => ({
         id: `dispatch:${dispatch.id}`,
@@ -2837,8 +2874,8 @@ export async function pollAndDeliver(
         model,
         thinking: state.remoteControlThinking ?? undefined,
         onAccepted: () => {
-          for (const id of dispatchIds) pump.deliveredDispatchIds.add(id)
-          patchState({ deliveredAssignmentIds: [...pump.deliveredDispatchIds].slice(-50) })
+          for (const id of playbookDispatchIds) pump.deliveredPlaybookDispatchIds.add(id)
+          patchState({ deliveredPlaybookDispatchIds: [...pump.deliveredPlaybookDispatchIds].slice(-50) })
           commitPlaybookCursor()
           pump.promptTransactions.set(playbookKey, 'accepted')
           if (pump.acceptingPlaybook?.key === playbookKey) pump.acceptingPlaybook = null
@@ -2924,7 +2961,7 @@ export async function pollAndDeliver(
     const controlKey = `control:${ingress.control.id}`
     if (pump.acceptingTurn?.key !== controlKey) {
       if (pump.acceptingTurn) return { delayMs: 1000, stop: false }
-      pump.acceptingTurn = { key: controlKey, commandIds: [], dispatchIds: [] }
+      pump.acceptingTurn = { key: controlKey, commandIds: [] }
       const injectStateKey = sessionId
       void runWithBondAsync(injectStateKey, async () => {
         try {
@@ -3001,7 +3038,7 @@ export async function pollAndDeliver(
   const commandIds = roomCommands.map((command) => command.message_id as string)
   const canonicalTurnId = roomCommands[0]!.delivery.turn_id
   const acceptanceKey = `canonical:${canonicalTurnId}`
-  pump.acceptingTurn = { key: acceptanceKey, commandIds, dispatchIds: [] }
+  pump.acceptingTurn = { key: acceptanceKey, commandIds }
   pump.promptTransactions.set(acceptanceKey, 'pending')
 
   // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
@@ -4262,7 +4299,8 @@ async function failOpenTrailTurn(
  *
  * OpenCode has no separate skill post path — this plugin *is* the agent writer.
  * Rules (ADR b98a39a9 clean cut):
- * - Sessionless: never post chat (assignment/progress only).
+ * - Sessionless: never post chat; separately accepted playbook runs report via
+ *   record_playbook_run.
  * - Prefer connection_id (server resolves current attachment).
  * - After a remote inject, only mirror assistants newer than the pre-inject baseline
  *   so an unrelated older local answer is not re-posted.

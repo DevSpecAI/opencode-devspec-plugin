@@ -136,8 +136,8 @@ interface ConnectionState {
      * `clearInjectTurnState` on stall/error.
      */
     currentTurnMessageIds?: string[] | null;
-    /** Assignment ids already injected into OpenCode (sessionless + attached). */
-    deliveredAssignmentIds?: string[];
+    /** Playbook dispatch ids already injected into OpenCode. */
+    deliveredPlaybookDispatchIds?: string[];
     /**
      * Our own last-known assertion of heartbeat_connection's `busy` flag —
      * the SOLE signal that drives the "OpenCode is working…" indicator on the
