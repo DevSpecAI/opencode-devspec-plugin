@@ -377,6 +377,9 @@ describe('pollAndDeliver canonical transaction integration', () => {
     pollResults.push(changed({ ingress: ingress([], { wake: { kind: 'control', active: true, reason_id: 'owner_control' }, control: thinkingControl }) }))
     await tick(); await settle()
 
+    const modelAck = calls.find((call) => call.name === 'poll_connection' && call.arguments.control_ack === modelControl.id)
+    assert.deepEqual(modelAck.arguments.agent_stats.model, { provider: 'anthropic', id: 'claude-test' })
+
     const cmd = command(message1, 1, provenance1, 'use selected controls', true)
     pollResults.push(changed({ cursor_v2: 'after-controlled-prompt', ingress: ingress([cmd]) }))
     await tick(); await settle()
@@ -392,6 +395,28 @@ describe('pollAndDeliver canonical transaction integration', () => {
     const ack = calls.find((call) => call.name === 'poll_connection' && call.arguments.control_ack === listId)
     assert.deepEqual(ack.arguments.model_catalog.models, [{ provider: 'anthropic', id: 'claude-test', name: 'Claude Test' }])
     assert.equal(ack.arguments.model_catalog.current, 'anthropic/claude-test')
+  })
+
+  it('rejects set_model for a provider this process does not have and posts to the room', async () => {
+    const control = {
+      id: 'f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1',
+      verb: 'set_model',
+      issued_at: '2026-08-20T12:00:00.000Z',
+      issued_by_user_id: ownerId,
+      args: { model: 'missing/not-a-model' },
+    }
+    const client = clientDouble()
+    client.config.providers = async () => ({
+      data: { providers: [{ id: 'anthropic', models: { 'claude-test': { name: 'Claude Test' } } }], default: {} },
+    })
+    pollResults.push(changed({ ingress: ingress([], { wake: { kind: 'control', active: true, reason_id: 'owner_control' }, control }) }))
+    await tick(client); await settle()
+    assert.equal(calls.some((call) => call.arguments.control_ack === control.id), false)
+    const notice = calls.find((call) => call.name === 'post_session_message')
+    assert.match(notice.arguments.message, /Could not switch model/)
+    assert.match(notice.arguments.message, /missing\/not-a-model/)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.remoteControlModel ?? null, null)
   })
 
   it('does not acknowledge a typed control when the deterministic host action fails', async () => {

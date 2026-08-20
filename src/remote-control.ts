@@ -749,6 +749,41 @@ export function modelStoryData(model: OpenCodeModelStamp | undefined): Record<st
   }
 }
 
+function remoteControlAgentStats(state: ConnectionState | null): Record<string, unknown> | undefined {
+  const model = state?.remoteControlModel
+  if (!model?.providerID || !model.modelID) return undefined
+  return {
+    v: 1,
+    model: { provider: model.providerID, id: model.modelID },
+    thinkingLevel: null,
+    context: null,
+    turn: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, messages: 0 },
+    session: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, turns: 0 },
+    at: new Date().toISOString(),
+  }
+}
+
+function catalogModelsFromProviders(raw: unknown): Array<{ provider: string; id: string; name?: string }> {
+  const data = (raw && typeof raw === 'object' ? raw : {}) as { providers?: unknown }
+  const providers = Array.isArray(data.providers) ? data.providers : []
+  return providers.flatMap((provider: unknown) => {
+    if (!provider || typeof provider !== 'object') return []
+    const row = provider as { id?: unknown; models?: unknown }
+    const providerId = typeof row.id === 'string' ? row.id : ''
+    if (!providerId) return []
+    const models = row.models && typeof row.models === 'object' && !Array.isArray(row.models)
+      ? Object.entries(row.models as Record<string, unknown>)
+      : []
+    return models.map(([id, model]) => ({
+      provider: providerId,
+      id,
+      ...(model && typeof model === 'object' && typeof (model as { name?: unknown }).name === 'string' && (model as { name: string }).name
+        ? { name: (model as { name: string }).name }
+        : {}),
+    }))
+  }).slice(0, 400)
+}
+
 /**
  * True when the latest assistant message still has an in-flight tool
  * (pending / running). Completed tools alone are not progress — the turn
@@ -2562,6 +2597,7 @@ export async function pollAndDeliver(
         ...(pump.catchUpCursor ? { catch_up_cursor: pump.catchUpCursor } : {}),
         ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
         ingress_version: REMOTE_INGRESS_VERSION,
+        ...(remoteControlAgentStats(state) ? { agent_stats: remoteControlAgentStats(state) } : {}),
       },
       timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
       signal: opts.signal,
@@ -2914,6 +2950,10 @@ export async function pollAndDeliver(
           commitConversationCursor()
         } catch (err) {
           logPoll(`canonical control ${ingress.control!.verb} failed; not acknowledged: ${err}`)
+          if (ingress.control!.verb === 'set_model') {
+            const reason = err instanceof Error ? err.message : String(err)
+            await postSessionNotice(auth, readState() ?? state, `⚠️ Could not switch model: ${reason}`)
+          }
         } finally {
           if (pump.acceptingTurn?.key === controlKey) pump.acceptingTurn = null
         }
@@ -3277,6 +3317,19 @@ export async function wipeOpenCodeContextInPlace(input: {
   return { newOpenCodeSessionId: newId, preservedDevspecSessionId }
 }
 
+async function liveOpenCodeCatalog(input: {
+  client: Parameters<Plugin>[0]['client']
+  directory: string
+}): Promise<{ models: Array<{ provider: string; id: string; name?: string }>; truncated: boolean }> {
+  const raw = await withTimeout(
+    (input.client as any).config.providers({ query: { directory: input.directory } }),
+    OPENCODE_SESSION_API_TIMEOUT_MS,
+    'canonical-control.list_models',
+  )
+  const models = catalogModelsFromProviders(unwrapSdkData<unknown>(raw) ?? {})
+  return { models, truncated: models.length >= 400 }
+}
+
 export async function executeCanonicalControl(input: {
   client: Parameters<Plugin>[0]['client']
   directory: string
@@ -3311,6 +3364,19 @@ export async function executeCanonicalControl(input: {
     case 'set_model': {
       const parsed = extractOpenCodeReplyModel(control.args?.model)
       if (!parsed.model) throw new Error(`Invalid OpenCode model: ${control.args?.model ?? '(missing)'}`)
+      const key = `${parsed.model.providerID}/${parsed.model.modelID}`
+      let configured: Array<{ provider: string; id: string }> = []
+      try {
+        configured = (await liveOpenCodeCatalog({ client, directory })).models
+      } catch (err) {
+        logPoll(`set_model: could not list providers; persisting ${key} anyway: ${err}`)
+      }
+      if (
+        configured.length > 0 &&
+        !configured.some((model) => model.provider === parsed.model!.providerID && model.id === parsed.model!.modelID)
+      ) {
+        throw new Error(`This OpenCode process does not have ${key} configured`)
+      }
       patchState({ remoteControlModel: parsed.model })
       return undefined
     }
@@ -3329,27 +3395,14 @@ export async function executeCanonicalControl(input: {
       return undefined
     }
     case 'list_models': {
-      const raw = await withTimeout(
-        (client as any).config.providers({ query: { directory } }),
-        OPENCODE_SESSION_API_TIMEOUT_MS,
-        'canonical-control.list_models',
-      )
-      const data = unwrapSdkData<any>(raw) ?? {}
-      const providers = Array.isArray(data.providers) ? data.providers : []
-      const models = providers.flatMap((provider: any) =>
-        Object.entries(provider?.models ?? {}).map(([id, model]: [string, any]) => ({
-          provider: String(provider.id),
-          id,
-          ...(typeof model?.name === 'string' && model.name ? { name: model.name } : {}),
-        })),
-      ).slice(0, 400)
+      const { models, truncated } = await liveOpenCodeCatalog({ client, directory })
       const current = readState()?.remoteControlModel
       return {
         v: 1,
         current: current ? `${current.providerID}/${current.modelID}` : null,
         models,
         at: new Date().toISOString(),
-        ...(models.length >= 400 ? { truncated: true } : {}),
+        ...(truncated ? { truncated: true } : {}),
       }
     }
   }
@@ -3374,6 +3427,7 @@ async function acknowledgeCanonicalControl(input: {
       ingress_version: REMOTE_INGRESS_VERSION,
       control_ack: input.controlId,
       ...(input.modelCatalog ? { model_catalog: input.modelCatalog } : {}),
+      ...(remoteControlAgentStats(input.state) ? { agent_stats: remoteControlAgentStats(input.state) } : {}),
     },
     timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
   })
