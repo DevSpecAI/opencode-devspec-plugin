@@ -5,9 +5,10 @@
  */
 
 export const REMOTE_INGRESS_VERSION = 1 as const
-const CONTRACT_VERSION = '1.1.1'
-const SUPPORTED_CONTRACT_VERSIONS = new Set(['1.1.0', CONTRACT_VERSION])
-const POLICY_VERSION = '2026-08-19.2'
+export const DELEGATED_SCOPE_VERSION = 1 as const
+export const DELEGATED_PROJECT_POLICY_ID = 'delegated_project_v1' as const
+const CONTRACT_VERSION = '1.2.0'
+const POLICY_VERSION = '2026-08-19.3'
 const UUID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i
 const OFFSET_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/
 
@@ -33,6 +34,12 @@ export interface CanonicalAttachment {
   reason?: 'missing_resource' | 'legacy_inline_payload' | 'access_denied'
 }
 export interface CanonicalOrder { sequence: number; created_at: string; message_id: string }
+export interface CanonicalProjectScope {
+  kind: 'devspec_project'
+  policy_id: typeof DELEGATED_PROJECT_POLICY_ID
+  project_id: string
+  instruction: string
+}
 export interface CanonicalCommand {
   message_id: string
   order: CanonicalOrder
@@ -40,6 +47,7 @@ export interface CanonicalCommand {
   attachments: CanonicalAttachment[]
   requester: { user_id: string; display_name: string | null }
   authority: { kind: 'owner' | 'delegated'; mode: 'owner' | 'project' | 'allowlist'; requested_by_user_id: string; connection_owner_user_id: string; decision_source: 'server' }
+  project_scope: CanonicalProjectScope | null
   addressee: CanonicalConnection
   delivery: { provenance_ref: string; turn_id: string; primary_provenance_ref: string; is_primary: boolean }
 }
@@ -106,6 +114,16 @@ function uuid(v: unknown, at: string, nullable = false): asserts v is string | n
 function oneOf<T extends string>(v: unknown, values: readonly T[], at: string): asserts v is T {
   if (typeof v !== 'string' || !values.includes(v as T)) throw new Error(`${at} is unknown`)
 }
+function projectScope(v: unknown, at: string): asserts v is CanonicalProjectScope {
+  exact(v, ['kind', 'policy_id', 'project_id', 'instruction'], at)
+  if (v.kind !== 'devspec_project') throw new Error(`${at}.kind is unknown`)
+  if (v.policy_id !== DELEGATED_PROJECT_POLICY_ID) throw new Error(`${at}.policy_id is unknown`)
+  uuid(v.project_id, `${at}.project_id`)
+  if (typeof v.instruction !== 'string' || v.instruction.trim().length === 0) throw new Error(`${at}.instruction must be non-empty server text`)
+}
+export function isCanonicalProjectScope(v: unknown): v is CanonicalProjectScope {
+  try { projectScope(v, 'project_scope'); return true } catch { return false }
+}
 function order(v: unknown, at: string): asserts v is CanonicalOrder {
   exact(v, ['sequence', 'created_at', 'message_id'], at)
   if (!Number.isSafeInteger(v.sequence) || (v.sequence as number) <= 0) throw new Error(`${at}.sequence is invalid`)
@@ -130,7 +148,7 @@ function attachment(v: unknown, at: string): asserts v is CanonicalAttachment {
   if (v.size_bytes !== null && (!Number.isSafeInteger(v.size_bytes) || (v.size_bytes as number) < 0)) throw new Error(`${at}.size_bytes is invalid`)
 }
 function command(v: unknown, at: string): asserts v is CanonicalCommand {
-  exact(v, ['message_id', 'order', 'content', 'attachments', 'requester', 'authority', 'addressee', 'delivery'], at)
+  exact(v, ['message_id', 'order', 'content', 'attachments', 'requester', 'authority', 'project_scope', 'addressee', 'delivery'], at)
   uuid(v.message_id, `${at}.message_id`); order(v.order, `${at}.order`)
   if (v.message_id !== v.order.message_id) throw new Error(`${at} identity mismatch`)
   exact(v.content, ['mode', 'body', 'complete'], `${at}.content`)
@@ -143,6 +161,11 @@ function command(v: unknown, at: string): asserts v is CanonicalCommand {
   if (v.authority.decision_source !== 'server' || v.requester.user_id !== v.authority.requested_by_user_id) throw new Error(`${at}.authority is inconsistent`)
   const owner = v.authority.requested_by_user_id === v.authority.connection_owner_user_id
   if ((v.authority.kind === 'owner') !== owner || (v.authority.mode === 'owner' && v.authority.kind !== 'owner')) throw new Error(`${at}.authority contradicts requester`)
+  if (v.authority.kind === 'owner') {
+    if (v.project_scope !== null) throw new Error(`${at}.project_scope must be null for owner authority`)
+  } else {
+    projectScope(v.project_scope, `${at}.project_scope`)
+  }
   connection(v.addressee, `${at}.addressee`)
   exact(v.delivery, ['provenance_ref', 'turn_id', 'primary_provenance_ref', 'is_primary'], `${at}.delivery`)
   uuid(v.delivery.provenance_ref, `${at}.delivery.provenance_ref`); uuid(v.delivery.turn_id, `${at}.delivery.turn_id`); uuid(v.delivery.primary_provenance_ref, `${at}.delivery.primary_provenance_ref`)
@@ -176,7 +199,7 @@ function strictlyOrdered(rows: Array<{ order: CanonicalOrder }>) { return rows.e
 export function parseCanonicalIngress(input: unknown, expectedConnectionId: string): CanonicalIngressResult {
   try {
     exact(input, ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', 'window'], 'ingress')
-    if (input.kind !== 'devspec.remote_ingress' || input.schema_version !== 1 || !SUPPORTED_CONTRACT_VERSIONS.has(input.contract_version as string) || input.policy_version !== POLICY_VERSION) throw new Error('ingress version is unsupported')
+    if (input.kind !== 'devspec.remote_ingress' || input.schema_version !== 1 || input.contract_version !== CONTRACT_VERSION || input.policy_version !== POLICY_VERSION) throw new Error('ingress contract/policy pair is unsupported')
     uuid(input.envelope_id, 'ingress.envelope_id'); connection(input.connection, 'ingress.connection')
     if (input.connection.connection_id !== expectedConnectionId) throw new Error('ingress connection mismatch')
     exact(input.wake, ['kind', 'active', 'reason_id'], 'ingress.wake'); oneOf(input.wake.kind, ['conversational_command', 'control', 'advisory_update', 'history_reseed', 'idle'], 'ingress.wake.kind')

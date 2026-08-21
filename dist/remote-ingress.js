@@ -4,9 +4,10 @@
  * devspec://product/remote-ingress-contract.
  */
 export const REMOTE_INGRESS_VERSION = 1;
-const CONTRACT_VERSION = '1.1.1';
-const SUPPORTED_CONTRACT_VERSIONS = new Set(['1.1.0', CONTRACT_VERSION]);
-const POLICY_VERSION = '2026-08-19.2';
+export const DELEGATED_SCOPE_VERSION = 1;
+export const DELEGATED_PROJECT_POLICY_ID = 'delegated_project_v1';
+const CONTRACT_VERSION = '1.2.0';
+const POLICY_VERSION = '2026-08-19.3';
 const UUID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
 const OFFSET_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
 function validOffsetDateTime(value) {
@@ -48,6 +49,25 @@ function oneOf(v, values, at) {
     if (typeof v !== 'string' || !values.includes(v))
         throw new Error(`${at} is unknown`);
 }
+function projectScope(v, at) {
+    exact(v, ['kind', 'policy_id', 'project_id', 'instruction'], at);
+    if (v.kind !== 'devspec_project')
+        throw new Error(`${at}.kind is unknown`);
+    if (v.policy_id !== DELEGATED_PROJECT_POLICY_ID)
+        throw new Error(`${at}.policy_id is unknown`);
+    uuid(v.project_id, `${at}.project_id`);
+    if (typeof v.instruction !== 'string' || v.instruction.trim().length === 0)
+        throw new Error(`${at}.instruction must be non-empty server text`);
+}
+export function isCanonicalProjectScope(v) {
+    try {
+        projectScope(v, 'project_scope');
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
 function order(v, at) {
     exact(v, ['sequence', 'created_at', 'message_id'], at);
     if (!Number.isSafeInteger(v.sequence) || v.sequence <= 0)
@@ -85,7 +105,7 @@ function attachment(v, at) {
         throw new Error(`${at}.size_bytes is invalid`);
 }
 function command(v, at) {
-    exact(v, ['message_id', 'order', 'content', 'attachments', 'requester', 'authority', 'addressee', 'delivery'], at);
+    exact(v, ['message_id', 'order', 'content', 'attachments', 'requester', 'authority', 'project_scope', 'addressee', 'delivery'], at);
     uuid(v.message_id, `${at}.message_id`);
     order(v.order, `${at}.order`);
     if (v.message_id !== v.order.message_id)
@@ -109,6 +129,13 @@ function command(v, at) {
     const owner = v.authority.requested_by_user_id === v.authority.connection_owner_user_id;
     if ((v.authority.kind === 'owner') !== owner || (v.authority.mode === 'owner' && v.authority.kind !== 'owner'))
         throw new Error(`${at}.authority contradicts requester`);
+    if (v.authority.kind === 'owner') {
+        if (v.project_scope !== null)
+            throw new Error(`${at}.project_scope must be null for owner authority`);
+    }
+    else {
+        projectScope(v.project_scope, `${at}.project_scope`);
+    }
     connection(v.addressee, `${at}.addressee`);
     exact(v.delivery, ['provenance_ref', 'turn_id', 'primary_provenance_ref', 'is_primary'], `${at}.delivery`);
     uuid(v.delivery.provenance_ref, `${at}.delivery.provenance_ref`);
@@ -166,8 +193,8 @@ function strictlyOrdered(rows) { return rows.every((r, i) => i === 0 || rows[i -
 export function parseCanonicalIngress(input, expectedConnectionId) {
     try {
         exact(input, ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', 'window'], 'ingress');
-        if (input.kind !== 'devspec.remote_ingress' || input.schema_version !== 1 || !SUPPORTED_CONTRACT_VERSIONS.has(input.contract_version) || input.policy_version !== POLICY_VERSION)
-            throw new Error('ingress version is unsupported');
+        if (input.kind !== 'devspec.remote_ingress' || input.schema_version !== 1 || input.contract_version !== CONTRACT_VERSION || input.policy_version !== POLICY_VERSION)
+            throw new Error('ingress contract/policy pair is unsupported');
         uuid(input.envelope_id, 'ingress.envelope_id');
         connection(input.connection, 'ingress.connection');
         if (input.connection.connection_id !== expectedConnectionId)
