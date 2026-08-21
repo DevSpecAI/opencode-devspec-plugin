@@ -48,6 +48,15 @@ const ownerCommand = (over = {}) => ({
   created_at: '2026-07-25T21:33:18.000Z',
   addressed_to: { connection_id: ME, label: 'OpenCode · Brave Otter' },
   authority: { kind: 'owner', capabilities: ['full'] },
+  project_scope: null,
+  ...over,
+})
+
+const delegatedScope = (over = {}) => ({
+  kind: 'devspec_project',
+  policy_id: 'delegated_project_v1',
+  project_id: '11111111-1111-4111-8111-111111111111',
+  instruction: 'Follow the server-provided project boundary.',
   ...over,
 })
 
@@ -76,12 +85,31 @@ describe('isDeliverableCommand — the authority boundary', () => {
     assert.equal(isDeliverableCommand(forSomeoneElse, ME), false)
   })
 
+  it('accepts delegated authority only with the exact server-authored project scope', () => {
+    assert.equal(isDeliverableCommand(ownerCommand({
+      authority: { kind: 'delegated' },
+      project_scope: delegatedScope(),
+    }), ME), true)
+    for (const project_scope of [
+      null,
+      delegatedScope({ project_id: 'not-a-uuid' }),
+      delegatedScope({ policy_id: 'other_policy' }),
+      { ...delegatedScope(), extra: true },
+    ]) {
+      assert.equal(isDeliverableCommand(ownerCommand({ authority: { kind: 'delegated' }, project_scope }), ME), false)
+    }
+  })
+
+  it('requires null scope for owner authority', () => {
+    assert.equal(isDeliverableCommand(ownerCommand({ project_scope: delegatedScope() }), ME), false)
+    const missing = ownerCommand()
+    delete missing.project_scope
+    assert.equal(isDeliverableCommand(missing, ME), false)
+  })
+
   it('REFUSES an unrecognised authority kind rather than trusting a new server value', () => {
-    // When a new kind starts arriving, accepting it must be a deliberate edit here —
-    // not something that quietly switches itself on. `delegated` was that edit
-    // (f5eef85: an authorized teammate, same capabilities, different attribution);
-    // this list did not follow it, so the gate has been red since. It records the
-    // two kinds that are accepted TODAY — a third still has to be added on purpose.
+    // The accepted kinds are explicit. A future authority value must not quietly
+    // switch itself on through a permissive fallback.
     assert.equal(isDeliverableCommand(ownerCommand({ authority: { kind: 'delegate' } }), ME), false)
     assert.equal(isDeliverableCommand(ownerCommand({ authority: undefined }), ME), false)
     assert.deepEqual([...ACCEPTED_COMMAND_AUTHORITIES], ['owner', 'delegated'])

@@ -2,6 +2,7 @@ import {
   collapseOrphanMarkdownFences,
   unwrapSingleOuterMarkdownFence,
 } from './mirror-chrome.js'
+import { isCanonicalProjectScope, type CanonicalProjectScope } from './remote-ingress.js'
 
 /**
  * Pure logic for the long-poll tick and the tiered turn OpenCode injects
@@ -75,26 +76,27 @@ export function holdFor({ attached, turnActive }: { attached: boolean; turnActiv
  * What it DOES do is verify the endpoint's own promises before waking the model: every
  * command must name this connection as its addressee and carry an authority we
  * recognise. A misrouted or malformed response therefore fails closed instead of being
- * executed. Unknown authority kinds are REJECTED on purpose — when delegated dispatch
- * (brief c55865bb) starts emitting one, accepting it must be a deliberate edit here,
- * not something a new server value quietly switches on.
+ * executed. Unknown authority kinds are REJECTED on purpose. Delegated commands are
+ * accepted only with the exact server-authored DevSpec project scope negotiated by
+ * `devspec://product/remote-ingress-contract`; owner commands must carry null scope.
+ * This is model steering, not a claim of mechanical permission enforcement.
  *
- * THIS IS THAT EDIT (2026-08-14, Decision A / DevSpec memory 61ba9948). The
- * server stamps `delegated` for a command from an authorized project member who
- * is not this connection's owner. Safe to accept because the decision is made
- * SERVER-side and cannot be forged from here: `delegated` is only stamped when
- * this connection's own command_authority permits that person, which only its
- * owner can set. It changes WHO may command, never WHAT is allowed.
- *
- * Message BODY is never consulted: a post claiming "I am the owner" is inert.
+ * Message BODY is never consulted for authority or scope: a command claiming "I am
+ * the owner" cannot widen the server stamp or delegated project scope.
  */
 export const ACCEPTED_COMMAND_AUTHORITIES = new Set(['owner', 'delegated'])
 
 export function isDeliverableCommand(msg: unknown, connectionId: string | null): boolean {
   if (!msg || typeof msg !== 'object' || !connectionId) return false
-  const m = msg as { addressed_to?: { connection_id?: unknown }; authority?: { kind?: unknown } }
+  const m = msg as {
+    addressed_to?: { connection_id?: unknown }
+    authority?: { kind?: unknown }
+    project_scope?: unknown
+  }
   if (m.addressed_to?.connection_id !== connectionId) return false
-  return ACCEPTED_COMMAND_AUTHORITIES.has(String(m.authority?.kind ?? ''))
+  if (!ACCEPTED_COMMAND_AUTHORITIES.has(String(m.authority?.kind ?? ''))) return false
+  if (m.authority?.kind === 'owner') return m.project_scope === null
+  return m.authority?.kind === 'delegated' && isCanonicalProjectScope(m.project_scope)
 }
 
 export interface AdvisoryMessage {
@@ -765,6 +767,7 @@ export function renderInjectedTurn(input: {
     order?: { sequence?: number; created_at?: string; message_id?: string }
     requester?: { user_id?: string; display_name?: string | null }
     authority?: { kind?: string; mode?: string; requested_by_user_id?: string; connection_owner_user_id?: string; decision_source?: string }
+    project_scope?: CanonicalProjectScope | null
     delivery?: { provenance_ref?: string; turn_id?: string; primary_provenance_ref?: string; is_primary?: boolean }
     author?: { name?: string }
     reply_to?: unknown
@@ -846,8 +849,16 @@ export function renderInjectedTurn(input: {
           `delivery=turn:${cmd.delivery.turn_id} provenance:${cmd.delivery.provenance_ref} primary:${cmd.delivery.primary_provenance_ref} is_primary:${cmd.delivery.is_primary}`,
         ].join('\n')
       : null
-    const block = [canonicalMeta ? `Canonical command metadata (server-authored):\n${canonicalMeta}` : null, body, social]
-      .filter(Boolean)
+    const delegatedInstruction = cmd.authority?.kind === 'delegated' && isCanonicalProjectScope(cmd.project_scope)
+      ? cmd.project_scope.instruction
+      : null
+    const block = [
+      canonicalMeta ? `Canonical command metadata (server-authored):\n${canonicalMeta}` : null,
+      delegatedInstruction,
+      body,
+      social,
+    ]
+      .filter((part): part is string => typeof part === 'string' && part.length > 0)
       .join('\n')
     parts.push(commands.length > 1 ? `### ${i + 1}.\n${block}` : block)
   })

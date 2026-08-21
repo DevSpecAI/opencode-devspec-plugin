@@ -4,6 +4,8 @@
  * devspec://product/remote-ingress-contract.
  */
 export declare const REMOTE_INGRESS_VERSION: 1;
+export declare const DELEGATED_SCOPE_VERSION: 1;
+export declare const DELEGATED_PROJECT_POLICY_ID: "delegated_project_v1";
 export interface CanonicalAttachment {
     materialization: 'metadata' | 'unavailable';
     filename: string;
@@ -17,6 +19,12 @@ export interface CanonicalOrder {
     sequence: number;
     created_at: string;
     message_id: string;
+}
+export interface CanonicalProjectScope {
+    kind: 'devspec_project';
+    policy_id: typeof DELEGATED_PROJECT_POLICY_ID;
+    project_id: string;
+    instruction: string;
 }
 export interface CanonicalCommand {
     message_id: string;
@@ -38,6 +46,7 @@ export interface CanonicalCommand {
         connection_owner_user_id: string;
         decision_source: 'server';
     };
+    project_scope: CanonicalProjectScope | null;
     addressee: CanonicalConnection;
     delivery: {
         provenance_ref: string;
@@ -123,6 +132,7 @@ export type CanonicalIngressResult = {
     ok: false;
     error: string;
 };
+export declare function isCanonicalProjectScope(v: unknown): v is CanonicalProjectScope;
 /** Parse a changed negotiated poll response. Missing ingress is therefore an error. */
 export declare function parseCanonicalIngress(input: unknown, expectedConnectionId: string): CanonicalIngressResult;
 export declare function selectCanonicalCommandsForPrompt(parsed: CanonicalIngressResult, deliveredMessageIds: ReadonlySet<string>): {

@@ -1,6 +1,6 @@
 import type { Plugin } from '@opencode-ai/plugin';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
-import { type CanonicalCommand, type CanonicalControl } from './remote-ingress.js';
+import { type CanonicalCommand, type CanonicalControl, type CanonicalIngress } from './remote-ingress.js';
 import { type OpencodeControlSlash } from './opencode-control-slash.js';
 export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
@@ -261,6 +261,16 @@ interface ConnectionState {
      * `shouldDeferInjectDuringConnect` is false.
      */
     deferredCanonicalCommands?: CanonicalCommand[];
+    /**
+     * Immutable acceptance transaction captured with deferred commands. The server
+     * may return an unchanged follow-up after showing a command once, so the window
+     * and both cursor candidates must survive locally with the exact command payload.
+     */
+    deferredCanonicalTransaction?: {
+        ingress: CanonicalIngress;
+        liveCursorCandidate: string | null;
+        catchUpCursorCandidate: string | null;
+    } | null;
     /**
      * DevSpec `session_messages.id` of the live work-trail turn currently open for
      * this connection (item bfca2495). Set from the first `phase:'trail'` post of a

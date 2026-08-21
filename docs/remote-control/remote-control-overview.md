@@ -18,8 +18,8 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Concern | Rule |
 |---|---|
 | Identity | `register_connection` → `connection_id` + server-minted `codename`. Fixed `AGENT_NAME` per plugin. |
-| Tick / ingress | Use one held `poll_connection` with numeric `ingress_version: 1`. The negotiated wire contract is `devspec://product/remote-ingress-contract`. |
-| Authority and advisory | Consume canonical `ingress` only for conversation/context; explicit playbook `dispatches[]` remains an independent host workflow with its own cursor. Do not restate mutable server policy here; validate `devspec://product/remote-ingress-contract` fail-closed. |
+| Tick / ingress | Use one held `poll_connection` with numeric `ingress_version: 1` and `delegated_scope_version: 1`. The negotiated wire contract is `devspec://product/remote-ingress-contract`. |
+| Authority, scope, and advisory | Consume canonical `ingress` only for conversation/context; explicit playbook `dispatches[]` remains an independent host workflow with its own cursor. Validate authority/scope fail-closed, render the delegated server instruction verbatim, and do not restate mutable policy here. This is model steering, not a claim of mechanical permission enforcement. |
 | Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
 | Answers (sessionless) | No conversational answer path. A separately accepted `playbook_run` reports through `record_playbook_run`; never invent chat. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |

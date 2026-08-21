@@ -8,12 +8,12 @@
 ## Agent gotchas (read before editing)
 
 1. **Presence is the bond.** Server attached liveness is ~90s. `last_seen` updates only when a `poll_connection` (or equivalent heartbeat) succeeds — **not** when `report_keepalive` runs alone. Anything that blocks the next successful poll for ~90s ends the connection with `idle_timeout` while the UI can still look attached.
-2. **OpenCode’s pump is in-process** (`src/plugin.ts` → `pollAndDeliver`). It negotiates canonical ingress using `ingress_version: 1`; the mutable wire and authority policy lives at `devspec://product/remote-ingress-contract`. Cursor keeps a **detached** Node poller. Do not “fix” OpenCode by copying Cursor’s wait/inbox scripts, and do not await inject / stall / hung `session.messages` on the path back to `poll_connection`.
+2. **OpenCode’s pump is in-process** (`src/plugin.ts` → `pollAndDeliver`). It negotiates canonical ingress using `ingress_version: 1` and delegated project steering using `delegated_scope_version: 1`; the mutable wire, authority, and scope policy lives at `devspec://product/remote-ingress-contract`. Cursor keeps a **detached** Node poller. Do not “fix” OpenCode by copying Cursor’s wait/inbox scripts, and do not await inject / stall / hung `session.messages` on the path back to `poll_connection`.
 3. **Multi-bond in one process** (item 7a9b7b0f): several OpenCode chat sessions may each `/devspec.remote` into different DevSpec rooms. The pump iterates `listOpenCodeBondSessions()` — a second attach **adds** a bond; it must **not** overwrite a single `lastKnownSessionId` (that starved Ivory Panda when Racing Dolphin attached, 2026-08-07 → first room `idle_timeout`). Ending one bond removes only that entry. State reads/writes for each bond run under `runWithBoundSession(stateKey)`.
 4. **Critical path after claiming delivery:** `setBusy(true)` then fire-and-forget `deliverInjectedTurn` (baseline → `promptAsync` → mirror), ALS-scoped to the inject bond. Return `{ delayMs: 0 }` so the pump re-enters the hold immediately. `checkBusyStall` is also `void`’d, not awaited.
 5. **After changing `dist/`:** fully quit and relaunch OpenCode (or reinstall the local package). Partial reloads leave a stale pump in memory.
 6. **Verify with** `npm test` from the plugin root (see [Running tests](#running-tests-after-a-remote-control-change)). Unit suite uses harness doubles — it does not launch a live TUI bond.
-7. **Act, don’t dump.** `commands/devspec.remote.md` must keep an **Act on owner commands** section (do the work in this repo / verify with tools) — parity with Cursor/Claude. Do not reintroduce “you do not need to go and read anything” / “grounded in the transcript” wording that licenses answering from the injected dump alone (Obsidian Gecko / Restless Ocelot, session `a2a262cd`).
+7. **Act, don’t dump.** `commands/devspec.remote.md` must keep an **Act on authorized commands** section (do the work in this repo / verify with tools). Do not reintroduce “you do not need to go and read anything” / “grounded in the transcript” wording that licenses answering from the injected dump alone (Obsidian Gecko / Restless Ocelot, session `a2a262cd`).
 8. **Attach transcript is budgeted + full UUID.** Skill attach uses `get_session_transcript` with `since_created_at` (~48h window), not an uncapped seed. Instruction tiers come from `attach_connection`. **Always pass the full `session_id` returned by `attach_connection`** — attach accepts an 8-char short code; transcript does not (live: Dashing Osprey / `7976fffb` → "Session not found"). Do not tell the model to call uncapped `get_session_transcript` on every attach.
 9. **Connect status chrome must never land in the room.** `prepareMirrorText` / `isOperationalChrome` strip the canonical `REMOTE_STATUS_BANNER` **and** variant field blocks (rule-only openers + Agent/Connection/Session lines) plus labelled `Internal note (not mirrored)` orientation. Do not rely on exact title string alone — models invent box-drawing variants. Real answers after a pasted block still post once chrome is stripped.
 10. **Model stamp is never silent.** `resolveOpenCodeAssistantModel` (flat `info.providerID`/`modelID` first, then nested `info.model`, then legacy `metadata.assistant`) + `mirror_post`/`model_missing` (and inject `dispatch_model` rejects via `extractOpenCodeReplyModel`) must log a story with the raw shape snippet when `providerID`/`modelID` cannot be stamped — DevSpec otherwise has no record of which model answered. Assistant turns (e.g. MiniMax) store the stamp flat on `info`; reading only nested `info.model` falsely logs `model_missing`.
@@ -90,9 +90,9 @@ Do not “fix” an unsecured-server warning by putting a password into project 
 
 ## How a message reaches OpenCode
 
-1. Owner dispatches to this connection in DevSpec.
+1. An authorized requester dispatches to this connection in DevSpec.
 2. Plugin (inside the OpenCode process) long-polls via held `poll_connection`.
-3. An active canonical conversational turn and an explicit playbook run are extracted independently and each gets its own immutable `renderInjectedTurn` / acceptance transaction. Malformed conversational ingress cannot block a valid playbook.
+3. An active canonical conversational turn and an explicit playbook run are extracted independently and each gets its own immutable `renderInjectedTurn` / acceptance transaction. A delegated command retains its validated root project scope and renders the server instruction verbatim immediately before the unchanged command body; owner commands receive no scope injection. Malformed conversational ingress cannot block a valid playbook. This is steering, not a claim of mechanical permission enforcement.
 4. Plugin asserts `setBusy(true)`, then **kicks** each `deliverInjectedTurn` without awaiting it. No corresponding cursor or delivery id commits yet.
 5. Inside deliver: timed `session.messages` baseline → `client.session.promptAsync` with `parts: [{ type: 'text', text }, …]` — **chat-message door**, not slash-command door. Canonical SDK acceptance commits only turn ids and top-level `cursor_v2`; playbook acceptance commits only playbook ids and `dispatch_cursor`; `window.next_cursor` remains the older catch-up continuation.
 6. OpenCode model runs a normal turn in that session.
@@ -228,7 +228,7 @@ OpenCode client stories also cover: `inject`/`queued` then `inject`/`kicked`, `p
 
 | Behaviour | Where |
 |---|---|
-| Act-on-owner-commands (do work in repo / verify with tools) | `commands/devspec.remote.md` — “Act on owner commands” |
+| Act-on-authorized-commands (do work in repo / verify with tools) | `commands/devspec.remote.md` — “Act on authorized commands” |
 | Budgeted attach transcript (`since_created_at` ~48h; skim newest ~40 if still large) | same skill, attach step |
 | Instruction tiers from `attach_connection` (not uncapped transcript seed) | same skill |
 | Loud model stamp failure | `resolveOpenCodeAssistantModel` / `extractOpenCodeReplyModel` + `logRemoteControlStory` in `src/remote-control.ts` |

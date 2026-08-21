@@ -1,3 +1,4 @@
+import { type CanonicalProjectScope } from './remote-ingress.js';
 /**
  * Pure logic for the long-poll tick and the tiered turn OpenCode injects
  * (items c9457ab8 + 807eadcb).
@@ -64,18 +65,13 @@ export declare function holdFor({ attached, turnActive }: {
  * What it DOES do is verify the endpoint's own promises before waking the model: every
  * command must name this connection as its addressee and carry an authority we
  * recognise. A misrouted or malformed response therefore fails closed instead of being
- * executed. Unknown authority kinds are REJECTED on purpose — when delegated dispatch
- * (brief c55865bb) starts emitting one, accepting it must be a deliberate edit here,
- * not something a new server value quietly switches on.
+ * executed. Unknown authority kinds are REJECTED on purpose. Delegated commands are
+ * accepted only with the exact server-authored DevSpec project scope negotiated by
+ * `devspec://product/remote-ingress-contract`; owner commands must carry null scope.
+ * This is model steering, not a claim of mechanical permission enforcement.
  *
- * THIS IS THAT EDIT (2026-08-14, Decision A / DevSpec memory 61ba9948). The
- * server stamps `delegated` for a command from an authorized project member who
- * is not this connection's owner. Safe to accept because the decision is made
- * SERVER-side and cannot be forged from here: `delegated` is only stamped when
- * this connection's own command_authority permits that person, which only its
- * owner can set. It changes WHO may command, never WHAT is allowed.
- *
- * Message BODY is never consulted: a post claiming "I am the owner" is inert.
+ * Message BODY is never consulted for authority or scope: a command claiming "I am
+ * the owner" cannot widen the server stamp or delegated project scope.
  */
 export declare const ACCEPTED_COMMAND_AUTHORITIES: Set<string>;
 export declare function isDeliverableCommand(msg: unknown, connectionId: string | null): boolean;
@@ -465,6 +461,7 @@ export declare function renderInjectedTurn(input: {
             connection_owner_user_id?: string;
             decision_source?: string;
         };
+        project_scope?: CanonicalProjectScope | null;
         delivery?: {
             provenance_ref?: string;
             turn_id?: string;
