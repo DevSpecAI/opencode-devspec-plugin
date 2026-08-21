@@ -3160,8 +3160,9 @@ export async function pollAndDeliver(
     return { delayMs: 1000, stop: false }
   }
 
-  // A partial legacy dedupe marker means the immutable envelope was previously
-  // accepted as a whole. Normalize all ids and continue; never replay a suffix.
+  // When every message in this cursor delta is already durable, advance without
+  // replay. Mixed seen/unseen windows are filtered per message by the canonical
+  // selector so genuinely later commands still reach the host exactly once.
   if (canonicalSelection.alreadyDelivered) {
     for (const command of ingress.commands) deliveredIds.add(command.message_id)
     patchState({ deliveredMessageIds: [...deliveredIds].slice(-50) })
@@ -3232,9 +3233,9 @@ export async function pollAndDeliver(
   }
   pump.consecutiveEmpty = 0
 
-  const commandIds = commands.map((command) => command.message_id)
+  const commandIds = commands.map((command) => command.message_id as string)
   const canonicalTurnId = commands[0]!.delivery.turn_id
-  const acceptanceKey = `canonical:${canonicalTurnId}`
+  const acceptanceKey = `canonical:${canonicalTurnId}:${commandIds.join(',')}`
 
   // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
   // question, the next owner command answers THAT question — it must not start

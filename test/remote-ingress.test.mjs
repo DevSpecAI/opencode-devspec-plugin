@@ -33,7 +33,7 @@ function envelope(over = {}) {
   const rows = [...commands, ...Object.values(context).flat()]
   const seq = rows.map((row) => row.order.sequence)
   return {
-    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.0', policy_version: '2026-08-19.2', envelope_id: ids.envelope,
+    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.1', policy_version: '2026-08-19.2', envelope_id: ids.envelope,
     connection,
     wake: over.wake ?? { kind: 'conversational_command', active: true, reason_id: 'new-command' },
     delivery_state: over.delivery_state ?? 'live',
@@ -57,6 +57,41 @@ describe('canonical remote ingress v1', () => {
     assert.throws(() => { frozen.commands[0].content.body = 'changed' }, TypeError)
   })
 
+  it('accepts a later cursor delta after the turn primary was already consumed', () => {
+    const secondary = command('Queued follow-up')
+    secondary.message_id = ids.context
+    secondary.order = point(2, ids.context)
+    secondary.delivery = {
+      provenance_ref: ids.resource,
+      turn_id: ids.turn,
+      primary_provenance_ref: ids.provenance,
+      is_primary: false,
+    }
+    const result = parseCanonicalIngress(envelope({ commands: [secondary] }), ids.connection)
+    assert.equal(result.ok, true)
+    assert.equal(result.executable, true)
+    assert.deepEqual(result.ingress.command_message_ids, [ids.context])
+  })
+
+  it('rejects false primary flags and duplicate visible provenance refs', () => {
+    const falsePrimary = envelope()
+    falsePrimary.commands[0].delivery.is_primary = false
+    assert.equal(parseCanonicalIngress(falsePrimary, ids.connection).ok, false)
+
+    const first = command('first')
+    first.delivery = {
+      provenance_ref: ids.resource,
+      turn_id: ids.turn,
+      primary_provenance_ref: ids.provenance,
+      is_primary: false,
+    }
+    const second = command('second')
+    second.message_id = ids.context
+    second.order = point(2, ids.context)
+    second.delivery = { ...first.delivery }
+    assert.equal(parseCanonicalIngress(envelope({ commands: [first, second] }), ids.connection).ok, false)
+  })
+
   it('fails closed on missing/malformed/preview-like/unknown ingress', () => {
     assert.equal(parseCanonicalIngress(undefined, ids.connection).ok, false)
     assert.equal(parseCanonicalIngress({ preview: 'notification only' }, ids.connection).ok, false)
@@ -64,6 +99,10 @@ describe('canonical remote ingress v1', () => {
     assert.equal(parseCanonicalIngress(malformed, ids.connection).ok, false)
     const unknown = envelope(); unknown.schema_version = 2
     assert.equal(parseCanonicalIngress(unknown, ids.connection).ok, false)
+    const previousPatch = envelope(); previousPatch.contract_version = '1.1.0'
+    assert.equal(parseCanonicalIngress(previousPatch, ids.connection).ok, true)
+    const futurePatch = envelope(); futurePatch.contract_version = '1.1.2'
+    assert.equal(parseCanonicalIngress(futurePatch, ids.connection).ok, false)
   })
 
   it('never marks advisory, replay, or reseed envelopes executable', () => {
