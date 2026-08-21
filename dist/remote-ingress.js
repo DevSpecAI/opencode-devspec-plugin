@@ -4,7 +4,8 @@
  * devspec://product/remote-ingress-contract.
  */
 export const REMOTE_INGRESS_VERSION = 1;
-const CONTRACT_VERSION = '1.1.0';
+const CONTRACT_VERSION = '1.1.1';
+const SUPPORTED_CONTRACT_VERSIONS = new Set(['1.1.0', CONTRACT_VERSION]);
 const POLICY_VERSION = '2026-08-19.2';
 const UUID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
 const OFFSET_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
@@ -165,7 +166,7 @@ function strictlyOrdered(rows) { return rows.every((r, i) => i === 0 || rows[i -
 export function parseCanonicalIngress(input, expectedConnectionId) {
     try {
         exact(input, ['kind', 'schema_version', 'contract_version', 'policy_version', 'envelope_id', 'connection', 'wake', 'delivery_state', 'command_message_ids', 'commands', 'control', 'context', 'window'], 'ingress');
-        if (input.kind !== 'devspec.remote_ingress' || input.schema_version !== 1 || input.contract_version !== CONTRACT_VERSION || input.policy_version !== POLICY_VERSION)
+        if (input.kind !== 'devspec.remote_ingress' || input.schema_version !== 1 || !SUPPORTED_CONTRACT_VERSIONS.has(input.contract_version) || input.policy_version !== POLICY_VERSION)
             throw new Error('ingress version is unsupported');
         uuid(input.envelope_id, 'ingress.envelope_id');
         connection(input.connection, 'ingress.connection');
@@ -240,8 +241,10 @@ export function parseCanonicalIngress(input, expectedConnectionId) {
         if (rows.length > 0 && (start === undefined || end === undefined || start > end || rows.some((row) => row.order.sequence < start || row.order.sequence > end)))
             throw new Error('ingress rows fall outside source window');
         if (input.commands.length) {
-            const primary = input.commands.filter((c) => c.delivery.is_primary);
-            if (primary.length !== 1 || new Set(input.commands.map((c) => c.delivery.turn_id)).size !== 1 || new Set(input.commands.map((c) => c.delivery.primary_provenance_ref)).size !== 1 || primary[0].delivery.provenance_ref !== primary[0].delivery.primary_provenance_ref)
+            const sharedPrimaryRef = input.commands[0].delivery.primary_provenance_ref;
+            const provenanceRefs = input.commands.map((command) => command.delivery.provenance_ref);
+            const primaryFlagsMatch = input.commands.every((command) => command.delivery.is_primary === (command.delivery.provenance_ref === sharedPrimaryRef));
+            if (new Set(input.commands.map((c) => c.delivery.turn_id)).size !== 1 || new Set(input.commands.map((c) => c.delivery.primary_provenance_ref)).size !== 1 || new Set(provenanceRefs).size !== provenanceRefs.length || !primaryFlagsMatch)
                 throw new Error('ingress command turn binding is invalid');
         }
         if (input.wake.kind === 'conversational_command' && input.commands.length === 0)
@@ -256,14 +259,13 @@ export function parseCanonicalIngress(input, expectedConnectionId) {
 export function selectCanonicalCommandsForPrompt(parsed, deliveredMessageIds) {
     if (!parsed.ok || !parsed.executable)
         return { commands: [], rejectedUnavailable: [], alreadyDelivered: false };
-    const rejectedUnavailable = parsed.ingress.commands.filter((command) => command.attachments.some((attachment) => attachment.materialization === 'unavailable'));
-    // One envelope is one immutable command turn. Never select only the unseen
-    // suffix: even a partial legacy dedupe marker suppresses the whole turn.
-    const alreadyDelivered = parsed.ingress.commands.some((command) => deliveredMessageIds.has(command.message_id));
+    const unseen = parsed.ingress.commands.filter((command) => !deliveredMessageIds.has(command.message_id));
+    const rejectedUnavailable = unseen.filter((command) => command.attachments.some((attachment) => attachment.materialization === 'unavailable'));
+    const alreadyDelivered = unseen.length === 0 && parsed.ingress.commands.length > 0;
     if (rejectedUnavailable.length > 0 || alreadyDelivered) {
         return { commands: [], rejectedUnavailable, alreadyDelivered };
     }
-    return { commands: [...parsed.ingress.commands], rejectedUnavailable, alreadyDelivered: false };
+    return { commands: unseen, rejectedUnavailable, alreadyDelivered: false };
 }
 /**
  * Persist owner commands that arrived while inject must wait (connect handshake

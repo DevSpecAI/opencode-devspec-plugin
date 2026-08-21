@@ -41,7 +41,7 @@ function ingress(commands = [], over = {}) {
   const context = over.context ?? { human_context: [], agent_context: [], ai_context: [], system_context: [] }
   const rows = [...commands, ...Object.values(context).flat()]
   return {
-    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.0', policy_version: '2026-08-19.2',
+    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.1.1', policy_version: '2026-08-19.2',
     envelope_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', connection,
     wake: over.wake ?? (commands.length ? { kind: 'conversational_command', active: true, reason_id: 'command' } : { kind: 'advisory_update', active: false, reason_id: 'context' }),
     delivery_state: over.delivery_state ?? 'live', command_message_ids: commands.map((row) => row.message_id), commands,
@@ -232,7 +232,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
       let faulted = false
       await tick(clientDouble(), {
         acceptanceBookkeepingFault: (candidate, key) => {
-          if (!faulted && candidate === stage && key === `canonical:${acceptedTurnId}`) {
+          if (!faulted && candidate === stage && key === `canonical:${acceptedTurnId}:${messageId}`) {
             faulted = true
             throw new Error(`injected ${stage}`)
           }
@@ -350,16 +350,18 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2, 'new-room-command-cursor')
   })
 
-  it('treats partial multi-command dedupe as an atomic delivered turn and never prompts the suffix', async () => {
+  it('filters an overlapping retry per message and delivers only the unseen suffix', async () => {
     const commands = [
       command(message1, 1, provenance1, 'first', true),
       command(message2, 2, provenance2, 'second', false),
     ]
     runWithBond(opencodeSessionId, () => writeState({ connectionId, sessionId: devspecSessionId, codename: 'Otter', busy: false, deliveredMessageIds: [message1] }))
     pollResults.push(changed({ ingress: ingress(commands) }))
-    await tick()
+    await tick(); await settle()
     const state = runWithBond(opencodeSessionId, () => readState())
-    assert.equal(promptCalls.length, 0)
+    assert.equal(promptCalls.length, 1)
+    assert.doesNotMatch(promptCalls[0].body.parts[0].text, /first/)
+    assert.match(promptCalls[0].body.parts[0].text, /second/)
     assert.deepEqual(state.deliveredMessageIds, [message1, message2])
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
   })
