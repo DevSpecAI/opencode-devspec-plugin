@@ -2877,6 +2877,18 @@ export async function executeCanonicalControl(input) {
                 throw new Error(`This OpenCode process does not have ${key} configured`);
             }
             patchState({ remoteControlModel: parsed.model });
+            if (typeof client.session?.update === 'function') {
+                try {
+                    const result = await withTimeout(client.session.update({
+                        path: { id: sessionId },
+                        body: { model: parsed.model },
+                    }), OPENCODE_SESSION_API_TIMEOUT_MS, 'canonical-control.set_model');
+                    assertSdkAccepted(result, 'canonical-control.set_model');
+                }
+                catch (err) {
+                    logPoll(`set_model: session.update failed after persisting ${key}: ${err}`);
+                }
+            }
             return undefined;
         }
         case 'set_thinking':

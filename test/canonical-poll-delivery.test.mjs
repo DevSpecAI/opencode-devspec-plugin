@@ -72,6 +72,7 @@ let originalUrl
 let calls
 let pollResults
 let promptCalls
+let sessionUpdateCalls
 let promptImpl
 let abortCalls
 let summarizeCalls
@@ -85,6 +86,7 @@ function clientDouble() {
       promptAsync: async (args) => { promptCalls.push(args); return promptImpl(args) },
       abort: async () => { abortCalls++; return { data: true } },
       summarize: async () => { summarizeCalls++; return { data: true } },
+      update: async (args) => { sessionUpdateCalls.push(args); return { data: true } },
     },
     config: { providers: async () => ({ data: { providers: [], default: {} } }) },
     instance: { dispose: async () => { reloadCalls++; return { data: true } } },
@@ -113,6 +115,7 @@ beforeEach(() => {
   calls = []
   pollResults = []
   promptCalls = []
+  sessionUpdateCalls = []
   promptImpl = async () => ({ data: true })
   abortCalls = 0
   summarizeCalls = 0
@@ -568,6 +571,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
 
     const modelAck = calls.find((call) => call.name === 'poll_connection' && call.arguments.control_ack === modelControl.id)
     assert.deepEqual(modelAck.arguments.agent_stats.model, { provider: 'anthropic', id: 'claude-test' })
+    assert.deepEqual(sessionUpdateCalls[0].body.model, { providerID: 'anthropic', modelID: 'claude-test' })
 
     const cmd = command(message1, 1, provenance1, 'use selected controls', true)
     pollResults.push(changed({ cursor_v2: 'after-controlled-prompt', ingress: ingress([cmd]) }))
