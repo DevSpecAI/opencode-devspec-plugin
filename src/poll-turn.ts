@@ -491,6 +491,8 @@ export function shouldAdvanceMessageCursor(opts: {
   seedKeptCount: number
   wasSeed: boolean
   dispatchCount: number
+  /** Local queue of owner commands waiting for handshake / prior acceptance. */
+  deferredHandshakeInject?: boolean
 }): boolean {
   const {
     injectCount,
@@ -498,7 +500,11 @@ export function shouldAdvanceMessageCursor(opts: {
     seedKeptCount,
     wasSeed,
     dispatchCount,
+    deferredHandshakeInject,
   } = opts
+  // Item 4414d2d9: an advisory-only follow-up poll must not skip a command we
+  // already took off the wire and stashed because connect was still settling.
+  if (deferredHandshakeInject) return false
   if (injectCount > 0) return true
   // Nothing addressable in the package (advisory-only / empty / rejected-elsewhere).
   if (deliverableRoomCount === 0 && dispatchCount === 0) return true

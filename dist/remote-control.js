@@ -31,7 +31,7 @@ import { pathToFileURL } from 'node:url';
 import { AGENT_NAME } from './agent-identity.js';
 import { McpTimeoutError, mcpToolsCall } from './devspec-client.js';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
-import { freezeCanonicalTurn, parseCanonicalIngress, REMOTE_INGRESS_VERSION, selectCanonicalCommandsForPrompt, } from './remote-ingress.js';
+import { freezeCanonicalTurn, parseCanonicalIngress, REMOTE_INGRESS_VERSION, resolveHandshakeInject, selectCanonicalCommandsForPrompt, } from './remote-ingress.js';
 import { HOLD_HTTP_GRACE_MS, createCarryBuffer, buildAttachmentParts, emptyTurnBackoffMs, errorBackoffMs, holdFor, pollTerminalReason, RECOVERABLE_TERMINAL_MAX, renderInjectedTurn, resolveServerAttachment, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 import { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
 import { logRemoteControlStory } from './remote-control-story.js';
@@ -2227,6 +2227,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                 remoteIngressCursorV2: null,
                 remoteIngressCatchUpCursor: null,
                 remoteDispatchCursor: null,
+                deferredCanonicalCommands: [],
             }) ?? {
                 ...state,
                 sessionId: adopt.sessionId,
@@ -2234,6 +2235,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                 remoteIngressCursorV2: null,
                 remoteIngressCatchUpCursor: null,
                 remoteDispatchCursor: null,
+                deferredCanonicalCommands: [],
             };
         // Fresh room: drop the cursor and any carried context from the old one, and treat
         // the NEXT poll (cursor:null + catch_up) as the seed. Never consume this hold's
@@ -2469,18 +2471,50 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         commitConversationCursor();
     }
     const roomCommands = canonicalSelection.commands;
-    const pendingCommands = [...roomCommands];
     const deferInject = shouldDeferInjectDuringConnect({
         connectMirrorSuppressed: state.connectMirrorSuppressed,
         awaitingRemoteReply: state.awaitingRemoteReply,
     });
-    if ((deferInject || pump.acceptingTurn) && pendingCommands.length > 0) {
-        logPoll(`deferring immutable turn until prior host acceptance settles`);
+    const handshakeInject = resolveHandshakeInject({
+        deferInject,
+        acceptingTurn: Boolean(pump.acceptingTurn),
+        deferred: state.deferredCanonicalCommands,
+        incoming: roomCommands,
+        deliveredIds,
+    });
+    const pendingChanged = (state.deferredCanonicalCommands?.length ?? 0) !== handshakeInject.nextDeferred.length ||
+        handshakeInject.nextDeferred.some((command, i) => command.message_id !== state.deferredCanonicalCommands?.[i]?.message_id);
+    if (pendingChanged) {
+        patchState({
+            deferredCanonicalCommands: handshakeInject.nextDeferred.length
+                ? freezeCanonicalTurn(structuredClone(handshakeInject.nextDeferred))
+                : [],
+        });
+    }
+    if (!handshakeInject.injectNow && handshakeInject.nextDeferred.length > 0) {
+        logPoll(`deferring inject of ${handshakeInject.nextDeferred.length} command(s) — ` +
+            `persisted locally until connect handshake / prior acceptance settles`);
+        logRemoteControlStory({
+            phase: 'inject',
+            outcome: 'deferred',
+            connectionId: state.connectionId,
+            sessionId: state.sessionId,
+            agent: AGENT_NAME,
+            codename: state.codename,
+            tool: 'promptAsync',
+            reason: deferInject ? 'connect_handshake' : 'prior_acceptance',
+            data: { commands: handshakeInject.nextDeferred.length },
+        });
         return { delayMs: 1000, stop: false };
     }
-    const commands = pendingCommands;
-    // Non-command canonical context/history commits independently.
-    if (roomCommands.length === 0 && unavailable.length === 0 && !parsedIngress.executable) {
+    const commands = handshakeInject.pending;
+    // Non-command canonical context/history commits independently — but never
+    // while a deferred owner command is still waiting to inject (4414d2d9).
+    if (commands.length === 0 &&
+        handshakeInject.nextDeferred.length === 0 &&
+        roomCommands.length === 0 &&
+        unavailable.length === 0 &&
+        !parsedIngress.executable) {
         commitConversationCursor();
     }
     if (commands.length === 0) {
@@ -2493,20 +2527,20 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         return { delayMs: floor, stop: false };
     }
     pump.consecutiveEmpty = 0;
-    const commandIds = roomCommands.map((command) => command.message_id);
-    const canonicalTurnId = roomCommands[0].delivery.turn_id;
+    const commandIds = commands.map((command) => command.message_id);
+    const canonicalTurnId = commands[0].delivery.turn_id;
     const acceptanceKey = `canonical:${canonicalTurnId}`;
     // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
     // question, the next owner command answers THAT question — it must not start
     // a fresh promptAsync turn. Advisory chatter never reaches this branch
     // (commands are local_agent_dispatch only).
-    if (state.pendingQuestion?.requestId && roomCommands.length > 0) {
+    if (state.pendingQuestion?.requestId && commands.length > 0) {
         // Keep this existing non-prompt transaction path independent from the
         // promptAsync acceptance recovery introduced below.
         pump.acceptingTurn = { key: acceptanceKey, commandIds };
         pump.promptTransactions.set(acceptanceKey, 'pending');
         const pendingRequestId = state.pendingQuestion.requestId;
-        const answerText = roomCommands
+        const answerText = commands
             .map((c) => typeof c?.content === 'string'
             ? c.content
             : typeof c?.content?.body === 'string'
@@ -2523,6 +2557,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             patchState({
                 deliveredMessageIds: [...deliveredIds].slice(-50),
                 currentTurnMessageIds: Array.from(new Set([...(state.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
+                deferredCanonicalCommands: [],
             });
             commitConversationCursor();
             pump.carry.take();
@@ -2555,6 +2590,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             if (!patchState({
                 deliveredMessageIds: [...acceptedIds].slice(-50),
                 currentTurnMessageIds: Array.from(new Set([...(acceptedState.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
+                deferredCanonicalCommands: [],
             })) {
                 throw new Error('delivered message ids were not persisted');
             }

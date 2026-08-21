@@ -616,6 +616,21 @@ describe('shouldAdvanceMessageCursor — never skip uninjected deliverables', ()
       false,
     )
   })
+
+  it('HOLDS an advisory-only poll while a deferred handshake inject is outstanding (4414d2d9)', () => {
+    assert.equal(
+      shouldAdvanceMessageCursor({
+        injectCount: 0,
+        deliverableRoomCount: 0,
+        seedKeptCount: 0,
+        wasSeed: false,
+        dispatchCount: 0,
+        deferredHandshakeInject: true,
+      }),
+      false,
+      'the live miss: command already left commands[], later poll looked advisory-only',
+    )
+  })
 })
 
 describe('adoptRequiresNullCursorRepoll — never seed from a pre-adopt package', () => {

@@ -318,6 +318,8 @@ export declare function shouldAdvanceMessageCursor(opts: {
     seedKeptCount: number;
     wasSeed: boolean;
     dispatchCount: number;
+    /** Local queue of owner commands waiting for handshake / prior acceptance. */
+    deferredHandshakeInject?: boolean;
 }): boolean;
 /**
  * Server-authoritative attachment decision.

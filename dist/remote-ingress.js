@@ -265,6 +265,34 @@ export function selectCanonicalCommandsForPrompt(parsed, deliveredMessageIds) {
     }
     return { commands: [...parsed.ingress.commands], rejectedUnavailable, alreadyDelivered: false };
 }
+/**
+ * Persist owner commands that arrived while inject must wait (connect handshake
+ * still settling, or another host acceptance in flight).
+ *
+ * Live session 191795fc / item 4414d2d9: poll_connection returned the owner's
+ * ping once, the plugin deferred inject (6990fd9e), then a later advisory-only
+ * package had no commands[] — so the client cursor advanced and the ping was
+ * gone. Holding the wire cursor is not enough once the server has already
+ * shown the command. Keep a local queue and drain it when inject is legal.
+ */
+export function mergeDeferredCanonicalCommands(deferred, incoming) {
+    const out = [];
+    const seen = new Set();
+    for (const command of [...(deferred ?? []), ...(incoming ?? [])]) {
+        if (!command?.message_id || seen.has(command.message_id))
+            continue;
+        seen.add(command.message_id);
+        out.push(command);
+    }
+    return out;
+}
+export function resolveHandshakeInject(opts) {
+    const pending = mergeDeferredCanonicalCommands(opts.deferred, opts.incoming).filter((command) => !opts.deliveredIds.has(command.message_id));
+    if ((opts.deferInject || opts.acceptingTurn) && pending.length > 0) {
+        return { pending, nextDeferred: pending, injectNow: false };
+    }
+    return { pending, nextDeferred: pending, injectNow: pending.length > 0 };
+}
 export function freezeCanonicalTurn(value) {
     const visit = (v) => { if (!v || typeof v !== 'object' || Object.isFrozen(v))
         return; Object.freeze(v); for (const child of Object.values(v))

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { freezeCanonicalTurn, parseCanonicalIngress, selectCanonicalCommandsForPrompt } from '../dist/remote-ingress.js'
+import { freezeCanonicalTurn, parseCanonicalIngress, resolveHandshakeInject, selectCanonicalCommandsForPrompt } from '../dist/remote-ingress.js'
 import { buildAttachmentParts, createCarryBuffer, renderInjectedTurn } from '../dist/poll-turn.js'
 
 const ids = {
@@ -132,5 +132,56 @@ describe('canonical remote ingress v1', () => {
     assert.equal(new Set([first.ingress.commands[0].message_id, retry.ingress.commands[0].message_id]).size, 1)
     const delivered = new Set([first.ingress.commands[0].message_id])
     assert.equal(selectCanonicalCommandsForPrompt(retry, delivered).commands.length, 0, 'retry cannot schedule a duplicate promptAsync')
+  })
+})
+
+describe('deferred mid-handshake inject (4414d2d9)', () => {
+  const emptyDelivered = new Set()
+
+  it('persists a wire command when inject is deferred, then drains it on an empty follow-up poll', () => {
+    const first = resolveHandshakeInject({
+      deferInject: true,
+      acceptingTurn: false,
+      deferred: [],
+      incoming: [command()],
+      deliveredIds: emptyDelivered,
+    })
+    assert.equal(first.injectNow, false)
+    assert.equal(first.nextDeferred.length, 1)
+    assert.equal(first.nextDeferred[0].message_id, ids.message)
+
+    const laterAdvisory = resolveHandshakeInject({
+      deferInject: true,
+      acceptingTurn: false,
+      deferred: first.nextDeferred,
+      incoming: [],
+      deliveredIds: emptyDelivered,
+    })
+    assert.equal(laterAdvisory.injectNow, false, 'still handshake: keep the queue, do not inject into connect')
+    assert.equal(laterAdvisory.nextDeferred[0].message_id, ids.message)
+
+    const afterConnect = resolveHandshakeInject({
+      deferInject: false,
+      acceptingTurn: false,
+      deferred: laterAdvisory.nextDeferred,
+      incoming: [],
+      deliveredIds: emptyDelivered,
+    })
+    assert.equal(afterConnect.injectNow, true, 'suppress cleared: drain into a real owner turn')
+    assert.equal(afterConnect.pending.length, 1)
+    assert.equal(afterConnect.pending[0].content.body, 'Do the requested work')
+  })
+
+  it('does not re-queue a command already marked delivered', () => {
+    const drained = resolveHandshakeInject({
+      deferInject: false,
+      acceptingTurn: false,
+      deferred: [command()],
+      incoming: [],
+      deliveredIds: new Set([ids.message]),
+    })
+    assert.equal(drained.injectNow, false)
+    assert.equal(drained.pending.length, 0)
+    assert.equal(drained.nextDeferred.length, 0)
   })
 })

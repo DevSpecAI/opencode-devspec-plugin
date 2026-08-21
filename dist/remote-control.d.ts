@@ -1,6 +1,6 @@
 import type { Plugin } from '@opencode-ai/plugin';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
-import { type CanonicalControl } from './remote-ingress.js';
+import { type CanonicalCommand, type CanonicalControl } from './remote-ingress.js';
 import { type OpencodeControlSlash } from './opencode-control-slash.js';
 export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
@@ -253,6 +253,14 @@ interface ConnectionState {
      * flag that starts and ends with the connect turn cannot tag a later one.
      */
     connectMirrorSuppressed?: boolean;
+    /**
+     * Owner commands that arrived while inject had to wait (connect handshake
+     * still settling, or another host acceptance in flight). Item 4414d2d9:
+     * poll_connection shows a command at most once; holding the wire cursor
+     * does not bring it back on a later advisory poll. Drain this queue when
+     * `shouldDeferInjectDuringConnect` is false.
+     */
+    deferredCanonicalCommands?: CanonicalCommand[];
     /**
      * DevSpec `session_messages.id` of the live work-trail turn currently open for
      * this connection (item bfca2495). Set from the first `phase:'trail'` post of a

@@ -380,7 +380,11 @@ export function adoptRequiresNullCursorRepoll() {
  * `cursor` argument is what skips messages on the wire.
  */
 export function shouldAdvanceMessageCursor(opts) {
-    const { injectCount, deliverableRoomCount, seedKeptCount, wasSeed, dispatchCount, } = opts;
+    const { injectCount, deliverableRoomCount, seedKeptCount, wasSeed, dispatchCount, deferredHandshakeInject, } = opts;
+    // Item 4414d2d9: an advisory-only follow-up poll must not skip a command we
+    // already took off the wire and stashed because connect was still settling.
+    if (deferredHandshakeInject)
+        return false;
     if (injectCount > 0)
         return true;
     // Nothing addressable in the package (advisory-only / empty / rejected-elsewhere).

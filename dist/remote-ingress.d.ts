@@ -130,4 +130,26 @@ export declare function selectCanonicalCommandsForPrompt(parsed: CanonicalIngres
     rejectedUnavailable: CanonicalCommand[];
     alreadyDelivered: boolean;
 };
+/**
+ * Persist owner commands that arrived while inject must wait (connect handshake
+ * still settling, or another host acceptance in flight).
+ *
+ * Live session 191795fc / item 4414d2d9: poll_connection returned the owner's
+ * ping once, the plugin deferred inject (6990fd9e), then a later advisory-only
+ * package had no commands[] — so the client cursor advanced and the ping was
+ * gone. Holding the wire cursor is not enough once the server has already
+ * shown the command. Keep a local queue and drain it when inject is legal.
+ */
+export declare function mergeDeferredCanonicalCommands(deferred: CanonicalCommand[] | null | undefined, incoming: CanonicalCommand[] | null | undefined): CanonicalCommand[];
+export declare function resolveHandshakeInject(opts: {
+    deferInject: boolean;
+    acceptingTurn: boolean;
+    deferred: CanonicalCommand[] | null | undefined;
+    incoming: CanonicalCommand[] | null | undefined;
+    deliveredIds: ReadonlySet<string>;
+}): {
+    pending: CanonicalCommand[];
+    nextDeferred: CanonicalCommand[];
+    injectNow: boolean;
+};
 export declare function freezeCanonicalTurn<T>(value: T): T;
