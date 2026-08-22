@@ -1,22 +1,34 @@
 # Working with DevSpec
 
-This project is connected to DevSpec over MCP. DevSpec indexes the codebase and tracks work as action items — use it proactively, not just when asked.
+This project is connected to DevSpec over MCP. DevSpec indexes the codebase and provides shared project records; use it proactively, not just when asked.
 
-1. **Check DevSpec first.** Before broad code search or planning, query the DevSpec MCP tools (`search_index`, `get_action_items`, `get_project_summary`, `search_memories`) — the project is already indexed.
-2. **Track work as action items.** For anything non-trivial, create or claim a DevSpec action item (`create_action_item` / `claim_work_item`) *before* writing code. One unit of work = one item. Lack of a claim does not block edits or execution; it is the normal coordination workflow, not a lock.
-3. **Tag your commits.** End every commit that implements a tracked item with `[devspec:<id>]` so DevSpec links it automatically (and doesn't create a duplicate stub from the push webhook).
-4. **Follow the canonical implementation contract.** `claim_work_item` returns the current contract. Follow that served contract rather than restating mutable authority or lifecycle rules here.
-5. **Keep the shared memory fresh.** DevSpec memory (`record_memory`, `search_memories`, `supersede_memory`, `retract_memory`) is your team's shared source of truth — the in-app assistant and every other connected agent read it. When you learn something durable about the project (a decision, convention, architecture fact, or risk), record it — search first, and supersede the closest match rather than duplicating. Shared project knowledge belongs in DevSpec, not in this file or any other local-only notes.
-6. **Respect project standards.** Check `get_conventions` / `get_decisions` before non-trivial changes — someone may have already decided this.
-7. **Briefs group related work.** A brief is a parent action item that groups related children; use `create_action_item` with `parent_action_item_id` to attach a child, or `is_brief: true` to start a new one. A brief resolves automatically once every child is verified, dismissed, or deferred.
-8. **Don't force past a conflict.** If `claim_work_item` rejects a claim with a `possible_conflict`, that means a human should resolve it (discuss, supersede, link, or dismiss) — don't pass `force: true` just to proceed unless a human has explicitly told you to.
+1. **Enter work through the canonical contract.** Before planning, action-item mutation, or implementation, read `devspec://product/implementation-contract` and apply its `work_entry_contract`. It is the sole authority for tracking choice, request authority, action-item lifecycle, claims, and completion; do not replace it with copied local prose.
+2. **Check DevSpec first.** Before broad code search, query the DevSpec MCP tools (`search_index`, `get_action_items`, `get_project_summary`, `search_memories`) — the project is already indexed.
+3. **Keep shared memory fresh.** DevSpec memory (`record_memory`, `search_memories`, `supersede_memory`, `retract_memory`) is the team's shared source of truth. Search first, read the closest match in full, and supersede rather than duplicating durable decisions, conventions, architecture, or risks.
+4. **Respect project standards.** Read applicable conventions and decisions in full before relying on or contradicting them.
+5. **Do not force conflicts.** Never force past a `possible_conflict` rejection without explicit human direction.
+
+## Session plans — high threshold, on demand
+
+The served implementation contract decides whether session-plan tracking is warranted. Routine reading, search/inspect/answer, and other work with no material shared interruption, coordination, or handoff value should add **no plan** and no plan prompt footprint.
+
+Only after the contract selects a session plan, load `manage_plan` on demand with `search_devspec_tools` if it is not already available. Its complete mechanics are:
+
+- Actions: `create`, `list`, `get`, `update`, `start_step`, `complete_step`, `skip_step`, `fail_step`, `advance`, `complete`, `abandon`, `adopt`.
+- `create` uses `title` plus ordered milestone `steps` (`title`, optional `description`). Steps are meaningful phases, not tool calls.
+- Every existing-plan mutation uses the authoritative positive `expected_revision`. Omit `plan_id` only for the connection's default-own plan; intentional cross-plan reads or mutations must include the exact `plan_id` and `expected_revision` shown by DevSpec.
+- Prefer `advance` at a phase boundary: it atomically completes `current_step_id`, optionally applies authoritative `steps`, and starts `next_step_id`. Use single-step actions only when that is the actual transition. `fail_step` requires `reason` and `retryable`.
+- An active plan must continue or end explicitly with `complete` (outcome achieved) or `abandon` (specific `reason`). Closing a plan does not end the session.
+- `list` and room-delivered active-plan projections provide advisory read-awareness across the room. They grant no mutation authority. `adopt` is only for an orphaned same-owner plan in the same session, on explicit continuation intent; never adopt another owner's or a non-orphaned plan.
+
+`manage_plan` caller identity and session are supplied mechanically by this plugin's hidden connection capability. Never pass or invent a connection id, session id, owner, or capability.
 
 ## Naming consistency
 
-This plugin ships two commands, named identically to the equivalent Claude Code and Cursor DevSpec integrations — `devspec.remote` and `devspec.remote-stop` — so guidance and muscle memory carry over between tools. Do not invent OpenCode-specific names for them.
+This plugin ships two commands, named identically to the equivalent Claude Code and Cursor DevSpec integrations — `devspec.remote` and `devspec.remote-stop`. Do not invent OpenCode-specific names for them.
 
-There is no command for working an item, creating one, or recording finished work. Ask in plain language and use the DevSpec MCP tools directly; their schemas carry the guidance those commands used to.
+There is no command for working an item, creating one, or recording finished work. Ask in plain language and use the DevSpec MCP tools directly; their schemas and the served implementation contract carry current guidance.
 
 ## Git & worktrees
 
-Do implementation work in its own git worktree when the project uses one (many agents may be working in parallel). Commit only the files you changed. Push and merge per the project's configured target branch — check `get_project_summary` / `get_workflow_rules` for the project's actual `auto_push` / `auto_merge` settings and target branch rather than assuming.
+Follow the repository and commit rules returned by `devspec://product/implementation-contract` and the project's current workflow settings. Do not infer push, merge, completion, or verification authority from this local file.

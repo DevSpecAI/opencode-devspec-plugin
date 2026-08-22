@@ -595,6 +595,8 @@ export function renderInjectedTurn(input) {
             parts.push(`_(${ctx.dropped} older context message(s) trimmed by the local carry budget.)_`);
         }
     }
+    if (input.activeSessionPlans)
+        parts.push(input.activeSessionPlans);
     if (window) {
         const renderPoint = (point) => point ? `sequence=${point.sequence},created_at=${point.created_at},message_id=${point.message_id}` : 'null';
         parts.push(`_Canonical ingress window: policy_version=${window.policy_version}, returned=${window.returned}, ` +

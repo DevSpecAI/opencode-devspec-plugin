@@ -31,6 +31,11 @@ import {
   wipeOpenCodeContextInPlace,
   writeState,
 } from '../dist/remote-control.js'
+import {
+  captureConnectionCapability,
+  clearConnectionCapability,
+  hasConnectionCapability,
+} from '../dist/manage-plan-tool.js'
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-wipe-'))
@@ -44,6 +49,7 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
 
   beforeEach(() => {
     resetBondsForTests()
+    clearConnectionCapability()
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-wipe-home-'))
     restoreHomedir = mock.method(os, 'homedir', () => tmpHome)
     priorHome = process.env.HOME
@@ -51,6 +57,7 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
   })
 
   afterEach(() => {
+    clearConnectionCapability()
     restoreHomedir?.mock?.restore?.()
     mock.restoreAll()
     if (priorHome === undefined) delete process.env.HOME
@@ -90,6 +97,9 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
       })
     })
     rememberOpenCodeBond(oldOpenCode, devspecSession)
+    captureConnectionCapability(oldOpenCode, {
+      _meta: { devspec: { connection_capability: { version: 1, value: 'dvsc_wipe-test' } } },
+    })
 
     const result = await wipeOpenCodeContextInPlace({
       client: { session: { create: async () => ({ data: { id: newOpenCode } }) } },
@@ -114,6 +124,8 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
 
     assert.equal(devspecSessionForBond(newOpenCode), devspecSession)
     assert.deepEqual(listOpenCodeBondSessions(), [newOpenCode])
+    assert.equal(hasConnectionCapability(oldOpenCode), false)
+    assert.equal(hasConnectionCapability(newOpenCode), true, 'context wipe must preserve the hidden plan capability')
   })
 
   it('leaves the abandoned chat with no bond and no state file', async () => {

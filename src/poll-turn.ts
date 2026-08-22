@@ -778,6 +778,8 @@ export function renderInjectedTurn(input: {
   deliveryContract?: string | null
   declinedAttachments?: Array<{ filename: string; reason: string }>
   attachmentReferences?: AttachmentReference[]
+  /** Strictly parsed active-plan projection serialized as inert read-awareness. */
+  activeSessionPlans?: string | null
 }): string {
   const commands = Array.isArray(input.commands) ? input.commands : []
   const ctx = input.context ?? null
@@ -806,6 +808,8 @@ export function renderInjectedTurn(input: {
       parts.push(`_(${ctx.dropped} older context message(s) trimmed by the local carry budget.)_`)
     }
   }
+
+  if (input.activeSessionPlans) parts.push(input.activeSessionPlans)
 
   if (window) {
     const renderPoint = (point: AdvisoryWindowMetadata['source_window']['start']) =>

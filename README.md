@@ -50,6 +50,7 @@ Start OpenCode in a DevSpec-tracked repo and ask it to list your DevSpec action 
 - **Commit provenance** — `tool.execute` assistance for honestly readable `git commit -m` forms (including worktree `cd <path> &&` and `git -C`). Edits and unknown tools are never claim-gated. See [docs/commit-provenance.md](docs/commit-provenance.md).
 - **Two commands** (`commands/*.md`) — `devspec.remote` and `devspec.remote-stop`, same names as the Claude Code and Cursor plugins. They exist because connecting runs a real setup script; everything else is a sentence you say to the agent, which works in any host with the DevSpec MCP server.
 - **Batches** — tell the agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* and it reserves them so nobody else takes one mid-run, then claims and works them in order. DevSpec's web app has a copy button that writes that line.
+- **Shared session plans** — substantial multi-phase work can use the on-demand `manage_plan` path selected by the served implementation contract; routine turns carry no plan boilerplate. Attached remote sessions receive a strict current active-plan snapshot with room-wide read awareness.
 - **Remote control** — attach this OpenCode session to a DevSpec session for phone/web control, delivered via OpenCode's own session-message API rather than a file-based workaround.
 
 ## Developing this plugin (coding agents)

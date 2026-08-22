@@ -21,6 +21,18 @@ export interface McpToolCallArgs {
   timeoutMs?: number
   /** Abort the request from outside (plugin `dispose`, so a held poll cannot outlive the host). */
   signal?: AbortSignal
+  /**
+   * Opaque per-connection capability negotiated during registration. It is sent
+   * only as transport metadata and must never be placed in tool arguments or
+   * model-visible output.
+   */
+  connectionCapability?: string
+  /**
+   * Trusted transport-only MCP result metadata observer. The callback runs on
+   * the raw JSON-RPC result before model-visible content is unwrapped. Never
+   * copy this metadata into a returned tool value or logs.
+   */
+  onResultMeta?: (meta: unknown) => void
 }
 
 /** Thrown when a request exceeded its own `timeoutMs` (not a server error). */
@@ -40,6 +52,8 @@ export async function mcpToolsCall({
   arguments: toolArgs,
   timeoutMs,
   signal,
+  connectionCapability,
+  onResultMeta,
 }: McpToolCallArgs): Promise<unknown> {
   const body = {
     jsonrpc: '2.0',
@@ -76,6 +90,9 @@ export async function mcpToolsCall({
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        ...(connectionCapability
+          ? { 'x-devspec-connection-capability': connectionCapability }
+          : {}),
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -117,6 +134,13 @@ export async function mcpToolsCall({
   }
   if (payload.error) {
     throw new Error(payload.error.message || JSON.stringify(payload.error))
+  }
+
+  // `_meta` is explicitly outside MCP model-visible content. Expose it only to
+  // trusted host code that opted in, and never merge it into this function's
+  // ordinary return value.
+  if (onResultMeta && payload.result && payload.result.isError !== true && Object.prototype.hasOwnProperty.call(payload.result, '_meta')) {
+    onResultMeta(payload.result._meta)
   }
 
   const content = payload.result?.content

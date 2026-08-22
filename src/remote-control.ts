@@ -33,12 +33,22 @@ import { AGENT_NAME } from './agent-identity.js'
 import { McpTimeoutError, mcpToolsCall } from './devspec-client.js'
 import { resolveDevspecAuth } from './resolve-devspec-auth.js'
 import {
+  captureConnectionCapabilityMeta,
+  clearConnectionCapability,
+  connectionCapabilityForTransport,
+  hasConnectionCapability,
+  moveConnectionCapability,
+  negotiateConnectionCapability,
+} from './manage-plan-tool.js'
+import {
+  ACTIVE_PLAN_PROJECTION_VERSION,
   DELEGATED_SCOPE_VERSION,
   freezeCanonicalTurn,
   parseCanonicalIngress,
   REMOTE_INGRESS_VERSION,
   resolveHandshakeInject,
   selectCanonicalCommandsForPrompt,
+  serializeActiveSessionPlans,
   type CanonicalCommand,
   type CanonicalContextEntry,
   type CanonicalControl,
@@ -2141,27 +2151,59 @@ export async function ensureConnection(
 
   return runWithBondAsync(opencodeSessionId, async () => {
     const existing = readState()
-    if (existing) return { auth, state: existing }
+    if (existing && hasConnectionCapability(opencodeSessionId)) {
+      rememberOpenCodeBond(opencodeSessionId, existing.sessionId ?? null)
+      return { auth, state: existing }
+    }
 
+    // A durable state file can outlive this process, but the raw connection
+    // capability intentionally cannot. Re-register the same local_id to rotate
+    // and recover trusted transport identity before declaring this path ready.
+    const registrationArgs: Record<string, unknown> = {
+      local_id: bondLocalId(opencodeSessionId),
+      agent_name: AGENT_NAME,
+      cwd: directory,
+    }
+    negotiateConnectionCapability(registrationArgs)
+    let capturedCapability = false
     const result: any = await mcpToolsCall({
       mcpUrl: auth.mcp_url!,
       token: auth.token!,
       name: 'register_connection',
-      arguments: {
-        local_id: bondLocalId(opencodeSessionId),
-        agent_name: AGENT_NAME,
-        cwd: directory,
-      },
+      arguments: registrationArgs,
       timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+      onResultMeta: (meta) => {
+        capturedCapability = captureConnectionCapabilityMeta(opencodeSessionId, meta)
+      },
     })
-
-    const state: ConnectionState = {
-      connectionId: result.connection_id,
-      sessionId: null,
-      codename: result.codename ?? null,
+    if (!capturedCapability) {
+      return {
+        auth,
+        state: null,
+        error: 'register_connection did not return the negotiated connection capability in trusted MCP result metadata',
+      }
     }
+
+    const connectionId = typeof result?.connection_id === 'string'
+      ? result.connection_id
+      : existing?.connectionId
+    if (!connectionId) {
+      clearConnectionCapability(opencodeSessionId)
+      return { auth, state: null, error: 'register_connection returned no connection id' }
+    }
+    const state: ConnectionState = existing
+      ? {
+          ...existing,
+          connectionId,
+          codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
+        }
+      : {
+          connectionId,
+          sessionId: null,
+          codename: result?.codename ?? null,
+        }
     writeState(state)
-    rememberOpenCodeBond(opencodeSessionId, null)
+    rememberOpenCodeBond(opencodeSessionId, state.sessionId ?? null)
     return { auth, state }
   })
 }
@@ -2172,13 +2214,14 @@ export async function attachSession(
   opencodeSessionId: string,
   sessionId: string,
 ): Promise<void> {
-  const { auth, state } = await ensureConnection(directory, opencodeSessionId)
-  if (!auth.ok || !auth.token || !auth.mcp_url || !state) throw new Error(auth.error || 'DevSpec not configured')
+  const { auth, state, error } = await ensureConnection(directory, opencodeSessionId)
+  if (!auth.ok || !auth.token || !auth.mcp_url || !state) throw new Error(error || auth.error || 'DevSpec not configured')
   const result: any = await mcpToolsCall({
     mcpUrl: auth.mcp_url,
     token: auth.token,
     name: 'attach_connection',
     arguments: { connection_id: state.connectionId, session_id: sessionId },
+    connectionCapability: connectionCapabilityForTransport(opencodeSessionId) ?? undefined,
     timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
   })
   const canonicalSessionId =
@@ -2197,6 +2240,7 @@ export async function stopConnection(directory: string, opencodeSessionId: strin
   if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
     runWithBond(opencodeSessionId, () => clearState())
     forgetOpenCodeBond(opencodeSessionId)
+    clearConnectionCapability(opencodeSessionId)
     return
   }
   try {
@@ -2205,11 +2249,13 @@ export async function stopConnection(directory: string, opencodeSessionId: strin
       token: auth.token,
       name: 'detach_connection',
       arguments: { connection_id: state.connectionId },
+      connectionCapability: connectionCapabilityForTransport(opencodeSessionId) ?? undefined,
       timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
     })
   } finally {
     runWithBond(opencodeSessionId, () => clearState())
     forgetOpenCodeBond(opencodeSessionId)
+    clearConnectionCapability(opencodeSessionId)
   }
 }
 
@@ -2786,6 +2832,7 @@ export async function pollAndDeliver(
         ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
         ingress_version: REMOTE_INGRESS_VERSION,
         delegated_scope_version: DELEGATED_SCOPE_VERSION,
+        active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
         ...(remoteControlAgentStats(state) ? { agent_stats: remoteControlAgentStats(state) } : {}),
       },
       timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
@@ -2854,6 +2901,7 @@ export async function pollAndDeliver(
           busy: false,
           ingress_version: REMOTE_INGRESS_VERSION,
           delegated_scope_version: DELEGATED_SCOPE_VERSION,
+          active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
         },
         timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
       })
@@ -2900,6 +2948,10 @@ export async function pollAndDeliver(
     })
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
+    // Capability identity is process-local to this bond. Clear it before bond
+    // removal so a same-process reconnect cannot mistake an ended connection's
+    // credential for a live one and skip registration/rotation.
+    clearConnectionCapability(sessionId)
     forgetOpenCodeBond(sessionId)
     return { delayMs: 0, stop: true, reason: terminal.reason ?? 'server_ended' }
   }
@@ -2917,6 +2969,7 @@ export async function pollAndDeliver(
     })
     await setBusy(directory, false).catch(() => {})
     forgetPumpState(state.connectionId)
+    clearConnectionCapability(sessionId)
     forgetOpenCodeBond(sessionId)
     return { delayMs: 0, stop: true, reason }
   }
@@ -3384,6 +3437,10 @@ export async function pollAndDeliver(
     deliveryContract: null,
     declinedAttachments,
     attachmentReferences,
+    activeSessionPlans: serializeActiveSessionPlans(ingress.active_session_plans, {
+      connectionId: ingress.connection.connection_id,
+      ownerUserId: commands[0]?.authority.connection_owner_user_id ?? null,
+    }),
   })
   logPoll(
     `injecting ${commands.length} command(s) with context: ` +
@@ -3608,6 +3665,7 @@ export async function wipeOpenCodeContextInPlace(input: {
   runWithBond(opencodeSessionId, () => clearState())
   forgetOpenCodeBond(opencodeSessionId)
   rememberOpenCodeBond(newId, preservedDevspecSessionId)
+  moveConnectionCapability(opencodeSessionId, newId)
 
   runWithBond(newId, () => {
     if (carried) {
@@ -3757,6 +3815,7 @@ async function acknowledgeCanonicalControl(input: {
       busy: input.state.busy ?? false,
       ingress_version: REMOTE_INGRESS_VERSION,
       delegated_scope_version: DELEGATED_SCOPE_VERSION,
+      active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
       control_ack: input.controlId,
       ...(input.modelCatalog ? { model_catalog: input.modelCatalog } : {}),
       ...(remoteControlAgentStats(input.state) ? { agent_stats: remoteControlAgentStats(input.state) } : {}),

@@ -27,6 +27,12 @@ import {
   ensureServeAuthEnv,
 } from './serve-auth.js'
 import { CommitProvenance } from './commit-provenance.js'
+import {
+  captureConnectionCapability,
+  clearConnectionCapability,
+  createManagePlanTool,
+  negotiateConnectionCapability,
+} from './manage-plan-tool.js'
 
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
 // OPENCODE_SERVER_PASSWORD as early as this module loads — same rule as rocket
@@ -60,6 +66,10 @@ function isPostSessionMessageTool(tool: string): boolean {
 
 function isAttachConnectionTool(tool: string): boolean {
   return tool === "devspec_attach_connection" || tool.endsWith("attach_connection")
+}
+
+function isDetachConnectionTool(tool: string): boolean {
+  return tool === 'devspec_detach_connection' || tool.endsWith('detach_connection')
 }
 
 /** OpenCode emits these live; `@opencode-ai/plugin` Event unions may lag. */
@@ -268,7 +278,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       stopped = true
       abort.abort()
       provenance.clearAll()
-      logPoll('dispose: pump stopped, in-flight hold aborted, and provenance state cleared')
+      clearConnectionCapability()
+      logPoll('dispose: pump stopped, in-flight hold aborted, and process-local identity state cleared')
+    },
+    tool: {
+      // OpenCode prefixes MCP tools with the server name (`devspec_`). Register
+      // the capability-aware host proxy under that exact on-demand name so a
+      // discovered native definition cannot bypass caller identity.
+      devspec_manage_plan: createManagePlanTool(directory),
     },
     config: async (cfg) => {
       registerBundledCommands(cfg)
@@ -290,6 +307,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
 
       if (event.type === 'session.deleted' && sessionId) {
         provenance.clearSession(sessionId)
+        clearConnectionCapability(sessionId)
       }
 
       // ---- The bond gate (item 2a5d212b) -------------------------------------
@@ -437,6 +455,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         if (typeof input.sessionID !== 'string' || !input.sessionID) return
         if (!output.args || typeof output.args !== 'object') output.args = {}
         const args = output.args as Record<string, unknown>
+        negotiateConnectionCapability(args)
         const correct = bondLocalId(input.sessionID)
         if (args.local_id === correct) return
         const had = typeof args.local_id === 'string' ? args.local_id : null
@@ -455,6 +474,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       provenance.after(input.tool, input.sessionID, input.args, output, input.callID)
       try {
         const opencodeSessionId = typeof input.sessionID === 'string' ? input.sessionID : null
+        // `_meta` is transport-only and never model-visible. Capture the rotated
+        // connection capability before ordinary result bookkeeping; content is
+        // never searched for a secret-shaped value.
+        if (opencodeSessionId && isRegisterConnectionTool(input.tool)) {
+          captureConnectionCapability(opencodeSessionId, output)
+        } else if (opencodeSessionId && isDetachConnectionTool(input.tool)) {
+          clearConnectionCapability(opencodeSessionId)
+        }
         // NOT bond-gated: this is the call that CREATES the bond, so requiring one
         // first would mean no session could ever connect.
         recordConnectionEventFromTool(input.tool, input.args, output, opencodeSessionId)

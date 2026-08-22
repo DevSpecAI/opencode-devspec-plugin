@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.0
+
+### Shared session plans stay current across OpenCode turns
+
+OpenCode now negotiates active-plan projection v1 alongside canonical ingress
+and delegated scope v1, strictly accepts the enhanced 1.3 contract while
+preserving the existing 1.2 parser, and renders a schema-validated current room
+snapshot only when active plans exist. Own-plan continuation/end, atomic
+advance, intentional cross-plan ids/revisions, same-owner orphan adoption, and
+cross-owner read-only awareness are explicit without turning the projection
+into a command or authority grant.
+
+A capability-backed `devspec_manage_plan` host proxy keeps caller identity out
+of model arguments. Model-driven and direct registration paths both negotiate
+and rotate the process-local capability from trusted MCP result metadata; attach,
+stop, reconnect, and context wipe preserve or clear it at the matching identity
+boundary. The concise instructions load plan mechanics on demand and point
+tracking and implementation authority to
+`devspec://product/implementation-contract` rather than copying it.
+
+`prepack` now builds TypeScript, so a clean checkout produces a complete package
+including the new manage-plan module instead of depending on ignored local dist
+files from an earlier build.
+
+Item `efd8e959`.
+
 ## 0.6.0
 
 ### Commit provenance replaces claim-gated mutation blocking

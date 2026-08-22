@@ -36,14 +36,21 @@ import {
   runWithBondAsync,
   writeState,
 } from '../dist/remote-control.js'
+import {
+  clearConnectionCapability,
+  hasConnectionCapability,
+} from '../dist/manage-plan-tool.js'
 
 const SESSION_A = 'ses_conversation_a'
 const SESSION_B = 'ses_conversation_b'
 
-/** MCP stub that mints a distinct connection per register call. */
+/** MCP stub that revives by local_id and rotates a hidden capability per register. */
 async function startStubMcp() {
   const toolCalls = []
   let minted = 0
+  let rotations = 0
+  let issueCapabilities = true
+  const connections = new Map()
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (c) => {
@@ -58,11 +65,17 @@ async function startStubMcp() {
       }
       const name = parsed?.params?.name ?? '(unparsed)'
       const args = parsed?.params?.arguments ?? {}
-      toolCalls.push({ name, arguments: args })
+      toolCalls.push({ name, arguments: args, capability: req.headers['x-devspec-connection-capability'] ?? null })
       let payload = { ok: true }
       if (name === 'register_connection') {
-        minted += 1
-        payload = { connection_id: `conn-${minted}`, codename: `Codename ${minted}` }
+        let payloadForLocalId = connections.get(args.local_id)
+        if (!payloadForLocalId) {
+          minted += 1
+          payloadForLocalId = { connection_id: `conn-${minted}`, codename: `Codename ${minted}` }
+          connections.set(args.local_id, payloadForLocalId)
+        }
+        rotations += 1
+        payload = payloadForLocalId
       } else if (name === 'attach_connection') {
         payload = { session_id: args.session_id }
       }
@@ -71,7 +84,12 @@ async function startStubMcp() {
         JSON.stringify({
           jsonrpc: '2.0',
           id: parsed?.id ?? 1,
-          result: { content: [{ type: 'text', text: JSON.stringify(payload) }] },
+          result: {
+            content: [{ type: 'text', text: JSON.stringify(payload) }],
+            ...(issueCapabilities && name === 'register_connection' && args.connection_capability_version === 1
+              ? { _meta: { devspec: { connection_capability: { version: 1, value: `dvsc_capability-${rotations}` } } } }
+              : {}),
+          },
         }),
       )
     })
@@ -81,6 +99,7 @@ async function startStubMcp() {
     url: `http://127.0.0.1:${server.address().port}/api/mcp`,
     toolCalls,
     registers: () => toolCalls.filter((c) => c.name === 'register_connection'),
+    omitCapabilities: () => { issueCapabilities = false },
     close: () => new Promise((r) => server.close(r)),
   }
 }
@@ -97,6 +116,7 @@ describe('bond identity is the OpenCode session id (a72a4e22)', () => {
 
   beforeEach(async () => {
     resetBondsForTests()
+    clearConnectionCapability()
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-bond-home-'))
     dirOne = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-bond-projA-'))
     dirTwo = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-bond-projB-'))
@@ -121,6 +141,7 @@ describe('bond identity is the OpenCode session id (a72a4e22)', () => {
     if (priorUrl === undefined) delete process.env.DEVSPEC_MCP_URL
     else process.env.DEVSPEC_MCP_URL = priorUrl
     resetBondsForTests()
+    clearConnectionCapability()
     for (const d of [tmpHome, dirOne, dirTwo]) fs.rmSync(d, { recursive: true, force: true })
   })
 
@@ -180,6 +201,15 @@ describe('bond identity is the OpenCode session id (a72a4e22)', () => {
     )
   })
 
+  it('fails closed when registration omits trusted capability metadata', async () => {
+    mcp.omitCapabilities()
+    const result = await ensureConnection(dirOne, SESSION_A)
+    assert.equal(result.state, null)
+    assert.match(result.error, /did not return the negotiated connection capability/)
+    assert.equal(mcp.registers()[0].arguments.connection_capability_version, 1)
+    assert.equal(hasConnectionCapability(SESSION_A), false)
+  })
+
   it('the same conversation resumes its own connection without re-registering', async () => {
     const first = await ensureConnection(dirOne, SESSION_A)
     const again = await ensureConnection(dirOne, SESSION_A)
@@ -191,14 +221,17 @@ describe('bond identity is the OpenCode session id (a72a4e22)', () => {
     await ensureConnection(dirOne, SESSION_A)
     await ensureConnection(dirOne, SESSION_B)
 
-    // A restart loses the in-memory bond map but not the files on disk.
+    // A restart loses process-local bonds AND raw capabilities, but not state.
     resetBondsForTests()
+    clearConnectionCapability()
     assert.deepEqual(listOpenCodeBondSessions(), [])
 
     const resumed = await ensureConnection(dirOne, SESSION_A)
     assert.equal(resumed.state?.connectionId, 'conn-1', 'A must get A back')
     assert.equal(resumed.state?.codename, 'Codename 1')
-    assert.equal(mcp.registers().length, 2, 'no new registration for a resumed session')
+    assert.equal(mcp.registers().length, 3, 'resume must re-register to rotate its process-local capability')
+    assert.equal(mcp.registers()[2].arguments.connection_capability_version, 1)
+    assert.equal(hasConnectionCapability(SESSION_A), true)
 
     const otherStill = runWithBond(SESSION_B, () => readState())
     assert.equal(otherStill?.connectionId, 'conn-2', "and B's bond is untouched by A resuming")
@@ -251,6 +284,10 @@ describe('bond identity is the OpenCode session id (a72a4e22)', () => {
       'and keep its baseline — the failure d5efd533 fixed, now impossible rather than migrated',
     )
     assert.equal(isBondedOpenCodeSession(SESSION_A), true)
+    const register = mcp.registers()[0]
+    const attach = mcp.toolCalls.find((call) => call.name === 'attach_connection')
+    assert.equal(register.arguments.connection_capability_version, 1)
+    assert.equal(attach.capability, 'dvsc_capability-1', 'attach must use trusted transport identity')
   })
 
   it('the model-driven handshake persists state for the session that performed it', () => {

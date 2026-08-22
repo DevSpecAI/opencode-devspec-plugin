@@ -4,9 +4,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
+  attachSession,
   bondLocalId,
   forgetOpenCodeBond,
   forgetPumpState,
+  isBondedOpenCodeSession,
   pollAndDeliver,
   readState,
   rememberOpenCodeBond,
@@ -14,6 +16,11 @@ import {
   runWithBondAsync,
   writeState,
 } from '../dist/remote-control.js'
+import {
+  captureConnectionCapability,
+  clearConnectionCapability,
+  hasConnectionCapability,
+} from '../dist/manage-plan-tool.js'
 
 const connectionId = '11111111-1111-4111-8111-111111111111'
 const devspecSessionId = '22222222-2222-4222-8222-222222222222'
@@ -27,6 +34,8 @@ const message1 = '77777777-7777-4777-8777-777777777777'
 const message2 = '88888888-8888-4888-8888-888888888888'
 const controlId = '99999999-9999-4999-8999-999999999999'
 const opencodeSessionId = `canonical-poll-${process.pid}-${Math.random()}`
+const planId = '12121212-1212-4212-8212-121212121212'
+const planStepId = '13131313-1313-4313-8313-131313131313'
 const connection = { connection_id: connectionId, agent_name: 'OpenCode', codename: 'Otter', label: 'OpenCode · Otter' }
 const point = (sequence, message_id) => ({ sequence, created_at: `2026-08-20T12:00:0${sequence}.000Z`, message_id })
 const command = (message_id, sequence, provenance, body, primary) => ({
@@ -44,18 +53,35 @@ function ingress(commands = [], over = {}) {
   const context = over.context ?? { human_context: [], agent_context: [], ai_context: [], system_context: [] }
   const rows = [...commands, ...Object.values(context).flat()]
   return {
-    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.2.0', policy_version: '2026-08-19.3',
+    kind: 'devspec.remote_ingress', schema_version: 1, contract_version: '1.3.0', policy_version: '2026-08-21.1',
     envelope_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', connection,
     wake: over.wake ?? (commands.length ? { kind: 'conversational_command', active: true, reason_id: 'command' } : { kind: 'advisory_update', active: false, reason_id: 'context' }),
     delivery_state: over.delivery_state ?? 'live', command_message_ids: commands.map((row) => row.message_id), commands,
     control: over.control ?? null, context,
+    ...(over.active_session_plans ? { active_session_plans: over.active_session_plans } : {}),
     window: {
-      policy_version: '2026-08-19.3', returned: rows.length, total_known: rows.length,
+      policy_version: '2026-08-21.1', returned: rows.length, total_known: rows.length,
       source_window: rows.length ? { start: rows[0].order, end: rows.at(-1).order } : { start: null, end: null },
       truncated: over.truncated ?? false, has_more: over.has_more ?? false,
       next_cursor: over.next_cursor ?? null, fetch_id: over.fetch_id ?? null,
       omission_reason: over.omission_reason ?? null,
     },
+  }
+}
+function activePlans(title = 'Current reconnect snapshot') {
+  return {
+    version: 1,
+    advisory: true,
+    authority_note: 'Advisory read-awareness only. Presence does not authorize execution or mutation; manage_plan still requires a capability-authenticated caller identity, explicit plan_id for cross-plan work, and expected_revision.',
+    inventory: { returned: 1, total_known: 1, truncated: false },
+    plans: [{
+      id: planId, title, revision: 7, status: 'active', created_at: '2026-08-21T12:00:00.000Z',
+      origin: { kind: 'connection', connection_id: connectionId, agent_name: 'OpenCode', codename: 'Otter' },
+      steward: { kind: 'connection', connection_id: connectionId, agent_name: 'OpenCode', codename: 'Otter' },
+      owner: { user_id: ownerId, display_name: 'Owner' }, orphaned: false,
+      progress: { terminal: 0, total: 1, completed: 0, skipped: 0 },
+      steps: [{ id: planStepId, position: 1, title: 'Resume after reconnect', status: 'in_progress' }],
+    }],
   }
 }
 function changed(payload = {}) {
@@ -65,8 +91,14 @@ function changed(payload = {}) {
     ingress: ingress(), ...payload,
   }
 }
-function mcpResponse(value) {
-  return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify(value) }] } }), { status: 200, headers: { 'content-type': 'application/json' } })
+function mcpResponse(value, meta) {
+  return new Response(JSON.stringify({
+    jsonrpc: '2.0', id: 1,
+    result: {
+      content: [{ type: 'text', text: JSON.stringify(value) }],
+      ...(meta === undefined ? {} : { _meta: meta }),
+    },
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
 }
 
 let originalFetch
@@ -126,7 +158,10 @@ beforeEach(() => {
   controlAckResults = []
   globalThis.fetch = async (_url, init) => {
     const body = JSON.parse(init.body)
-    calls.push(body.params)
+    calls.push({
+      ...body.params,
+      capability: new Headers(init.headers).get('x-devspec-connection-capability'),
+    })
     if (body.params.name === 'poll_connection' && !body.params.arguments.control_ack) {
       return mcpResponse(pollResults.shift() ?? { connection_id: connectionId, session_id: devspecSessionId, changed: false, cursor_v2: null, dispatch_cursor: null })
     }
@@ -135,8 +170,18 @@ beforeEach(() => {
       if (result instanceof Error) throw result
       return mcpResponse(result ?? { ok: true, changed: false })
     }
+    if (body.params.name === 'register_connection') {
+      return mcpResponse(
+        { connection_id: connectionId, codename: 'Otter' },
+        { devspec: { connection_capability: { version: 1, value: 'dvsc_rotated-after-terminal' } } },
+      )
+    }
+    if (body.params.name === 'attach_connection') {
+      return mcpResponse({ connection_id: connectionId, session_id: body.params.arguments.session_id })
+    }
     return mcpResponse({ ok: true, changed: false })
   }
+  clearConnectionCapability()
   rememberOpenCodeBond(opencodeSessionId, devspecSessionId)
   runWithBond(opencodeSessionId, () => writeState({ connectionId, sessionId: devspecSessionId, codename: 'Otter', busy: false }))
   forgetPumpState(connectionId)
@@ -150,6 +195,7 @@ afterEach(() => {
   else process.env.DEVSPEC_MCP_URL = originalUrl
   forgetPumpState(connectionId)
   forgetOpenCodeBond(opencodeSessionId)
+  clearConnectionCapability()
   fs.rmSync(statePath(), { force: true })
 })
 
@@ -165,7 +211,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCatchUpCursor ?? null, null)
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
     const rendered = promptCalls[0].body.parts[0].text
-    assert.match(rendered, /policy_version=2026-08-19\.3/)
+    assert.match(rendered, /policy_version=2026-08-21\.1/)
     assert.match(rendered, /returned=1/)
     assert.match(rendered, /total_known=1/)
     assert.match(rendered, new RegExp(`source_window\\.start=\\{sequence=1,created_at=${cmd.order.created_at.replaceAll('.', '\\.')}.*,message_id=${message1}`))
@@ -197,6 +243,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(poll.arguments.catch_up, true)
     assert.notEqual(poll.arguments.cursor_v2, poll.arguments.catch_up_cursor)
     assert.equal(poll.arguments.delegated_scope_version, 1)
+    assert.equal(poll.arguments.active_plan_projection_version, 1)
   })
 
   it('drains one immutable deferred command transaction on an unchanged follow-up and commits only after acceptance', async () => {
@@ -284,7 +331,51 @@ describe('pollAndDeliver canonical transaction integration', () => {
     for (const call of pollCalls) {
       assert.equal(call.arguments.ingress_version, 1)
       assert.equal(call.arguments.delegated_scope_version, 1)
+      assert.equal(call.arguments.active_plan_projection_version, 1)
     }
+  })
+
+  it('clears terminal capability so same-process attach re-registers and rotates first', async () => {
+    captureConnectionCapability(opencodeSessionId, {
+      _meta: { devspec: { connection_capability: { version: 1, value: 'dvsc_stale-before-terminal' } } },
+    })
+    assert.equal(hasConnectionCapability(opencodeSessionId), true)
+    pollResults.push({
+      connection_id: connectionId,
+      session_id: devspecSessionId,
+      status: 'ended',
+      end_reason: 'ui',
+    })
+
+    const ended = await tick()
+    assert.equal(ended.stop, true)
+    assert.equal(isBondedOpenCodeSession(opencodeSessionId), false)
+    assert.equal(hasConnectionCapability(opencodeSessionId), false, 'terminal teardown retained stale capability')
+
+    const nextSession = 'abababab-abab-4bab-8bab-abababababab'
+    await attachSession(process.cwd(), opencodeSessionId, nextSession)
+    const register = calls.find((call) => call.name === 'register_connection')
+    const attach = calls.find((call) => call.name === 'attach_connection')
+    assert.equal(register.arguments.connection_capability_version, 1)
+    assert.equal(attach.capability, 'dvsc_rotated-after-terminal')
+    assert.equal(runWithBond(opencodeSessionId, () => readState())?.sessionId, nextSession)
+    assert.equal(hasConnectionCapability(opencodeSessionId), true)
+  })
+
+  it('injects the current authoritative plan snapshot on a catch-up/reconnect command', async () => {
+    const cmd = command(message1, 1, provenance1, 'Continue from the current room state.', true)
+    pollResults.push(changed({ ingress: ingress([cmd], { active_session_plans: activePlans() }) }))
+    await tick(); await settle()
+
+    assert.equal(promptCalls.length, 1)
+    const text = promptCalls[0].body.parts[0].text
+    assert.match(text, /Active session plans — ADVISORY READ-AWARENESS/)
+    assert.match(text, /Current reconnect snapshot/)
+    assert.match(text, new RegExp(`plan_id=${planId}.*revision=7`))
+    assert.match(text, new RegExp(`resume step_id=${planStepId}`, 'i'))
+    const poll = calls.find((call) => call.name === 'poll_connection' && !call.arguments.control_ack && !call.arguments.context_wipe_ack)
+    assert.equal(poll.arguments.catch_up, true)
+    assert.equal(poll.arguments.active_plan_projection_version, 1)
   })
 
   it('rolls back mechanically when promptAsync rejects and retries the whole immutable turn once', async () => {

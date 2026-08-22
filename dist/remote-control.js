@@ -31,7 +31,8 @@ import { pathToFileURL } from 'node:url';
 import { AGENT_NAME } from './agent-identity.js';
 import { McpTimeoutError, mcpToolsCall } from './devspec-client.js';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
-import { DELEGATED_SCOPE_VERSION, freezeCanonicalTurn, parseCanonicalIngress, REMOTE_INGRESS_VERSION, resolveHandshakeInject, selectCanonicalCommandsForPrompt, } from './remote-ingress.js';
+import { captureConnectionCapabilityMeta, clearConnectionCapability, connectionCapabilityForTransport, hasConnectionCapability, moveConnectionCapability, negotiateConnectionCapability, } from './manage-plan-tool.js';
+import { ACTIVE_PLAN_PROJECTION_VERSION, DELEGATED_SCOPE_VERSION, freezeCanonicalTurn, parseCanonicalIngress, REMOTE_INGRESS_VERSION, resolveHandshakeInject, selectCanonicalCommandsForPrompt, serializeActiveSessionPlans, } from './remote-ingress.js';
 import { HOLD_HTTP_GRACE_MS, createCarryBuffer, buildAttachmentParts, emptyTurnBackoffMs, errorBackoffMs, holdFor, pollTerminalReason, RECOVERABLE_TERMINAL_MAX, renderInjectedTurn, resolveServerAttachment, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 import { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
 import { logRemoteControlStory } from './remote-control-story.js';
@@ -1580,39 +1581,71 @@ export async function ensureConnection(directory, opencodeSessionId) {
     }
     return runWithBondAsync(opencodeSessionId, async () => {
         const existing = readState();
-        if (existing)
+        if (existing && hasConnectionCapability(opencodeSessionId)) {
+            rememberOpenCodeBond(opencodeSessionId, existing.sessionId ?? null);
             return { auth, state: existing };
+        }
+        // A durable state file can outlive this process, but the raw connection
+        // capability intentionally cannot. Re-register the same local_id to rotate
+        // and recover trusted transport identity before declaring this path ready.
+        const registrationArgs = {
+            local_id: bondLocalId(opencodeSessionId),
+            agent_name: AGENT_NAME,
+            cwd: directory,
+        };
+        negotiateConnectionCapability(registrationArgs);
+        let capturedCapability = false;
         const result = await mcpToolsCall({
             mcpUrl: auth.mcp_url,
             token: auth.token,
             name: 'register_connection',
-            arguments: {
-                local_id: bondLocalId(opencodeSessionId),
-                agent_name: AGENT_NAME,
-                cwd: directory,
-            },
+            arguments: registrationArgs,
             timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
+            onResultMeta: (meta) => {
+                capturedCapability = captureConnectionCapabilityMeta(opencodeSessionId, meta);
+            },
         });
-        const state = {
-            connectionId: result.connection_id,
-            sessionId: null,
-            codename: result.codename ?? null,
-        };
+        if (!capturedCapability) {
+            return {
+                auth,
+                state: null,
+                error: 'register_connection did not return the negotiated connection capability in trusted MCP result metadata',
+            };
+        }
+        const connectionId = typeof result?.connection_id === 'string'
+            ? result.connection_id
+            : existing?.connectionId;
+        if (!connectionId) {
+            clearConnectionCapability(opencodeSessionId);
+            return { auth, state: null, error: 'register_connection returned no connection id' };
+        }
+        const state = existing
+            ? {
+                ...existing,
+                connectionId,
+                codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
+            }
+            : {
+                connectionId,
+                sessionId: null,
+                codename: result?.codename ?? null,
+            };
         writeState(state);
-        rememberOpenCodeBond(opencodeSessionId, null);
+        rememberOpenCodeBond(opencodeSessionId, state.sessionId ?? null);
         return { auth, state };
     });
 }
 /** Attach this session's connection to a DevSpec session — `/devspec.remote --session <id>`. */
 export async function attachSession(directory, opencodeSessionId, sessionId) {
-    const { auth, state } = await ensureConnection(directory, opencodeSessionId);
+    const { auth, state, error } = await ensureConnection(directory, opencodeSessionId);
     if (!auth.ok || !auth.token || !auth.mcp_url || !state)
-        throw new Error(auth.error || 'DevSpec not configured');
+        throw new Error(error || auth.error || 'DevSpec not configured');
     const result = await mcpToolsCall({
         mcpUrl: auth.mcp_url,
         token: auth.token,
         name: 'attach_connection',
         arguments: { connection_id: state.connectionId, session_id: sessionId },
+        connectionCapability: connectionCapabilityForTransport(opencodeSessionId) ?? undefined,
         timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
     });
     const canonicalSessionId = typeof result?.session_id === 'string' ? result.session_id : sessionId;
@@ -1629,6 +1662,7 @@ export async function stopConnection(directory, opencodeSessionId) {
     if (!auth.ok || !auth.token || !auth.mcp_url || !state) {
         runWithBond(opencodeSessionId, () => clearState());
         forgetOpenCodeBond(opencodeSessionId);
+        clearConnectionCapability(opencodeSessionId);
         return;
     }
     try {
@@ -1637,12 +1671,14 @@ export async function stopConnection(directory, opencodeSessionId) {
             token: auth.token,
             name: 'detach_connection',
             arguments: { connection_id: state.connectionId },
+            connectionCapability: connectionCapabilityForTransport(opencodeSessionId) ?? undefined,
             timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
         });
     }
     finally {
         runWithBond(opencodeSessionId, () => clearState());
         forgetOpenCodeBond(opencodeSessionId);
+        clearConnectionCapability(opencodeSessionId);
     }
 }
 // Dedup key for reportPollError, keyed by directory — avoids spamming DevSpec
@@ -2083,6 +2119,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                 ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
                 ingress_version: REMOTE_INGRESS_VERSION,
                 delegated_scope_version: DELEGATED_SCOPE_VERSION,
+                active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
                 ...(remoteControlAgentStats(state) ? { agent_stats: remoteControlAgentStats(state) } : {}),
             },
             timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
@@ -2152,6 +2189,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                     busy: false,
                     ingress_version: REMOTE_INGRESS_VERSION,
                     delegated_scope_version: DELEGATED_SCOPE_VERSION,
+                    active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
                 },
                 timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
             });
@@ -2194,6 +2232,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         });
         await setBusy(directory, false).catch(() => { });
         forgetPumpState(state.connectionId);
+        // Capability identity is process-local to this bond. Clear it before bond
+        // removal so a same-process reconnect cannot mistake an ended connection's
+        // credential for a live one and skip registration/rotation.
+        clearConnectionCapability(sessionId);
         forgetOpenCodeBond(sessionId);
         return { delayMs: 0, stop: true, reason: terminal.reason ?? 'server_ended' };
     }
@@ -2211,6 +2253,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         });
         await setBusy(directory, false).catch(() => { });
         forgetPumpState(state.connectionId);
+        clearConnectionCapability(sessionId);
         forgetOpenCodeBond(sessionId);
         return { delayMs: 0, stop: true, reason };
     }
@@ -2660,6 +2703,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         deliveryContract: null,
         declinedAttachments,
         attachmentReferences,
+        activeSessionPlans: serializeActiveSessionPlans(ingress.active_session_plans, {
+            connectionId: ingress.connection.connection_id,
+            ownerUserId: commands[0]?.authority.connection_owner_user_id ?? null,
+        }),
     });
     logPoll(`injecting ${commands.length} command(s) with context: ` +
         `${context?.owner_ambient.length ?? 0} owner-ambient, ${context?.room_context.length ?? 0} room-context, ` +
@@ -2854,6 +2901,7 @@ export async function wipeOpenCodeContextInPlace(input) {
     runWithBond(opencodeSessionId, () => clearState());
     forgetOpenCodeBond(opencodeSessionId);
     rememberOpenCodeBond(newId, preservedDevspecSessionId);
+    moveConnectionCapability(opencodeSessionId, newId);
     runWithBond(newId, () => {
         if (carried) {
             writeState({
@@ -2966,6 +3014,7 @@ async function acknowledgeCanonicalControl(input) {
             busy: input.state.busy ?? false,
             ingress_version: REMOTE_INGRESS_VERSION,
             delegated_scope_version: DELEGATED_SCOPE_VERSION,
+            active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
             control_ack: input.controlId,
             ...(input.modelCatalog ? { model_catalog: input.modelCatalog } : {}),
             ...(remoteControlAgentStats(input.state) ? { agent_stats: remoteControlAgentStats(input.state) } : {}),

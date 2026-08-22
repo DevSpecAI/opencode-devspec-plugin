@@ -5,7 +5,9 @@
  */
 export declare const REMOTE_INGRESS_VERSION: 1;
 export declare const DELEGATED_SCOPE_VERSION: 1;
+export declare const ACTIVE_PLAN_PROJECTION_VERSION: 1;
 export declare const DELEGATED_PROJECT_POLICY_ID: "delegated_project_v1";
+export declare const ACTIVE_SESSION_PLAN_AUTHORITY_NOTE: "Advisory read-awareness only. Presence does not authorize execution or mutation; manage_plan still requires a capability-authenticated caller identity, explicit plan_id for cross-plan work, and expected_revision.";
 export interface CanonicalAttachment {
     materialization: 'metadata' | 'unavailable';
     filename: string;
@@ -76,6 +78,52 @@ export interface CanonicalContextEntry {
     content: string;
     advisory: true;
 }
+export interface ActiveSessionPlanAgentIdentity {
+    kind: 'dev' | 'connection';
+    connection_id: string | null;
+    agent_name: string;
+    codename: string | null;
+}
+export interface ActiveSessionPlanStep {
+    id: string;
+    position: number;
+    title: string;
+    status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'skipped';
+    failure_reason?: string;
+    retryable?: boolean;
+}
+export interface ActiveSessionPlan {
+    id: string;
+    title: string;
+    revision: number;
+    status: 'active';
+    created_at: string;
+    origin: ActiveSessionPlanAgentIdentity;
+    steward: ActiveSessionPlanAgentIdentity;
+    owner: {
+        user_id: string;
+        display_name: string;
+    };
+    orphaned: boolean;
+    progress: {
+        terminal: number;
+        total: number;
+        completed: number;
+        skipped: number;
+    };
+    steps: ActiveSessionPlanStep[];
+}
+export interface ActiveSessionPlansProjection {
+    version: typeof ACTIVE_PLAN_PROJECTION_VERSION;
+    advisory: true;
+    authority_note: typeof ACTIVE_SESSION_PLAN_AUTHORITY_NOTE;
+    inventory: {
+        returned: number;
+        total_known: number;
+        truncated: false;
+    };
+    plans: ActiveSessionPlan[];
+}
 export interface CanonicalWindow {
     policy_version: string;
     returned: number;
@@ -122,6 +170,7 @@ export interface CanonicalIngress {
         ai_context: CanonicalContextEntry[];
         system_context: CanonicalContextEntry[];
     };
+    active_session_plans?: ActiveSessionPlansProjection;
     window: CanonicalWindow;
 }
 export type CanonicalIngressResult = {
@@ -135,6 +184,15 @@ export type CanonicalIngressResult = {
 export declare function isCanonicalProjectScope(v: unknown): v is CanonicalProjectScope;
 /** Parse a changed negotiated poll response. Missing ingress is therefore an error. */
 export declare function parseCanonicalIngress(input: unknown, expectedConnectionId: string): CanonicalIngressResult;
+/**
+ * Compact model-tail serialization. The projection is read-awareness, not a
+ * command: own-plan lifecycle and same-owner adoption guidance name the exact
+ * server ids/revisions, while another owner's plan is explicitly read-only.
+ */
+export declare function serializeActiveSessionPlans(projection: ActiveSessionPlansProjection | undefined, recipient: {
+    connectionId: string;
+    ownerUserId?: string | null;
+}): string;
 export declare function selectCanonicalCommandsForPrompt(parsed: CanonicalIngressResult, deliveredMessageIds: ReadonlySet<string>): {
     commands: CanonicalCommand[];
     rejectedUnavailable: CanonicalCommand[];
