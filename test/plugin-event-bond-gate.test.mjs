@@ -296,6 +296,14 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
     assert.equal(readBonded()?.permissionAskedPending, true)
     assert.deepEqual(readBonded()?.pendingPermissions?.map((request) => request.requestId), ['perm_new'])
     assert.equal(heartbeats().some((call) => call.arguments.busy === false), false)
+
+    await hooks.event({
+      event: { type: 'permission.denied', properties: { sessionID: BONDED, requestID: 'perm_new' } },
+    })
+    assert.equal(readBonded()?.permissionAskedPending, false)
+    assert.equal(readBonded()?.busy, true)
+    assert.equal(readBonded()?.awaitingRemoteReply, true)
+    assert.equal(readBonded()?.activeTrailMessageId, 'trail_remote')
   })
 
   it('accepts the SDK message.updated sessionID nested under info', async () => {
