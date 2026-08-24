@@ -8,6 +8,7 @@ import {
   listOpenCodeBondSessions,
   logPoll,
   markPermissionAsked,
+  postPermissionWaitNotice,
   pollAndDeliver,
   recordConnectionEventFromTool,
   recordManualPostSessionMessage,
@@ -98,6 +99,11 @@ function isQuestionResolvedEvent(type: string): boolean {
     type === 'question.v2.replied' ||
     type === 'question.v2.rejected'
   )
+}
+
+function permissionRequestId(props: Record<string, unknown> | undefined): string | null {
+  const value = props?.requestID ?? props?.id
+  return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
 /**
@@ -301,6 +307,8 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
       const sessionId =
         typeof props?.sessionID === 'string'
           ? props.sessionID
+          : typeof eventInfo?.sessionID === 'string'
+            ? eventInfo.sessionID
           : event.type === 'session.deleted' && typeof eventInfo?.id === 'string'
             ? eventInfo.id
             : undefined
@@ -368,15 +376,17 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
           recordRemoteControlSkillCommand(props ?? null)
         })
       } else if (isPermissionAskedEvent(event.type)) {
-        // Hung permission wait is NOT stall progress — mark so checkBusyStall
-        // never slides on the still-"running" tool (bb633917). OpenCode emits
-        // `permission.asked` live; SDK Event typings may lag — compare as string.
+        // A permission wait is not model progress, but the OpenCode turn remains
+        // resumable. Keep its activity/correlation intact until the request is
+        // answered or OpenCode settles the session.
         await inBond(async () => {
-          markPermissionAsked()
+          if (markPermissionAsked(permissionRequestId(props))) {
+            await postPermissionWaitNotice(directory)
+          }
         })
       } else if (isPermissionResolvedEvent(event.type)) {
         await inBond(async () => {
-          clearPermissionAsked()
+          clearPermissionAsked(permissionRequestId(props))
         })
       } else if (isQuestionAskedEvent(event.type)) {
         await inBond(() => handleQuestionAsked(directory, props ?? null))

@@ -23,7 +23,6 @@ import {
   resetBondsForTests,
   scopeAssistantsAfterBaseline,
   writeState,
-  PERMISSION_ASK_STALL_MS,
   runWithBondAsync,
 } from '../dist/remote-control.js'
 
@@ -271,13 +270,11 @@ describe('decideBusyStall', () => {
       sameAssistantActiveToolSlides: 0,
       maxActiveToolSlides: 2,
       permissionAskPending: true,
-      permissionAskElapsedMs: 1_000,
-      permissionAskStallMs: PERMISSION_ASK_STALL_MS,
     })
-    assert.equal(d.action, 'under_timeout')
+    assert.equal(d.action, 'waiting_permission')
   })
 
-  itInBond('stalls after the permission-ask window even with a running tool', () => {
+  itInBond('keeps waiting past every stall window while permission is pending', () => {
     const d = decideBusyStall({
       elapsedMs: 20_000,
       timeoutMs: TIMEOUT,
@@ -289,12 +286,8 @@ describe('decideBusyStall', () => {
       sameAssistantActiveToolSlides: 0,
       maxActiveToolSlides: 2,
       permissionAskPending: true,
-      permissionAskElapsedMs: PERMISSION_ASK_STALL_MS,
-      permissionAskStallMs: PERMISSION_ASK_STALL_MS,
     })
-    assert.equal(d.action, 'stall')
-    assert.equal(d.reason, 'permission_asked')
-    assert.equal(d.assistantId, 'm1')
+    assert.equal(d.action, 'waiting_permission')
   })
 
   itInBond('detects permission ask from message parts without an explicit flag', () => {
@@ -303,10 +296,21 @@ describe('decideBusyStall', () => {
       timeoutMs: TIMEOUT,
       lastAssistant: assistant('m1', [{ type: 'tool', state: { status: 'ask' } }]),
       previousProgressAssistantId: 'm1',
-      permissionAskElapsedMs: PERMISSION_ASK_STALL_MS,
     })
-    assert.equal(d.action, 'stall')
-    assert.equal(d.reason, 'permission_asked')
+    assert.equal(d.action, 'waiting_permission')
+  })
+
+  itInBond('permission wait wins over partial assistant text', () => {
+    const d = decideBusyStall({
+      elapsedMs: TIMEOUT + 1,
+      timeoutMs: TIMEOUT,
+      lastAssistant: assistant('m1', [
+        { type: 'text', text: 'I need to inspect that file.' },
+        { type: 'tool', state: { status: 'ask' } },
+      ]),
+      previousProgressAssistantId: 'm1',
+    })
+    assert.equal(d.action, 'waiting_permission')
   })
 
   itInBond('without permission, active_tool still slides before the cap', () => {
