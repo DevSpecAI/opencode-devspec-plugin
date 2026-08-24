@@ -31,7 +31,7 @@
  * to the token that actually registered the connection.
  *
  * NOTE: this resolver feeds ONLY the in-process remote-control machinery
- * (register / heartbeat / poll / mirror in remote-control.ts). It is not the
+ * (register / heartbeat / poll / answer-post in remote-control.ts). It is not the
  * auth path for OpenCode's own MCP tool calls, so re-prioritising it here keeps
  * register + poller symmetric without affecting anything else.
  */

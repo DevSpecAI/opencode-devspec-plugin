@@ -59,7 +59,7 @@ export function ensureServeAuthEnv(env: NodeJS.ProcessEnv = process.env): ServeA
  * Live OpenCode SDK interceptors receive Fetch `Request` objects whose
  * `.headers` is a getter-only `Headers` instance. Assigning `req.headers = …`
  * throws (Node: "Cannot set property headers…"; Bun: "Attempted to assign to
- * readonly property") and breaks every remote inject / mirror call
+ * readonly property") and breaks every remote inject / answer-post call
  * (Purple Kingfisher, 2026-08-08).
  */
 export function stampServeAuthOnRequest(

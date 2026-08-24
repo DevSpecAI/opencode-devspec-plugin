@@ -413,13 +413,13 @@ describe('plugin hooks remain independent of remote bonds and egress', () => {
       connectionId: connectionID,
       sessionId: devspecSessionID,
       codename: 'Fresh Otter',
-      connectMirrorSuppressed: true,
+      connectHandshakePending: true,
     })
     await assert.doesNotReject(() => before('bash', sessionID, { command: 'git status' }))
     await assert.doesNotReject(() => before('edit', sessionID, { filePath: 'a.ts' }))
   })
 
-  it('a remote-control bond does not change provenance or egress', async () => {
+  it('a remote-control bond does not change provenance', async () => {
     rememberOpenCodeBond('bonded', '11111111-1111-1111-1111-111111111111')
     await assert.doesNotReject(() => before('bash', 'bonded', { command: 'npm test' }))
 
@@ -431,10 +431,6 @@ describe('plugin hooks remain independent of remote bonds and egress', () => {
     const args = { command: "git commit -m 'ship'" }
     await before('bash', 'bonded', args, 'stamp-1')
     assert.match(args.command, /\[devspec:f240d17f-8b9a-401d-bc73-d848db8b8fe5\]/)
-    await assert.rejects(
-      () => before('devspec_post_session_message', 'bonded', { message: 'answer' }),
-      /plugin posts your reply for you/,
-    )
   })
 
   it('unknown tools and opaque shell fail open; readable untagged commits do not terminate the session', async () => {

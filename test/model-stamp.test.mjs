@@ -161,7 +161,7 @@ describe('summarizeModelShapeSnippet / modelStoryData', () => {
   })
 })
 
-describe('loud model_missing story (mirror_post)', () => {
+describe('loud model_missing story (answer_post)', () => {
   let restoreHomedir
 
   beforeEach(() => {
@@ -176,7 +176,7 @@ describe('loud model_missing story (mirror_post)', () => {
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   })
 
-  it('emits mirror_post/model_missing with connectionId, sessionId, and raw shape', () => {
+  it('emits answer_post/model_missing with connectionId, sessionId, and raw shape', () => {
     const extracted = resolveOpenCodeAssistantModel({
       info: { id: 'msg-1', provider: 'anthropic' },
     })
@@ -184,7 +184,7 @@ describe('loud model_missing story (mirror_post)', () => {
     assert.equal(extracted.source, 'info.flat')
 
     logRemoteControlStory({
-      phase: 'mirror_post',
+      phase: 'answer_post',
       outcome: 'model_missing',
       connectionId: 'conn-gecko',
       sessionId: 'sess-a2a262cd',
@@ -203,7 +203,7 @@ describe('loud model_missing story (mirror_post)', () => {
     const line = body.trim().split('\n').pop()
     const json = JSON.parse(line.replace(/^\S+\s+story\s+/, ''))
     assert.equal(json.type, 'remote_control_story')
-    assert.equal(json.phase, 'mirror_post')
+    assert.equal(json.phase, 'answer_post')
     assert.equal(json.outcome, 'model_missing')
     assert.equal(json.connectionId, 'conn-gecko')
     assert.equal(json.sessionId, 'sess-a2a262cd')
@@ -225,7 +225,7 @@ describe('loud model_missing story (mirror_post)', () => {
     })
     assert.ok(extracted.model)
     assert.equal(extracted.source, 'info.flat')
-    // Successful mirrors post with model and use done/mirrored — not model_missing.
+    // Successful answer posts carry the model rather than model_missing.
     assert.equal(extracted.missingReason, undefined)
   })
 })

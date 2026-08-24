@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * What survives in mirror-chrome after egress stopped reading text (68cc567c).
+ * Content-blind remote-control formatting and sequencing helpers.
  *
  * This file used to be the home of the classifier suite: `prepareMirrorText`
  * fence-awareness (0ffe97cb), variant status-block detection (Dashing Osprey /
@@ -21,7 +21,7 @@ import {
   isDevspecRemoteControlCommand,
   shouldDeferInjectDuringConnect,
   unwrapSingleOuterMarkdownFence,
-} from '../dist/mirror-chrome.js'
+} from '../dist/remote-format.js'
 import { unansweredCommands } from '../dist/poll-turn.js'
 
 const FENCED = '```\n━━━ DevSpec Remote Control ━━━\nAgent: OpenCode\n```'
@@ -59,12 +59,12 @@ describe('isDevspecRemoteControlCommand — a NAME test, not a text test', () =>
 
 describe('shouldDeferInjectDuringConnect — sequencing, not egress (6990fd9e)', () => {
   it('defers an owner command while the handshake is still settling', () => {
-    assert.equal(shouldDeferInjectDuringConnect({ connectMirrorSuppressed: true }), true)
+    assert.equal(shouldDeferInjectDuringConnect({ connectHandshakePending: true }), true)
   })
 
   it('does not defer once a real inject turn is in flight', () => {
     assert.equal(
-      shouldDeferInjectDuringConnect({ connectMirrorSuppressed: true, awaitingRemoteReply: true }),
+      shouldDeferInjectDuringConnect({ connectHandshakePending: true, awaitingRemoteReply: true }),
       false,
       'a turn already answering a command must not be starved by a stale handshake flag',
     )

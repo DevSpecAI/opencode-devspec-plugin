@@ -534,7 +534,8 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
       awaitingRemoteReply: true,
       replyAfterOpenCodeMessageId: 'msg_base',
       replyBaselineCaptured: true,
-      manualAnswerPostedThisTurn: true,
+      currentCommandTurnId: 'turn-1',
+      currentCommandMessageId: 'cmd-3',
       activeTrailMessageId: 'trail-1',
       lastTrailHash: 'hash-1',
       lastTrailPostedAt: 111,
@@ -544,7 +545,7 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
     })
   }
 
-  itInBond('clears awaiting/baseline/trail/manual-post state without touching deliveredMessageIds by default', () => {
+  itInBond('clears awaiting/baseline/trail/command correlation without touching deliveredMessageIds by default', () => {
     const dir = tmpDir()
     dirs.push(dir)
     seedState(dir)
@@ -555,7 +556,8 @@ describe('clearInjectTurnState (item 40279ae0)', () => {
     assert.equal(fresh?.awaitingRemoteReply, false)
     assert.equal(fresh?.replyAfterOpenCodeMessageId, null)
     assert.equal(fresh?.currentTurnMessageIds, null)
-    assert.equal(fresh?.manualAnswerPostedThisTurn, false)
+    assert.equal(fresh?.currentCommandTurnId, null)
+    assert.equal(fresh?.currentCommandMessageId, null)
     assert.equal(fresh?.activeTrailMessageId, null)
     assert.equal(fresh?.lastTrailHash, null)
     assert.equal(fresh?.lastTrailPostedAt, null)

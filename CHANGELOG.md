@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Agent-owned answer delivery replaces plugin mirroring
+
+Bonded OpenCode turns now call `post_session_message` exactly once. The plugin
+mechanically binds the current connection, model, lifecycle fields, and exact
+remote command correlation, while unbonded sessions fail closed. Assistant-text
+mirroring, mirror deduplication, and compatibility fallback writers are removed.
+
+Historical entries below describe the architecture shipped by those versions;
+their instructions not to call `post_session_message` are superseded by this
+single-writer design.
+
 ## 0.7.0
 
 ### Shared session plans stay current across OpenCode turns

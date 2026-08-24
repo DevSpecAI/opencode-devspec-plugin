@@ -34,22 +34,23 @@ import { resolveDevspecAuth } from './resolve-devspec-auth.js';
 import { captureConnectionCapabilityMeta, clearConnectionCapability, connectionCapabilityForTransport, hasConnectionCapability, moveConnectionCapability, negotiateConnectionCapability, } from './manage-plan-tool.js';
 import { ACTIVE_PLAN_PROJECTION_VERSION, DELEGATED_SCOPE_VERSION, freezeCanonicalTurn, parseCanonicalIngress, REMOTE_INGRESS_VERSION, resolveHandshakeInject, selectCanonicalCommandsForPrompt, serializeActiveSessionPlans, } from './remote-ingress.js';
 import { HOLD_HTTP_GRACE_MS, createCarryBuffer, buildAttachmentParts, emptyTurnBackoffMs, errorBackoffMs, holdFor, pollTerminalReason, RECOVERABLE_TERMINAL_MAX, renderInjectedTurn, resolveServerAttachment, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
-import { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
+import { shouldDeferInjectDuringConnect, } from './remote-format.js';
 import { logRemoteControlStory } from './remote-control-story.js';
 import { TRAIL_POST_MIN_GAP_MS, TRAIL_SEED_TEXT, serializeTurnTrail, shouldPostTrail, } from './work-trail.js';
 import { controlSlashSuccessMessage, } from './opencode-control-slash.js';
-export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
+const ANSWER_POST_PROCESS_ID = crypto.randomBytes(12).toString('hex');
+export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
 // Re-exported so the poll-turn split stays an internal refactor for importers.
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 /**
  * Persistent diagnostic log for the poll loop's own decisions — every
- * heartbeat's busy value, every delivery/mirror decision, every busy
+ * heartbeat's busy value, every delivery/answer-post decision, every busy
  * transition. Real gap found live-testing: none of this was ever recorded
  * anywhere, and Axiom has no visibility into heartbeat_connection calls
  * either (they don't appear in the standard tool-call telemetry at all,
  * unlike register_connection/get_session_transcript/post_session_message,
  * which do) — so a stuck "OpenCode is working…" indicator, or a duplicate
- * mirrored reply, was completely undiagnosable from either side without
+ * duplicate answer post, was completely undiagnosable from either side without
  * this. Colocated with launch-opencode-session.mjs's own launcher.log
  * (same directory, different file) in the other repo.
  */
@@ -70,7 +71,7 @@ export function logPoll(line) {
  * treat it as stalled. Progress means reply text, a new assistant message,
  * or an in-flight tool on the latest assistant — not merely "busy wall-clock
  * with empty text" (Tembo / Racing Heron false stalls: MiniMax tool loops
- * spent minutes with no mirrorable text while still working). Override via
+ * spent minutes with no assistant text while still working). Override via
  * DEVSPEC_OPENCODE_STALL_MS (milliseconds).
  */
 export const STALL_TIMEOUT_MS = (() => {
@@ -215,7 +216,7 @@ export async function setBusy(directory, busy) {
             timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
         });
         // patchState re-reads disk — never spread a stale snapshot here (see
-        // patchState's doc: that lost-update duplicated mirrored replies).
+        // patchState's doc: that lost update duplicated answer posts).
         patchState({
             busy,
             busySince: busy ? Date.now() : null,
@@ -342,7 +343,7 @@ export function extractOpenCodeReplyModel(raw) {
  *
  * Assistant turns store flat `info.providerID` + `info.modelID` (e.g. MiniMax).
  * Nested `info.model` is the user-message / Model.Ref shape. Reading only
- * `info.model` caused false `model_missing` / `mirrored_without_model` when
+ * `info.model` caused false missing-model diagnostics when
  * the model was present on the assistant message.
  *
  * Tries in order: flat info fields → nested `info.model` → legacy
@@ -742,7 +743,7 @@ export async function handleQuestionAsked(directory, props) {
         });
         logPoll(`handleQuestionAsked: posted needs_input request=${requestId} message=${messageId ?? 'n/a'}`);
         logRemoteControlStory({
-            phase: 'mirror_post',
+            phase: 'answer_post',
             outcome: 'posted',
             connectionId: state.connectionId,
             sessionId: state.sessionId,
@@ -826,6 +827,7 @@ export async function rejectPendingQuestion(input) {
     if (auth.ok && auth.token && auth.mcp_url) {
         await failOpenTrailTurn(auth, state, reason ?? 'OpenCode question was dismissed before an answer arrived.');
     }
+    clearInjectTurnState({ unclaim: true });
 }
 /**
  * Pure stall policy (unit-tested). Call only after `elapsedMs >= timeoutMs`
@@ -872,97 +874,21 @@ export function decideBusyStall(input) {
     }
     return { action: 'stall', assistantId: lastId, reason: 'empty_assistant_timeout' };
 }
-/** Normalize reply text before hashing so trivial whitespace drift cannot bypass dedup. */
+/** Normalize text before hashing so trivial whitespace drift shares a trail fingerprint. */
 export function normalizePostedContent(text) {
     return String(text ?? '')
         .replace(/\r\n/g, '\n')
         .trim();
 }
-/** Stable short hash of a reply body (used for mirror ↔ manual-post dedup). */
+/** Stable short hash used by work-trail update deduplication. */
 export function hashPostedContent(text) {
     return crypto.createHash('sha256').update(normalizePostedContent(text), 'utf8').digest('hex').slice(0, 32);
 }
-/**
- * True when this OpenCode assistant message already invoked DevSpec's
- * `post_session_message` (any MCP name variant). Mirror must not post again.
- */
-export function messageHasPostSessionMessageTool(message) {
-    const parts = Array.isArray(message?.parts) ? message.parts : [];
-    for (const p of parts) {
-        if (!p || typeof p !== 'object')
-            continue;
-        const part = p;
-        const candidates = [part.tool, part.name, part.toolName, part.call]
-            .filter((v) => typeof v === 'string')
-            .map((v) => v.toLowerCase());
-        for (const name of candidates) {
-            if (name === 'post_session_message' || name.endsWith('_post_session_message') || name.endsWith('/post_session_message')) {
-                return true;
-            }
-        }
-        // Nested tool metadata shapes observed across OpenCode versions.
-        const nested = part.tool;
-        if (nested && typeof nested === 'object') {
-            const nestedName = typeof nested.name === 'string' ? nested.name.toLowerCase() : '';
-            if (nestedName === 'post_session_message' ||
-                nestedName.endsWith('_post_session_message') ||
-                nestedName.endsWith('/post_session_message')) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-function rememberPostedContentHash(hash) {
-    const state = readState();
-    if (!state)
-        return;
-    const prev = state.recentPostedContentHashes ?? [];
-    if (prev.includes(hash))
-        return;
-    patchState({
-        recentPostedContentHashes: [...prev, hash].slice(-40),
-    });
-}
-/**
- * Record a successful model-initiated `post_session_message` so the auto-mirror
- * skips the same body. Wired from `tool.execute.after` in plugin.ts.
- *
- * Item 5f75c2cb / turn-scoped tool detection: `tool.execute.after` carries no
- * `messageID` (verified against the plugin's own hook signature), so this
- * cannot correlate the call back to a specific OpenCode assistant message —
- * the content-hash remembered below is the mechanical guard for that. This
- * also sets `manualAnswerPostedThisTurn`, a second, message-id-independent
- * guard scoped to "did the model post at all during THIS remote turn" —
- * `mirrorLatestReply` checks both, so a manual post cannot double up with the
- * mirror even in a shape neither the hash nor the tool-part scan catches.
- * Only set while `awaitingRemoteReply`: a manual post during a plain local
- * OpenCode turn (not remote-injected) has no turn to scope it to, and this
- * flag must never suppress an unrelated later remote turn's mirror.
- */
-export function recordManualPostSessionMessage(toolName, args) {
-    const lower = String(toolName ?? '').toLowerCase();
-    if (lower !== 'post_session_message' &&
-        !lower.endsWith('_post_session_message') &&
-        !lower.endsWith('/post_session_message') &&
-        lower !== 'devspec_post_session_message') {
-        return;
-    }
-    const argsObj = (args && typeof args === 'object' ? args : {});
-    const message = typeof argsObj.message === 'string' ? argsObj.message : null;
-    if (!message || !normalizePostedContent(message)) {
-        logPoll(`recordManualPostSessionMessage: model called post_session_message with an empty/whitespace ` +
-            `message — nothing to dedup, not recording a hash`);
-        return;
-    }
-    const hash = hashPostedContent(message);
-    rememberPostedContentHash(hash);
-    const state = readState();
-    if (state?.awaitingRemoteReply && !state.manualAnswerPostedThisTurn) {
-        patchState({ manualAnswerPostedThisTurn: true });
-    }
-    logPoll(`recordManualPostSessionMessage: remembered hash=${hash.slice(0, 8)}… ` +
-        `awaitingRemoteReply=${Boolean(state?.awaitingRemoteReply)}`);
+/** Keep one promptAsync answer correlation active at a time on a connection. */
+export function shouldDeferCanonicalPrompt(opts) {
+    if ((opts.busy || opts.awaitingRemoteReply) && !opts.pendingQuestionRequestId)
+        return true;
+    return shouldDeferInjectDuringConnect(opts);
 }
 /**
  * Spill an oversize attachment to ~/.devspec/opencode-remote-control/attachments/
@@ -1074,7 +1000,7 @@ export async function checkBusyStall(client, directory, sessionId) {
     // a freshly-injected turn's stall check could see the PRE-inject assistant's
     // old text — from a completely different, already-answered turn — and report
     // "last assistant has text — not a stall" even though THIS turn had produced
-    // nothing at all yet. Mirrors the same correlation `mirrorLatestReply` uses.
+    // nothing at all yet. This is the inject baseline that scopes the remote turn.
     const baselineDecision = decideAwaitingBaseline({
         baseline: state.replyAfterOpenCodeMessageId ?? null,
         baselineCaptured: state.replyBaselineCaptured,
@@ -1086,7 +1012,6 @@ export async function checkBusyStall(client, directory, sessionId) {
         // to evaluate progress against; recover immediately instead of waiting
         // out the stall timeout on a cursor that can never resolve.
         clearAbandonedInjectCursor(baselineDecision.baseline);
-        clearInjectTurnState({ unclaim: true });
         logPoll(`stall check: abandoned inject cursor (baseline ${baselineDecision.baseline} not in current ` +
             `session) — cleared busy/awaiting immediately`);
         return;
@@ -1239,7 +1164,7 @@ const openCodeBonds = new Map();
  *
  * This is now the ONLY carrier of bond identity — there is no process-global
  * beneath it and no fallback when the store is empty. Ambient async scoping is
- * the right shape for it (every poll, inject and mirror is already one async
+ * the right shape for it (every poll, inject and turn settlement is already one async
  * operation belonging to exactly one bond), but it must be a hard requirement:
  * `undefined` means "nobody said which bond", and the only safe answer to that
  * is to touch nothing.
@@ -1364,7 +1289,7 @@ export function readState() {
  * Full replace of the on-disk state file. Only safe for handshake / clear paths
  * that intentionally own the whole snapshot. Mid-tick poll updates MUST use
  * patchState — a stale `writeState({ ...inMemory })` rolls back concurrent
- * mirror claims (live: session f3af591e double-posted msg_fc80605c).
+ * answer-post claims (live: session f3af591e double-posted msg_fc80605c).
  */
 export function writeState(state) {
     const bond = currentBondSessionId();
@@ -1379,17 +1304,16 @@ export function writeState(state) {
 }
 /**
  * Re-read the on-disk state, merge `patch`, write back. Real bug found
- * live-testing: setBusy(false) on the session.idle path and
- * mirrorLatestReply both did `writeState({ ...staleInMemory, … })`, so
- * whichever finished second rolled back the other's cursor fields —
- * lastMirrored got reset to the previous id and the next poll posted the
- * same reply twice into DevSpec. Always merge onto the latest disk
- * snapshot so concurrent writers only touch their own keys.
+ * live-testing: concurrent turn-settlement writers both used
+ * `writeState({ ...staleInMemory, … })`, so whichever finished second rolled
+ * back the other's cursor fields and the next poll posted the same reply twice.
+ * Always merge onto the latest disk snapshot so concurrent writers only touch
+ * their own keys.
  *
  * Regression (67794386 / f3af591e): pollAndDeliver still used writeState with
- * a stale in-memory spread for cursor / delivered-ids / inject-baseline; the
- * advisory echo of a just-mirrored reply then re-mirrored the same OpenCode
- * message. Every mid-tick persistence must go through this helper.
+ * a stale in-memory spread for cursor / delivered-ids / inject-baseline; an
+ * advisory echo then caused a duplicate answer post. Every mid-tick persistence
+ * must go through this helper.
  */
 export function patchState(patch) {
     const current = readState();
@@ -1480,7 +1404,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
             patchState({
                 connectionId,
                 codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
-                connectMirrorSuppressed: true,
+                connectHandshakePending: true,
             });
         }
         else {
@@ -1488,7 +1412,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
                 connectionId,
                 sessionId: null,
                 codename: typeof result?.codename === 'string' ? result.codename : null,
-                connectMirrorSuppressed: true,
+                connectHandshakePending: true,
             });
         }
         // Sessionless bond. The key does not change when this session later
@@ -1529,7 +1453,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
             connectionId,
             sessionId,
             codename: null,
-            connectMirrorSuppressed: true,
+            connectHandshakePending: true,
         });
     }
     else {
@@ -1538,44 +1462,11 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
             sessionId,
             // First time this bond learns its room: suppress the connect turn's own
             // assistant message, which is chrome for the terminal, not an answer.
-            connectMirrorSuppressed: prior.sessionId ? prior.connectMirrorSuppressed : true,
+            connectHandshakePending: prior.sessionId ? prior.connectHandshakePending : true,
         });
     }
     if (opencodeSessionId)
         rememberOpenCodeBond(opencodeSessionId, sessionId);
-}
-/**
- * Record an OpenCode `command.executed` for `/devspec.remote` /
- * `/devspec.remote-stop` so mirrorLatestReply never posts that assistant turn.
- *
- * While `awaitingRemoteReply` is set, ignore the event: OpenCode has been
- * observed to fire a late `devspec.remote` command.executed against the
- * *post-inject answer* message id (session 8a97effc). Recording that id would
- * poison nonMirrorMessageIds and skip-mirror the real reply.
- */
-export function recordRemoteControlSkillCommand(props) {
-    if (!props)
-        return;
-    if (!isDevspecRemoteControlCommand(props.name))
-        return;
-    const messageId = typeof props.messageID === 'string' ? props.messageID : null;
-    if (!messageId)
-        return;
-    const existing = readState();
-    if (!existing)
-        return;
-    if (existing.awaitingRemoteReply) {
-        logPoll(`recordRemoteControlSkillCommand: ignore id=${messageId} name=${props.name} (awaitingRemoteReply)`);
-        return;
-    }
-    const ids = new Set(existing.nonMirrorMessageIds ?? []);
-    if (ids.has(messageId))
-        return;
-    ids.add(messageId);
-    patchState({
-        nonMirrorMessageIds: Array.from(ids).slice(-50),
-    });
-    logPoll(`recordRemoteControlSkillCommand: skip-mirror id=${messageId} name=${props.name}`);
 }
 /**
  * Register (or resume) THIS OpenCode session as a DevSpec connection.
@@ -1671,7 +1562,7 @@ export async function attachSession(directory, opencodeSessionId, sessionId) {
     const canonicalSessionId = typeof result?.session_id === 'string' ? result.session_id : sessionId;
     // No key flip, so no migration: the same file gains a room.
     runWithBond(opencodeSessionId, () => {
-        patchState({ sessionId: canonicalSessionId, connectMirrorSuppressed: true });
+        patchState({ sessionId: canonicalSessionId, connectHandshakePending: true });
     });
     rememberOpenCodeBond(opencodeSessionId, canonicalSessionId);
 }
@@ -1722,7 +1613,7 @@ export function isTransientMcpGatewayError(err) {
     return /MCP HTTP 50[234]\b/i.test(message) || /\bBad Gateway\b/i.test(message);
 }
 /**
- * Whether a poll failure should be mirrored into the DevSpec room.
+ * Whether a poll failure should be posted into the DevSpec room.
  * Transient 5xx waits until `POLL_ERROR_REPORT_AFTER_TRANSIENT` consecutive
  * failures; everything else reports immediately (still cooldown-deduped).
  */
@@ -2004,7 +1895,7 @@ function playbookRunCommandText(d) {
         : d.permission === 'can_commit'
             ? 'You MAY edit and commit locally, but MUST NOT push.'
             : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.';
-    const runId = typeof d.run_id === 'string' ? d.run_id : String(d.id ?? '');
+    const runId = d.run_id;
     const name = typeof d.playbook_name === 'string' ? d.playbook_name : 'playbook';
     return [
         `▶️ Playbook run dispatched to this connection: "${name}" (run ${runId}).`,
@@ -2286,26 +2177,34 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     const adopt = resolveServerAttachment(state.sessionId, res);
     if (adopt.changed) {
         logPoll(`server attachment ${state.sessionId ?? '(none)'} → ${adopt.sessionId ?? '(none)'}`);
-        // patchState — never writeState a stale full snapshot (mirror claims race).
-        state =
-            patchState({
-                sessionId: adopt.sessionId,
-                lastDeliveredMessageId: null,
-                remoteIngressCursorV2: null,
-                remoteIngressCatchUpCursor: null,
-                remoteDispatchCursor: null,
-                deferredCanonicalCommands: [],
-                deferredCanonicalTransaction: null,
-            }) ?? {
-                ...state,
-                sessionId: adopt.sessionId,
-                lastDeliveredMessageId: null,
-                remoteIngressCursorV2: null,
-                remoteIngressCatchUpCursor: null,
-                remoteDispatchCursor: null,
-                deferredCanonicalCommands: [],
-                deferredCanonicalTransaction: null,
-            };
+        const adoptedRoomState = {
+            sessionId: adopt.sessionId,
+            busy: false,
+            busySince: null,
+            awaitingRemoteReply: false,
+            currentTurnMessageIds: null,
+            currentCommandTurnId: null,
+            currentCommandMessageId: null,
+            answerPostInFlight: false,
+            answerPostCallId: null,
+            answerPostProcessId: null,
+            answerPostedThisTurn: false,
+            activePlaybookRunIds: [],
+            activeTrailMessageId: null,
+            pendingQuestion: null,
+            pendingPermissions: [],
+            permissionAskedPending: false,
+            lastDeliveredMessageId: null,
+            remoteIngressCursorV2: null,
+            remoteIngressCatchUpCursor: null,
+            remoteDispatchCursor: null,
+            deferredCanonicalCommands: [],
+            deferredCanonicalTransaction: null,
+            deferredPlaybookDispatches: [],
+            deferredPlaybookDispatchCursor: null,
+        };
+        // patchState — never writeState a stale full snapshot (answer-post claims race).
+        state = patchState(adoptedRoomState) ?? { ...state, ...adoptedRoomState };
         // Fresh room: drop the cursor and any carried context from the old one, and treat
         // the NEXT poll (cursor:null + catch_up) as the seed. Never consume this hold's
         // package as a completed seed — it was opened under the previous room's cursor,
@@ -2330,18 +2229,20 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         const persistedDeferred = state.deferredCanonicalTransaction;
         const deferredCommands = state.deferredCanonicalCommands ?? [];
         if (persistedDeferred && deferredCommands.length > 0) {
-            const deferInject = shouldDeferInjectDuringConnect({
-                connectMirrorSuppressed: state.connectMirrorSuppressed,
+            const deferInject = shouldDeferCanonicalPrompt({
+                busy: state.busy,
+                connectHandshakePending: state.connectHandshakePending,
                 awaitingRemoteReply: state.awaitingRemoteReply,
+                pendingQuestionRequestId: state.pendingQuestion?.requestId,
             });
-            if (deferInject || pump.acceptingTurn) {
+            if (deferInject || pump.acceptingTurn || pump.acceptingPlaybook) {
                 // Do not accept echoed idle cursors while a command transaction is held.
                 // poll_connection may show the command only once.
                 return { delayMs: 1000, stop: false };
             }
             deferredFollowUpTransaction = freezeCanonicalTurn(structuredClone(persistedDeferred));
         }
-        else {
+        else if ((state.deferredPlaybookDispatches?.length ?? 0) === 0) {
             // Idle responses echo all independent cursors. They contain no turn to accept,
             // so applying them cannot skip work.
             if (typeof res?.cursor_v2 === 'string' && res.cursor_v2)
@@ -2363,12 +2264,22 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     // schedule it before canonical parsing so an unsupported conversation envelope
     // cannot block a valid playbook. Unknown work-shaped dispatches remain inert.
     const offeredDispatches = Array.isArray(res?.dispatches) ? res.dispatches : [];
-    const freshDispatches = offeredDispatches.filter((dispatch) => dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
+    const persistedPlaybookDispatches = state.deferredPlaybookDispatches ?? [];
+    const playbookDispatchesById = new Map();
+    for (const dispatch of [...persistedPlaybookDispatches, ...offeredDispatches]) {
+        if (dispatch &&
+            dispatch.kind === 'playbook_run' &&
+            typeof dispatch.id === 'string' &&
+            typeof dispatch.run_id === 'string' &&
+            dispatch.run_id.length > 0) {
+            playbookDispatchesById.set(dispatch.id, dispatch);
+        }
+    }
+    const freshDispatches = [...playbookDispatchesById.values()].filter((dispatch) => dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
         !pump.deliveredPlaybookDispatchIds.has(dispatch.id) &&
         !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')));
-    const playbookDispatchCursor = typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor
-        ? res.dispatch_cursor
-        : null;
+    const playbookDispatchCursor = state.deferredPlaybookDispatchCursor ??
+        (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor ? res.dispatch_cursor : null);
     const commitPlaybookCursor = () => {
         if (playbookDispatchCursor)
             pump.dispatchCursor = playbookDispatchCursor;
@@ -2376,11 +2287,31 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     };
     if (freshDispatches.length === 0) {
         commitPlaybookCursor();
+        if (persistedPlaybookDispatches.length > 0) {
+            patchState({ deferredPlaybookDispatches: [], deferredPlaybookDispatchCursor: null });
+        }
     }
     else {
+        const playbookBlocked = Boolean(state.busy || state.awaitingRemoteReply || pump.acceptingTurn || pump.acceptingPlaybook);
+        if (playbookBlocked) {
+            patchState({
+                deferredPlaybookDispatches: structuredClone(freshDispatches),
+                deferredPlaybookDispatchCursor: playbookDispatchCursor,
+            });
+            logPoll(`deferring ${freshDispatches.length} playbook dispatch(es) until the active OpenCode turn settles`);
+            return { delayMs: 1000, stop: false };
+        }
         const playbookDispatchIds = freshDispatches.map((dispatch) => dispatch.id);
+        const playbookRunIds = freshDispatches
+            .map((dispatch) => dispatch.run_id)
+            .filter((runId) => typeof runId === 'string' && runId.length > 0);
         const playbookKey = `playbook:${playbookDispatchIds.join(',')}`;
         const playbookAcceptanceStages = () => [
+            acceptanceStage('playbook_active_runs', playbookKey, () => {
+                if (!patchState({ activePlaybookRunIds: playbookRunIds })) {
+                    throw new Error('active playbook run ids were not persisted');
+                }
+            }),
             acceptanceStage('playbook_memory_ids', playbookKey, () => {
                 for (const id of playbookDispatchIds)
                     pump.deliveredPlaybookDispatchIds.add(id);
@@ -2388,6 +2319,8 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             acceptanceStage('playbook_persisted_ids', playbookKey, () => {
                 if (!patchState({
                     deliveredPlaybookDispatchIds: [...pump.deliveredPlaybookDispatchIds].slice(-50),
+                    deferredPlaybookDispatches: [],
+                    deferredPlaybookDispatchCursor: null,
                 })) {
                     throw new Error('delivered playbook ids were not persisted');
                 }
@@ -2401,6 +2334,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             logPoll(`suppressing in-process reoffer of host-accepted playbook ${playbookKey}`);
         }
         else if (!pump.acceptingPlaybook) {
+            patchState({
+                deferredPlaybookDispatches: structuredClone(freshDispatches),
+                deferredPlaybookDispatchCursor: playbookDispatchCursor,
+            });
             pump.acceptingPlaybook = { key: playbookKey, playbookDispatchIds };
             pump.promptTransactions.set(playbookKey, 'pending');
             const playbookCommands = freshDispatches.map((dispatch) => ({
@@ -2563,13 +2500,19 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         commitConversationCursor();
     }
     const roomCommands = canonicalSelection.commands;
-    const deferInject = shouldDeferInjectDuringConnect({
-        connectMirrorSuppressed: state.connectMirrorSuppressed,
+    // A second promptAsync while an answer is still outstanding would overwrite
+    // the connection-scoped command correlation used by the first answer. Queue
+    // follow-ups until that answer settles. A pending question is the exception:
+    // its next owner command is routed to question.reply below, not promptAsync.
+    const deferInject = shouldDeferCanonicalPrompt({
+        busy: state.busy,
+        connectHandshakePending: state.connectHandshakePending,
         awaitingRemoteReply: state.awaitingRemoteReply,
+        pendingQuestionRequestId: state.pendingQuestion?.requestId,
     });
     const handshakeInject = resolveHandshakeInject({
         deferInject,
-        acceptingTurn: Boolean(pump.acceptingTurn),
+        acceptingTurn: Boolean(pump.acceptingTurn || pump.acceptingPlaybook),
         deferred: state.deferredCanonicalCommands,
         incoming: roomCommands,
         deliveredIds,
@@ -2602,7 +2545,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             agent: AGENT_NAME,
             codename: state.codename,
             tool: 'promptAsync',
-            reason: deferInject ? 'connect_handshake' : 'prior_acceptance',
+            reason: state.awaitingRemoteReply ? 'active_turn' : deferInject ? 'connect_handshake' : 'prior_acceptance',
             data: { commands: handshakeInject.nextDeferred.length },
         });
         return { delayMs: 1000, stop: false };
@@ -2620,7 +2563,6 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     if (commands.length === 0) {
         pump.consecutiveEmpty = 0;
         if (roomContext.length > 0 || !parsedIngress.executable || unavailable.length > 0 || canonicalSelection.alreadyDelivered) {
-            await mirrorNow(client, directory, sessionId);
             return { delayMs: 0, stop: false };
         }
         const floor = emptyTurnBackoffMs(++pump.consecutiveEmpty, hold.waitMs);
@@ -2771,20 +2713,9 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         },
     });
     // Assert busy BEFORE returning to the pump so the next poll_connection re-asserts
-    // busy:true. Inject (baseline + promptAsync + mirror) must NOT block presence —
+    // busy:true. Inject (baseline + promptAsync + answer lifecycle) must NOT block presence —
     // awaiting session.messages / kickoff here was starving last_seen (875d75b5).
     await setBusy(directory, true);
-    // Mark awaiting BEFORE fire-and-forget deliverInjectedTurn. Baseline capture
-    // used to set this only after session.messages — during that window a late
-    // command.executed / connect suppress could poison the answer id (b156e680).
-    // Turn-scope the content-hash ring (item 4f9515a4): a prior turn's "7." must
-    // not suppress this turn's identical short answer, or the live Working trail
-    // stays streaming forever with empty content.
-    patchState({
-        awaitingRemoteReply: true,
-        recentPostedContentHashes: [],
-        manualAnswerPostedThisTurn: false,
-    });
     logRemoteControlStory({
         phase: 'pickup',
         outcome: 'started',
@@ -2811,6 +2742,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         fileParts,
         model,
         thinking,
+        answerCorrelation: {
+            turnId: canonicalTurnId,
+            messageId: commandIds[commandIds.length - 1] ?? null,
+        },
         onAccepted: () => {
             finalizeAcceptedPrompt({
                 pump,
@@ -2822,6 +2757,10 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             });
         },
         onRejected: () => {
+            const rejectedState = readState();
+            if (rejectedState?.currentCommandTurnId === canonicalTurnId) {
+                clearInjectTurnState({ unclaim: true });
+            }
             pump.promptTransactions.delete(acceptanceKey);
             if (pump.acceptingTurn?.key === acceptanceKey)
                 pump.acceptingTurn = null;
@@ -2930,10 +2869,16 @@ export async function wipeOpenCodeContextInPlace(input) {
                 // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery
                 // cursors (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room
                 // transcript is not re-injected into the blank chat.
-                lastMirroredMessageId: null,
                 replyAfterOpenCodeMessageId: null,
                 replyBaselineCaptured: undefined,
                 awaitingRemoteReply: false,
+                currentTurnMessageIds: null,
+                currentCommandTurnId: null,
+                currentCommandMessageId: null,
+                answerPostInFlight: false,
+                answerPostCallId: null,
+                answerPostProcessId: null,
+                answerPostedThisTurn: false,
                 pendingQuestion: null,
             });
         }
@@ -3144,7 +3089,7 @@ export async function executeOwnerControlSlash(input) {
  * Presence (`poll_connection`) must keep updating `last_seen` while this runs.
  */
 export async function deliverInjectedTurn(input) {
-    const { client, directory, sessionId, auth, text, fileParts, model, thinking, onAccepted, onRejected, shouldCleanupRejectedTurn, } = input;
+    const { client, directory, sessionId, auth, text, fileParts, model, thinking, answerCorrelation, onAccepted, onRejected, shouldCleanupRejectedTurn, } = input;
     let state = readState();
     let promptAccepted = false;
     if (!state) {
@@ -3152,9 +3097,8 @@ export async function deliverInjectedTurn(input) {
         return;
     }
     try {
-        // Baseline: only mirror assistant messages that appear AFTER the last one present at
-        // inject time. Capture success is tracked separately — a failed snapshot must fail
-        // closed at mirror time, never fall back to "newest in history".
+        // Baseline the assistant history before inject so work-trail and stall checks
+        // cannot accidentally serialize or assess an older local turn.
         let replyAfter = null;
         let baselineCaptured = false;
         try {
@@ -3165,7 +3109,7 @@ export async function deliverInjectedTurn(input) {
             baselineCaptured = true;
         }
         catch (err) {
-            logPoll(`inject: baseline snapshot failed (will fail-closed on mirror): ${err}`);
+            logPoll(`inject: baseline snapshot failed (remote-turn correlation will fail closed): ${err}`);
             baselineCaptured = false;
         }
         // A new turn starts with no bubble of its own: dropping the previous turn's
@@ -3176,24 +3120,15 @@ export async function deliverInjectedTurn(input) {
             lastTrailHash: null,
             lastTrailPostedAt: null,
         };
+        const baselinePatch = {
+            replyAfterOpenCodeMessageId: replyAfter,
+            replyBaselineCaptured: baselineCaptured,
+            ...freshTurnTrail,
+        };
         state =
-            patchState({
-                replyAfterOpenCodeMessageId: replyAfter,
-                replyBaselineCaptured: baselineCaptured,
-                awaitingRemoteReply: true,
-                // Reaffirm turn-scoped hash ring (item 4f9515a4) — inject may have
-                // already cleared it; baseline patch must not reintroduce prior hashes.
-                recentPostedContentHashes: [],
-                manualAnswerPostedThisTurn: false,
-                ...freshTurnTrail,
-            }) ?? {
+            patchState(baselinePatch) ?? {
                 ...state,
-                replyAfterOpenCodeMessageId: replyAfter,
-                replyBaselineCaptured: baselineCaptured,
-                awaitingRemoteReply: true,
-                recentPostedContentHashes: [],
-                manualAnswerPostedThisTurn: false,
-                ...freshTurnTrail,
+                ...baselinePatch,
             };
         const promptResult = await client.session.promptAsync({
             path: { id: sessionId },
@@ -3205,6 +3140,17 @@ export async function deliverInjectedTurn(input) {
         });
         assertSdkAccepted(promptResult, 'promptAsync');
         promptAccepted = true;
+        if (answerCorrelation) {
+            state = patchState({
+                awaitingRemoteReply: true,
+                currentCommandTurnId: answerCorrelation.turnId,
+                currentCommandMessageId: answerCorrelation.messageId,
+                answerPostInFlight: false,
+                answerPostCallId: null,
+                answerPostProcessId: null,
+                answerPostedThisTurn: false,
+            }) ?? state;
+        }
         try {
             onAccepted?.();
         }
@@ -3279,9 +3225,6 @@ export async function deliverInjectedTurn(input) {
         }
         return;
     }
-    // Prefer the guarded path — session.idle / message.updated own the real flush;
-    // this is a best-effort nudge that must not race a bare concurrent mirror.
-    await mirrorNow(client, directory, sessionId);
 }
 export function decideAwaitingBaseline(opts) {
     if (opts.baselineCaptured === false)
@@ -3301,10 +3244,8 @@ export function decideAwaitingBaseline(opts) {
 }
 /**
  * Turn an `AwaitingBaselineDecision` into the assistant messages `checkBusyStall`
- * should evaluate progress against (item 40279ae0). Unlike `mirrorLatestReply`'s
- * own use of the same decision — where several actions must `return` outright
- * (never post an answer without a confident correlation) — stall detection has
- * a safe meaning for "nothing after baseline yet": empty input is exactly what
+ * should evaluate progress against (item 40279ae0). Stall detection has a safe
+ * meaning for "nothing after baseline yet": empty input is exactly what
  * `decideBusyStall` needs to correctly declare `empty_assistant_timeout` for a
  * freshly-injected turn that has produced nothing at all, rather than falling
  * back to whatever a completely unrelated, already-answered turn's last
@@ -3318,8 +3259,8 @@ export function scopeAssistantsAfterBaseline(assistants, decision) {
         case 'all':
         case 'fail_closed_legacy':
             // Legacy state shape (no baseline info at all) — fall back to the whole
-            // history rather than fail closed, which has no safe meaning here the
-            // way it does for mirroring.
+            // history rather than fail closed, which has no safe meaning in this
+            // read-only stall check.
             return assistants;
         case 'wait':
         case 'fail_closed_snapshot':
@@ -3332,123 +3273,20 @@ export function scopeAssistantsAfterBaseline(assistants, decision) {
  * rotate). Returns true when state was cleared.
  */
 export function clearAbandonedInjectCursor(baseline) {
-    logPoll(`mirrorLatestReply: clearing abandoned inject cursor — baseline ${baseline} not in current OpenCode session`);
+    logPoll(`clearing abandoned inject cursor — baseline ${baseline} not in current OpenCode session`);
+    clearInjectTurnState({ unclaim: true });
     const next = patchState({
-        awaitingRemoteReply: false,
-        replyAfterOpenCodeMessageId: null,
-        replyBaselineCaptured: undefined,
         busy: false,
         busySince: null,
     });
     return Boolean(next);
 }
 /**
- * Mirror a finished reply without polling — driven by OpenCode's OWN events.
- *
- * Why this exists: the interval version mirrored replies as a side-effect of its 8s
- * tick. With long-poll a tick happens roughly every 25s, so hanging mirroring off it
- * would have made replies take up to 25s to reach the room — trading delivery latency
- * for reply latency. Instead the pump owns DELIVERY and OpenCode's own message events
- * own MIRRORING, which is both faster than the old 8s floor and free.
- *
- * Cheap-guarded: at most one mirror in flight per directory, and at most one attempt per
- * MIRROR_MIN_GAP_MS, because `message.updated` can fire many times per turn.
- *
- * Settle debounce (item a70cdf78): `message.updated` often fires with the
- * assistant text BEFORE the model finishes a `post_session_message` tool call.
- * Mirroring immediately then double-posts when the tool lands ~1s later.
- * `scheduleMirrorNow` waits MIRROR_SETTLE_MS so `tool.execute.after` can
- * record the manual-post hash first; `session.idle` still flushes immediately.
- */
-const MIRROR_MIN_GAP_MS = 1_500;
-/** Wait after the last message.updated before mirroring — covers tool-call lag. */
-export const MIRROR_SETTLE_MS = 2_000;
-const mirrorGuards = new Map();
-const mirrorSettleTimers = new Map();
-/** In-memory debounce/guard key. The OpenCode session id is already unique. */
-function mirrorGuardKey(sessionId) {
-    return sessionId;
-}
-export async function mirrorNow(client, directory, sessionId, { force = false } = {}) {
-    const bonded = isBondedOpenCodeSession(sessionId);
-    const run = async () => {
-        const auth = resolveDevspecAuth(directory);
-        const state = readState();
-        if (!auth.ok || !auth.token || !auth.mcp_url || !state?.sessionId)
-            return;
-        const key = mirrorGuardKey(sessionId);
-        const guard = mirrorGuards.get(key) ?? { at: 0, inFlight: false };
-        if (guard.inFlight)
-            return;
-        if (!force && Date.now() - guard.at < MIRROR_MIN_GAP_MS)
-            return;
-        guard.inFlight = true;
-        guard.at = Date.now();
-        mirrorGuards.set(key, guard);
-        try {
-            await mirrorLatestReply(client, auth, directory, state, sessionId, { force });
-        }
-        catch (err) {
-            logPoll(`mirrorNow failed: ${err}`);
-        }
-        finally {
-            guard.inFlight = false;
-            mirrorGuards.set(key, guard);
-        }
-    };
-    if (!bonded) {
-        // FAIL CLOSED (item 2a5d212b). `undefined` means this OpenCode session has no
-        // bond — an @explore child, a sibling tab, an ordinary interactive chat that
-        // never ran /devspec.remote. It used to mean "run against whatever the
-        // process-global bind happens to be", and on 2026-08-17 that published an
-        // unbonded child's 3,886-token internal handoff into DevSpec session
-        // 8fd18ec0 under bonded connection 7695c4dc's identity.
-        //
-        // A remote identity speaks only from the session bonded to it. There is
-        // nothing sensible to fall back to here: the whole question this answers is
-        // WHICH room this text belongs in, and an unbonded session has no answer.
-        logPoll(`mirrorNow: opencodeSession=${sessionId} has no bond — inert`);
-        return;
-    }
-    await runWithBondAsync(sessionId, run);
-}
-/**
- * Debounced mirror for `message.updated` — resets on every update so we only
- * run after the turn has gone quiet long enough for a manual post tool to land.
- */
-export function scheduleMirrorNow(client, directory, sessionId) {
-    const key = mirrorGuardKey(sessionId);
-    const prev = mirrorSettleTimers.get(key);
-    if (prev)
-        clearTimeout(prev);
-    const timer = setTimeout(() => {
-        mirrorSettleTimers.delete(key);
-        void mirrorNow(client, directory, sessionId);
-    }, MIRROR_SETTLE_MS);
-    // Don't keep the process alive solely for this timer.
-    if (typeof timer === 'object' && timer && 'unref' in timer) {
-        ;
-        timer.unref();
-    }
-    mirrorSettleTimers.set(key, timer);
-}
-/** Cancel any pending settle timer and mirror immediately (session.idle path). */
-export function flushMirrorNow(client, directory, sessionId) {
-    const key = mirrorGuardKey(sessionId);
-    const prev = mirrorSettleTimers.get(key);
-    if (prev)
-        clearTimeout(prev);
-    mirrorSettleTimers.delete(key);
-    void mirrorNow(client, directory, sessionId, { force: true });
-}
-/**
  * Live work trail (item bfca2495) — publish what this turn has produced SO FAR
  * into DevSpec's streaming bubble, so the room is not blank while OpenCode works.
  *
- * Separate from the mirror on purpose. The mirror is answer-shaped: it fires once
- * per turn, dedups, strips chrome, and closes the turn. The trail is progress-
- * shaped: it fires repeatedly with unfiltered output and closes nothing. They
- * share only the connection and the tool.
+ * The trail is progress-shaped: it fires repeatedly with unfiltered output and
+ * closes nothing. The model-owned answer post closes it.
  *
  * Throttled leading-edge: the first update of a turn goes out immediately, and
  * later ones are spaced by TRAIL_POST_MIN_GAP_MS with a trailing flush scheduled
@@ -3457,9 +3295,12 @@ export function flushMirrorNow(client, directory, sessionId) {
  */
 const trailGuards = new Map();
 const trailTrailingTimers = new Map();
+function trailGuardKey(sessionId) {
+    return sessionId;
+}
 /** Debounced/throttled trail publish for `message.updated`. */
 export function scheduleWorkTrailPost(client, directory, sessionId) {
-    const key = mirrorGuardKey(sessionId);
+    const key = trailGuardKey(sessionId);
     void postWorkTrail(client, directory, sessionId);
     // Whatever arrives during the gap still reaches the room: schedule one trailing
     // publish so the last update before a quiet stretch is never the one dropped.
@@ -3481,7 +3322,7 @@ export function scheduleWorkTrailPost(client, directory, sessionId) {
  * Only while a remote turn is actually in flight (`busy` or `awaitingRemoteReply`):
  * a trail posted outside one would open a streaming bubble that nothing is going
  * to close. Best-effort throughout — a failed trail post must never disturb the
- * turn or the mirror that ends it.
+ * turn or the final post that ends it.
  */
 export async function postWorkTrail(client, directory, sessionId, { force = false, seed = false } = {}) {
     const bonded = isBondedOpenCodeSession(sessionId);
@@ -3494,7 +3335,7 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             return;
         if (!state.busy && !state.awaitingRemoteReply)
             return;
-        const key = mirrorGuardKey(sessionId);
+        const key = trailGuardKey(sessionId);
         const guard = trailGuards.get(key) ?? { inFlight: false, pending: false };
         if (guard.inFlight) {
             // A trailing timer alone is not enough: if it fires while this post is
@@ -3514,8 +3355,8 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             logPoll(`postWorkTrail: client.session.messages failed: ${err}`);
             return;
         }
-        // Same baseline the mirror correlates on: everything after the pre-inject
-        // assistant is this remote turn's work. Without one, only the newest turn.
+        // The inject baseline scopes everything after the pre-inject assistant to
+        // this remote turn's work. Without one, only the newest turn.
         const rawTrail = serializeTurnTrail(messages, {
             afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
         });
@@ -3574,7 +3415,7 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
         }
     };
     if (!bonded) {
-        // FAIL CLOSED (item 2a5d212b) — same rule as mirrorNow above. An unbonded
+        // FAIL CLOSED (item 2a5d212b) — the same bond rule as every remote egress path. An unbonded
         // session's tool calls and reasoning are not a trail of any remote turn, and
         // publishing them under the bonded connection's identity is a leak, not a
         // best effort.
@@ -3588,12 +3429,213 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
  *
  * `mcpToolsCall` unwraps JSON to `{ message_id, … }`; tests and some call
  * sites still pass the raw MCP envelope. Both shapes are accepted.
- * Mirror answer posts MUST require this id before claiming success (item 6990fd9e).
+ * Answer posts require this id before local lifecycle settlement.
  */
 export function extractPostedMessageId(result) {
     const parsed = parsePostedToolJson(result);
     const id = parsed?.message_id;
     return typeof id === 'string' && id ? id : null;
+}
+function isPostSessionMessageToolName(toolName) {
+    const lower = String(toolName ?? '').toLowerCase();
+    return lower === 'post_session_message' ||
+        lower.endsWith('_post_session_message') ||
+        lower.endsWith('/post_session_message');
+}
+function isRecordPlaybookRunToolName(toolName) {
+    const lower = String(toolName ?? '').toLowerCase();
+    return lower === 'record_playbook_run' ||
+        lower.endsWith('_record_playbook_run') ||
+        lower.endsWith('/record_playbook_run');
+}
+/** Reserve the one model-owned answer post allowed for the current OpenCode turn. */
+export function claimAgentAnswerPost(callId) {
+    const state = readState();
+    if (!state?.connectionId) {
+        throw new Error('DevSpec: bonded post_session_message has no current connection');
+    }
+    const currentReservation = state.answerPostInFlight && state.answerPostProcessId === ANSWER_POST_PROCESS_ID;
+    if (currentReservation || state.answerPostedThisTurn) {
+        throw new Error('DevSpec: this OpenCode turn already posted its answer');
+    }
+    const claimed = patchState({
+        answerPostInFlight: true,
+        answerPostCallId: callId,
+        answerPostProcessId: ANSWER_POST_PROCESS_ID,
+    });
+    if (!claimed)
+        throw new Error('DevSpec: could not reserve answer delivery');
+    return claimed;
+}
+/** Release the prior turn's success latch when OpenCode starts a new user turn. */
+export function resetAnswerPostLatchForUserTurn() {
+    const state = readState();
+    if (!state)
+        return;
+    if (state.answerPostInFlight || state.answerPostedThisTurn || state.answerPostCallId) {
+        patchState({
+            answerPostInFlight: false,
+            answerPostedThisTurn: false,
+            answerPostCallId: null,
+            answerPostProcessId: null,
+        });
+    }
+}
+/** Resolve the actual model stamp from the firing OpenCode session, never model-supplied routing. */
+export async function resolveCurrentAssistantModel(client, sessionId, callId) {
+    try {
+        const response = await withTimeout(client.session.messages({ path: { id: sessionId } }), OPENCODE_SESSION_API_TIMEOUT_MS, 'session.messages(answer-model)');
+        const messages = Array.isArray(response?.data)
+            ? response.data
+            : Array.isArray(response)
+                ? response
+                : [];
+        const assistants = messages.filter((message) => message?.info?.role === 'assistant');
+        const firing = assistants.findLast((message) => Array.isArray(message?.parts) && message.parts.some((part) => part?.callID === callId || part?.callId === callId || part?.call?.id === callId));
+        if (!firing) {
+            logPoll(`answer post: no assistant message contains callID=${callId}; model stamp omitted`);
+            return null;
+        }
+        const resolved = resolveOpenCodeAssistantModel(firing);
+        if (resolved.model)
+            return resolved.model;
+        logPoll(`answer post: current model unavailable (${resolved.missingReason ?? 'absent'}) ` +
+            `source=${resolved.source} shape=${resolved.rawSnippet ?? '(none)'}`);
+    }
+    catch (err) {
+        logPoll(`answer post: could not resolve current model: ${err}`);
+    }
+    return null;
+}
+/** Commit local lifecycle only after DevSpec confirms the model-owned answer row. */
+export function settleAgentPostResult(toolName, result, callId) {
+    if (!isPostSessionMessageToolName(toolName))
+        return false;
+    const outer = result && typeof result === 'object' && !Array.isArray(result)
+        ? result
+        : null;
+    const parsed = parsePostedToolJson(result);
+    const failed = outer?.isError === true || outer?.error != null ||
+        parsed?.isError === true || parsed?.ok === false || parsed?.success === false || parsed?.error != null;
+    const messageId = failed ? null : extractPostedMessageId(result);
+    const state = readState();
+    if (!state || state.answerPostCallId !== callId) {
+        logPoll(`settleAgentPostResult: ignoring stale answer result callID=${callId}`);
+        return false;
+    }
+    if (!messageId || !state) {
+        if (state.answerPostInFlight) {
+            patchState({ answerPostInFlight: false, answerPostCallId: null, answerPostProcessId: null });
+        }
+        logPoll('settleAgentPostResult: post failed or carried no message_id; turn remains open');
+        return false;
+    }
+    clearPromptTransactions(state.connectionId);
+    clearInjectTurnState();
+    patchState({
+        busy: false,
+        busySince: null,
+        stallWarnedAt: null,
+        stallProgressAssistantId: null,
+        stallActiveToolSlides: null,
+        stallReasoningFingerprint: null,
+        permissionAskedPending: false,
+        permissionAskedAt: null,
+        pendingPermissions: [],
+        permissionResolutionObserved: false,
+        connectHandshakePending: false,
+        answerPostInFlight: false,
+        answerPostCallId: null,
+        answerPostProcessId: null,
+        answerPostedThisTurn: true,
+    });
+    logPoll(`settleAgentPostResult: model answer committed devspec_message_id=${messageId}`);
+    return true;
+}
+/** A reported playbook outcome is the deterministic terminal boundary for that prompt. */
+export function settlePlaybookRunResult(toolName, result, args) {
+    if (!isRecordPlaybookRunToolName(toolName))
+        return false;
+    const outer = result && typeof result === 'object' && !Array.isArray(result)
+        ? result
+        : null;
+    const parsed = parsePostedToolJson(result);
+    const failed = outer?.isError === true || outer?.error != null ||
+        parsed?.isError === true || parsed?.ok === false || parsed?.success === false || parsed?.error != null;
+    const confirmed = parsed ?? (outer && !Array.isArray(outer.content) && typeof outer.raw !== 'string' ? outer : null);
+    if (failed || !confirmed) {
+        logPoll('settlePlaybookRunResult: result was not confirmed; playbook activity remains open');
+        return false;
+    }
+    const state = readState();
+    if (!state)
+        return false;
+    const input = args && typeof args === 'object' ? args : null;
+    const runId = typeof input?.run_id === 'string' ? input.run_id : null;
+    const activeRunIds = state.activePlaybookRunIds ?? [];
+    if (!runId || !activeRunIds.includes(runId) || state.awaitingRemoteReply || state.currentCommandTurnId) {
+        logPoll(`settlePlaybookRunResult: ignoring unrelated or stale run_id=${runId ?? '(missing)'}`);
+        return false;
+    }
+    const remainingRunIds = activeRunIds.filter((id) => id !== runId);
+    if (remainingRunIds.length > 0) {
+        patchState({ activePlaybookRunIds: remainingRunIds });
+        logPoll(`settlePlaybookRunResult: recorded ${runId}; ${remainingRunIds.length} run(s) remain active`);
+        return true;
+    }
+    clearPromptTransactions(state.connectionId);
+    clearInjectTurnState();
+    patchState({
+        activePlaybookRunIds: [],
+        busy: false,
+        busySince: null,
+        stallWarnedAt: null,
+        stallProgressAssistantId: null,
+        stallActiveToolSlides: null,
+        stallReasoningFingerprint: null,
+    });
+    logPoll('settlePlaybookRunResult: recorded outcome closed local playbook activity');
+    return true;
+}
+/**
+ * Settle an OpenCode idle event without ever reading assistant text. A remote
+ * turn that failed to post gets one bounded mechanical error; an already
+ * settled or handshake/local turn only drops stale local busy state.
+ */
+export async function handleSessionIdle(directory) {
+    const state = readState();
+    if (!state)
+        return;
+    if (state.awaitingRemoteReply && state.currentCommandTurnId && state.currentCommandMessageId) {
+        const auth = resolveDevspecAuth(directory);
+        const errorPosted = await failOpenTrailTurn(auth, state, 'OpenCode finished this remote turn without posting an answer. The command remains pending for retry.');
+        if (!errorPosted) {
+            logPoll('handleSessionIdle: error post failed; preserving command correlation for retry');
+            return;
+        }
+        clearInjectTurnState({ unclaim: true });
+    }
+    const fresh = readState();
+    if (!fresh)
+        return;
+    clearPromptTransactions(fresh.connectionId);
+    patchState({
+        busy: false,
+        busySince: null,
+        stallWarnedAt: null,
+        stallProgressAssistantId: null,
+        stallActiveToolSlides: null,
+        stallReasoningFingerprint: null,
+        permissionAskedPending: false,
+        permissionAskedAt: null,
+        pendingPermissions: [],
+        permissionResolutionObserved: false,
+        connectHandshakePending: false,
+        answerPostInFlight: false,
+        answerPostCallId: null,
+        answerPostProcessId: null,
+        answerPostedThisTurn: false,
+    });
 }
 /** Whether `phase:'error'|'answer'` actually closed a server-open trail turn. */
 export function extractClosedTrailTurn(result) {
@@ -3676,10 +3718,12 @@ export function clearInjectTurnState(opts = {}) {
         replyAfterOpenCodeMessageId: null,
         replyBaselineCaptured: undefined,
         currentTurnMessageIds: null,
-        manualAnswerPostedThisTurn: false,
-        // Hashes are turn-scoped (item 4f9515a4) — drop them with the rest of the
-        // inject-turn correlation so the next remote turn starts clean.
-        recentPostedContentHashes: [],
+        currentCommandTurnId: null,
+        currentCommandMessageId: null,
+        answerPostInFlight: false,
+        answerPostCallId: null,
+        answerPostProcessId: null,
+        answerPostedThisTurn: false,
         activeTrailMessageId: null,
         lastTrailHash: null,
         lastTrailPostedAt: null,
@@ -3706,8 +3750,8 @@ function clearTrailState() {
  * This is the whole reason the plugin tracks an open turn at all: a stall, a
  * `session.error`, or an agent that simply dies would otherwise leave a bubble
  * streaming for ever, which reads as "still working" to whoever is watching.
- * Returns true when it closed a server-open turn, so callers can fall back to a
- * plain notice when there was no live bubble to fail in the first place.
+ * Returns true when DevSpec confirms an error row. The server may close an
+ * existing trail row or insert a standalone error when no trail opened.
  *
  * Do NOT gate on local `activeTrailMessageId`. The server owns the open-turn
  * pointer (`agent_connections.active_turn_message_id`); a trail may have opened
@@ -3726,7 +3770,19 @@ async function failOpenTrailTurn(auth, state, reason) {
             mcpUrl: auth.mcp_url,
             token: auth.token,
             name: 'post_session_message',
-            arguments: postMessageArgs(state, reason, { turn_kind: 'agent', phase: 'error' }),
+            arguments: {
+                ...postMessageArgs(state, reason, {
+                    turn_kind: 'agent',
+                    phase: 'error',
+                    complete_turn: true,
+                }),
+                ...(state.currentCommandTurnId && state.currentCommandMessageId
+                    ? {
+                        command_turn_id: state.currentCommandTurnId,
+                        command_message_id: state.currentCommandMessageId,
+                    }
+                    : { command_turn_unbound: true }),
+            },
             timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
         });
     }
@@ -3734,20 +3790,12 @@ async function failOpenTrailTurn(auth, state, reason) {
         logPoll(`failOpenTrailTurn: post_session_message(phase=error) failed: ${err}`);
         return false;
     }
-    const closed = extractClosedTrailTurn(result);
-    if (!closed) {
-        // Server had no open trail turn — leave the fallback notice path alone.
-        // Item 40279ae0: also clear the broader inject-turn state (not just the
-        // trail pointers) here — this "abandon" branch still means the turn is
-        // over from this connection's point of view. Callers that know the end
-        // was ABNORMAL (checkBusyStall, handleSessionError) additionally unclaim
-        // this turn's ids at their own call site right after this returns.
-        clearInjectTurnState();
+    const messageId = extractPostedMessageId(result);
+    if (!messageId)
         return false;
-    }
-    const messageId = extractPostedMessageId(result) ?? state.activeTrailMessageId ?? null;
+    const closed = extractClosedTrailTurn(result);
     logRemoteControlStory({
-        phase: 'mirror_post',
+        phase: 'complete_turn',
         outcome: 'failed_turn',
         connectionId: state.connectionId,
         sessionId: state.sessionId,
@@ -3755,452 +3803,7 @@ async function failOpenTrailTurn(auth, state, reason) {
         codename: state.codename,
         tool: 'post_session_message',
         reason: 'work_trail_error',
-        data: { message_id: messageId, phase: 'error' },
+        data: { message_id: messageId, phase: 'error', closed_trail_turn: closed },
     });
-    // Item 40279ae0: same reasoning as the abandon branch above — a closed
-    // trail turn means this connection's remote turn is over.
-    clearInjectTurnState();
     return true;
-}
-/**
- * Mirror a completed OpenCode assistant reply into the attached DevSpec session.
- *
- * OpenCode has no separate skill post path — this plugin *is* the agent writer.
- * Rules (ADR b98a39a9 clean cut):
- * - Sessionless: never post chat; separately accepted playbook runs report via
- *   record_playbook_run.
- * - Prefer connection_id (server resolves current attachment).
- * - After a remote inject, only mirror assistants newer than the pre-inject baseline
- *   so an unrelated older local answer is not re-posted.
- * - turn_kind: agent.
- */
-async function mirrorLatestReply(client, auth, directory, state, sessionId, opts = {}) {
-    // Sessionless: no room. connection_id without attachment would be rejected server-side.
-    if (!auth.ok || !auth.token || !auth.mcp_url || !state.sessionId || !state.connectionId)
-        return;
-    let messages;
-    try {
-        const res = await client.session.messages({ path: { id: sessionId } });
-        messages = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : [];
-    }
-    catch (err) {
-        logPoll(`mirrorLatestReply: client.session.messages failed: ${err}`);
-        return;
-    }
-    const assistantMessages = messages.filter((m) => m?.info?.role === 'assistant');
-    // Always re-read disk before the dedup decision — a concurrent setBusy /
-    // prior mirror may have advanced the cursor since `state` was snapshotted
-    // at the top of pollAndDeliver.
-    const fresh = readState() ?? state;
-    const alreadyMirrored = new Set(fresh.mirroredMessageIds ?? []);
-    const baseline = fresh.replyAfterOpenCodeMessageId ?? null;
-    const baselineCaptured = fresh.replyBaselineCaptured;
-    // When awaiting a remote reply: correlate to pre-inject baseline. Fail closed
-    // if the baseline snapshot failed; clear an abandoned cursor when the
-    // baseline id vanished (OpenCode session rotated — 8d0f1726).
-    let candidates = assistantMessages;
-    if (fresh.awaitingRemoteReply) {
-        const decision = decideAwaitingBaseline({
-            baseline,
-            baselineCaptured,
-            assistantIds: assistantMessages.map((m) => m?.info?.id).filter(Boolean),
-        });
-        if (decision.action === 'fail_closed_snapshot') {
-            logPoll('mirrorLatestReply: FAIL CLOSED — awaiting remote reply but baseline snapshot failed at inject');
-            return;
-        }
-        if (decision.action === 'clear_abandoned') {
-            clearAbandonedInjectCursor(decision.baseline);
-            // Item 40279ae0: an abandoned cursor is an abnormal end for whatever
-            // command(s) this turn claimed — unclaim them so they can re-inject
-            // against the (now current) OpenCode session instead of being
-            // silently swallowed forever by the delivery dedup set.
-            clearInjectTurnState({ unclaim: true });
-            await setBusy(directory, false);
-            return;
-        }
-        if (decision.action === 'wait') {
-            logPoll(`mirrorLatestReply: still waiting for assistant after baseline ${decision.baseline}`);
-            return;
-        }
-        if (decision.action === 'slice') {
-            candidates = assistantMessages.slice(decision.fromIndex);
-        }
-        else if (decision.action === 'all') {
-            candidates = assistantMessages;
-        }
-        else {
-            logPoll('mirrorLatestReply: FAIL CLOSED — awaiting remote reply with null baseline and unknown capture status');
-            return;
-        }
-    }
-    const last = candidates[candidates.length - 1];
-    logPoll(`mirrorLatestReply: ${assistantMessages.length} assistant messages, candidates=${candidates.length}, ` +
-        `last.id=${last?.info?.id}, lastMirrored=${fresh.lastMirroredMessageId}, ` +
-        `awaiting=${fresh.awaitingRemoteReply} baseline=${baseline} captured=${baselineCaptured}`);
-    if (!last?.info?.id || last.info.id === fresh.lastMirroredMessageId || alreadyMirrored.has(last.info.id)) {
-        logPoll(`mirrorLatestReply: skip (already mirrored or no last message)`);
-        return;
-    }
-    // When not awaiting a remote reply, still allow local-terminal answers while
-    // attached — but never re-post something older than lastMirrored (handled above).
-    // No answer-path narration mid-turn (item d4b8adcb): `message.updated` fires
-    // repeatedly while a turn is still running, and can land while `last` still
-    // has an in-flight tool part. Posting it now would mirror half-finished
-    // work as if it were the model's final answer — the room reads intermediate
-    // narration as done. The live trail is built for exactly this progress
-    // view; defer to it and let the turn actually finish.
-    //
-    // `opts.force` (session.idle's flushMirrorNow) always bypasses this: that
-    // event is OpenCode's own authoritative "this turn is over" signal, and
-    // trusting it unconditionally is what keeps this deadlock-free. Without the
-    // bypass, a tool whose status field never updates after session.idle fires
-    // would leave the connection stuck at busy:false forever with no answer
-    // ever posted and no stall recovery — checkBusyStall only runs while
-    // busy:true (see pollAndDeliver's turnActive gate), so nothing would ever
-    // re-check `last` again. A non-forced skip here is always safe to retry:
-    // either a later message.updated re-triggers the debounced mirror once the
-    // tool genuinely finishes, or session.idle forces it through regardless.
-    if (!opts.force && messageHasActiveToolWork(last)) {
-        logPoll(`mirrorLatestReply: skip (active tool work, mid-turn) last.id=${last.info.id} — ` +
-            `trail covers this; waiting for quiescence or session.idle`);
-        return;
-    }
-    // ---- The only egress gate: what the turn DID, never what it said ---------
-    //
-    // A turn that performed the DevSpec connect handshake is the plugin's own
-    // protocol and produces no room post. That fact is observed from the tool
-    // calls the turn made (`tool.execute.after` sees register/attach mid-turn),
-    // so there is nothing here to infer from the model's prose and no override
-    // to fall through — the previous version peeked at the text, decided "Done."
-    // looked like a real answer, and published it into a room the conversation
-    // had never chosen.
-    //
-    // Everything else posts: an answer to a delivered owner command, and an
-    // ordinary local turn in an attached chat (the room is a shared transcript).
-    // The model's words go through verbatim, exactly as the work trail already
-    // does — chrome filtering is what this deletes, not a thing it preserves.
-    //
-    // `awaitingRemoteReply` exempts a turn that is answering a delivered owner
-    // command: a stale handshake flag must never swallow a real answer. That was
-    // the structural half of the old check and it is kept — b156e680 needed a
-    // text override only because `command.executed` could tag a LATER turn's
-    // message id, which marking at tool-call time no longer does.
-    const isHandshakeTurn = !fresh.awaitingRemoteReply &&
-        (Boolean(fresh.connectMirrorSuppressed) ||
-            (fresh.nonMirrorMessageIds ?? []).includes(last.info.id));
-    if (isHandshakeTurn) {
-        logPoll(`mirrorLatestReply: skip (connect handshake turn) last.id=${last.info.id} — ` +
-            `this turn ran the DevSpec handshake, so it has no answer to post`);
-        logRemoteControlStory({
-            phase: 'mirror_decision',
-            outcome: 'skip',
-            connectionId: fresh.connectionId,
-            sessionId: fresh.sessionId,
-            agent: AGENT_NAME,
-            codename: fresh.codename,
-            tool: 'mirrorLatestReply',
-            reason: 'connect_turn_suppress',
-            data: { message_id: last.info.id },
-        });
-        alreadyMirrored.add(last.info.id);
-        patchState({
-            lastMirroredMessageId: last.info.id,
-            mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-            connectMirrorSuppressed: false,
-            replyAfterOpenCodeMessageId: null,
-            replyBaselineCaptured: undefined,
-            currentTurnMessageIds: null,
-            manualAnswerPostedThisTurn: false,
-        });
-        await setBusy(directory, false);
-        return;
-    }
-    const text = assistantTextFromMessage(last);
-    if (!text) {
-        logPoll(`mirrorLatestReply: last.id=${last.info.id} has no text yet, not persisting — will recheck`);
-        // Real bug found live-testing: a message can be checked WHILE STILL
-        // STREAMING (no text parts yet) — marking it "mirrored" here (as this
-        // code used to) meant it was permanently skipped even once it finished
-        // streaming with real text moments later, since the dedup check above
-        // only compares message IDs, not content. Confirmed live: a genuine
-        // answer to a plain question never made it to DevSpec at all because an
-        // earlier poll caught it empty and marked it done first. Do NOT persist
-        // here — leave last.info.id unrecorded so the next poll re-evaluates
-        // this same message once it (likely) has text. A message that is
-        // permanently textless (a real pure-tool-call turn) is harmless to
-        // recheck: `last` moves on naturally once a newer message exists.
-        // Stall detection for long-lived empty text lives in checkBusyStall.
-        return;
-    }
-    // The model's words, verbatim. `prepareMirrorText` used to classify text here
-    // — stripping a pasted banner, returning null for anything it judged to be
-    // "pure chrome" — because the connect turn had no other channel and its
-    // status block would otherwise land in the room as an answer. The handshake
-    // turn is now excluded structurally above, so there is nothing left for a
-    // classifier to catch, and the work trail already sets the precedent of
-    // keeping assistant text exactly as written.
-    const preparedText = collapseOrphanMarkdownFences(unwrapSingleOuterMarkdownFence(text.trim()));
-    // Nothing to post is not a judgement about content — it is the absence of
-    // any. A textless turn (pure tool calls) still has to settle, or the room
-    // sits at "working…" for ever.
-    if (!preparedText || !preparedText.trim()) {
-        logPoll(`mirrorLatestReply: skip (turn produced no text) last.id=${last.info.id}`);
-        logRemoteControlStory({
-            phase: 'mirror_decision',
-            outcome: 'skip',
-            connectionId: fresh.connectionId,
-            sessionId: fresh.sessionId,
-            agent: AGENT_NAME,
-            codename: fresh.codename,
-            tool: 'mirrorLatestReply',
-            reason: 'no_text',
-            data: { message_id: last.info.id },
-        });
-        // A live trail bubble opened by this turn would otherwise stream for ever:
-        // the answer that closes it is never coming, because there wasn't one. Fail
-        // it so the room shows a finished turn that produced no reply, with the work
-        // still readable, rather than a permanent "working…". Always attempt — the
-        // server owns the open-turn pointer, not local activeTrailMessageId.
-        await failOpenTrailTurn(auth, fresh, '⚠️ The remote agent finished this turn without an answer — only operational output. The work above is what it did.');
-        alreadyMirrored.add(last.info.id);
-        patchState({
-            lastMirroredMessageId: last.info.id,
-            mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-            awaitingRemoteReply: false,
-            replyAfterOpenCodeMessageId: null,
-            replyBaselineCaptured: undefined,
-            currentTurnMessageIds: null,
-            manualAnswerPostedThisTurn: false,
-        });
-        await setBusy(directory, false);
-        return;
-    }
-    // Mechanical double-post guard (a70cdf78, hardened for 5f75c2cb): if the
-    // model already called post_session_message for this turn, claim the
-    // OpenCode message id and do NOT post again. Three independent signals,
-    // because no single one covers every shape observed live:
-    // - content hash: the exact same body was already posted (manual or mirror).
-    // - tool-part scan across every post-inject candidate (not just `last`) —
-    //   the model may have called post_session_message from an EARLIER
-    //   assistant message in this turn and then kept working, ending on a
-    //   `last` with no tool part of its own.
-    // - `manualAnswerPostedThisTurn`: message-id-independent — set the instant
-    //   `tool.execute.after` observes the call (see recordManualPostSessionMessage),
-    //   so it also catches a shape neither the hash nor the tool-part scan sees.
-    const contentHash = hashPostedContent(preparedText);
-    const alreadyPostedByHash = (fresh.recentPostedContentHashes ?? []).includes(contentHash);
-    const alreadyPostedByTool = candidates.some((m) => messageHasPostSessionMessageTool(m));
-    const alreadyPostedManually = Boolean(fresh.manualAnswerPostedThisTurn);
-    // Hash-only hits must NOT skip while a live trail is still open (item 4f9515a4).
-    // Cross-turn identical short answers used to hash-skip here and leave
-    // response_status=streaming forever; tool/manual posts already closed the
-    // trail server-side, so those skips remain safe.
-    const hashSkipWouldOrphanTrail = alreadyPostedByHash &&
-        !alreadyPostedByTool &&
-        !alreadyPostedManually &&
-        Boolean(fresh.activeTrailMessageId);
-    if (hashSkipWouldOrphanTrail) {
-        logPoll(`mirrorLatestReply: content-hash hit but trail ${fresh.activeTrailMessageId} still open — ` +
-            `posting phase=answer anyway (last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…)`);
-    }
-    if ((alreadyPostedByHash || alreadyPostedByTool || alreadyPostedManually) &&
-        !hashSkipWouldOrphanTrail) {
-        const via = alreadyPostedByTool ? 'tool' : alreadyPostedManually ? 'manual-flag' : 'content-hash';
-        logPoll(`mirrorLatestReply: skip (already posted via ${via}) ` +
-            `last.id=${last.info.id} hash=${contentHash.slice(0, 8)}…`);
-        logRemoteControlStory({
-            phase: 'mirror_decision',
-            outcome: 'skip',
-            connectionId: fresh.connectionId,
-            sessionId: fresh.sessionId,
-            agent: AGENT_NAME,
-            codename: fresh.codename,
-            tool: 'mirrorLatestReply',
-            reason: via === 'tool' ? 'already_posted_tool' : via === 'manual-flag' ? 'already_posted_manual_flag' : 'already_posted_hash',
-            data: { message_id: last.info.id },
-        });
-        alreadyMirrored.add(last.info.id);
-        patchState({
-            lastMirroredMessageId: last.info.id,
-            mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-            awaitingRemoteReply: false,
-            replyAfterOpenCodeMessageId: null,
-            replyBaselineCaptured: undefined,
-            currentTurnMessageIds: null,
-            manualAnswerPostedThisTurn: false,
-            recentPostedContentHashes: (fresh.recentPostedContentHashes ?? []).includes(contentHash)
-                ? fresh.recentPostedContentHashes
-                : [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
-            // The model's own post already closed any open trail turn server-side
-            // (a phase-less post takes the answer path) — just drop the local pointer.
-            activeTrailMessageId: null,
-            lastTrailHash: null,
-            lastTrailPostedAt: null,
-        });
-        await setBusy(directory, false);
-        return;
-    }
-    // Optimistic claim BEFORE the network post — closes the race where two
-    // concurrent poll/idle paths both pass the dedup check, both post, then
-    // both write. Whichever claims second sees the id already in the set and
-    // skips. If the post fails we roll the claim back so a later poll can retry.
-    alreadyMirrored.add(last.info.id);
-    const claimed = patchState({
-        lastMirroredMessageId: last.info.id,
-        mirroredMessageIds: Array.from(alreadyMirrored).slice(-50),
-        awaitingRemoteReply: false,
-        replyAfterOpenCodeMessageId: null,
-        replyBaselineCaptured: undefined,
-        currentTurnMessageIds: null,
-        manualAnswerPostedThisTurn: false,
-        // A successful real mirror means the connect handshake is over.
-        connectMirrorSuppressed: false,
-        // Claim the content hash too so a racing manual post that lands during
-        // our network round-trip is remembered, and a second mirror path skips.
-        recentPostedContentHashes: [...(fresh.recentPostedContentHashes ?? []), contentHash].slice(-40),
-    });
-    if (!claimed)
-        return;
-    // Another writer may have claimed the same id between our check and patch
-    // if we lost a race on lastMirrored — re-check isn't perfect without a
-    // lock, but the set membership after merge is enough when both use patchState.
-    const modelExtract = resolveOpenCodeAssistantModel(last);
-    const model = modelExtract.model;
-    if (!model) {
-        // Never silent — DevSpec has no record of which model answered when the
-        // stamp is dropped (Obsidian Gecko RCA / Restless Ocelot).
-        const shape = modelExtract.rawSnippet ??
-            summarizeModelShapeSnippet(last.info);
-        logPoll(`mirrorLatestReply: model stamp missing (${modelExtract.missingReason ?? 'absent'}) ` +
-            `last.id=${last.info.id} source=${modelExtract.source} shape=${shape}`);
-        logRemoteControlStory({
-            phase: 'mirror_post',
-            outcome: 'model_missing',
-            connectionId: fresh.connectionId,
-            sessionId: fresh.sessionId,
-            agent: AGENT_NAME,
-            codename: fresh.codename,
-            tool: 'post_session_message',
-            reason: modelExtract.missingReason ?? 'absent',
-            data: {
-                message_id: last.info.id,
-                model_shape: shape,
-                source: modelExtract.source,
-            },
-        });
-    }
-    // phase:'answer' closes the live work-trail bubble this turn has been growing
-    // (item bfca2495) by writing the chrome-filtered answer into the SAME row,
-    // instead of leaving it streaming under a second, duplicate message. With no
-    // open trail turn the server falls back to the historical insert, so every
-    // mirror can take this path unconditionally. complete_turn rides along so the
-    // Working dots clear with the bubble rather than one report_complete later.
-    let postedDevspecMessageId = null;
-    try {
-        const result = await mcpToolsCall({
-            mcpUrl: auth.mcp_url,
-            token: auth.token,
-            name: 'post_session_message',
-            arguments: postMessageArgs(fresh, preparedText, {
-                turn_kind: 'agent',
-                model,
-                phase: 'answer',
-                complete_turn: true,
-            }),
-            timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
-        });
-        // Item 6990fd9e: "no throw" is not success. Live: mcpToolsCall returned
-        // without throwing, we logged posted + claimed the OpenCode id, but no
-        // session_messages row existed. Require a DevSpec message_id before keeping
-        // the optimistic claim.
-        postedDevspecMessageId = extractPostedMessageId(result);
-        if (!postedDevspecMessageId) {
-            throw new Error('post_session_message returned without message_id — refusing silent mirror success');
-        }
-    }
-    catch (err) {
-        // Roll back the optimistic claim so this reply can be retried.
-        const ids = (readState()?.mirroredMessageIds ?? []).filter((id) => id !== last.info.id);
-        const hashes = (readState()?.recentPostedContentHashes ?? []).filter((h) => h !== contentHash);
-        patchState({
-            lastMirroredMessageId: fresh.lastMirroredMessageId ?? null,
-            mirroredMessageIds: ids,
-            awaitingRemoteReply: fresh.awaitingRemoteReply ?? false,
-            replyAfterOpenCodeMessageId: fresh.replyAfterOpenCodeMessageId ?? null,
-            replyBaselineCaptured: fresh.replyBaselineCaptured,
-            currentTurnMessageIds: fresh.currentTurnMessageIds ?? null,
-            manualAnswerPostedThisTurn: fresh.manualAnswerPostedThisTurn ?? false,
-            recentPostedContentHashes: hashes,
-        });
-        logPoll(`mirrorLatestReply: post_session_message failed for last.id=${last.info.id}: ${err}`);
-        logRemoteControlStory({
-            phase: 'mirror_post',
-            outcome: 'failed',
-            connectionId: fresh.connectionId,
-            sessionId: fresh.sessionId,
-            agent: AGENT_NAME,
-            codename: fresh.codename,
-            tool: 'post_session_message',
-            reason: 'post_failed',
-            data: {
-                message_id: last.info.id,
-                error: err instanceof Error ? err.message : String(err),
-                ...modelStoryData(model),
-            },
-        });
-        return;
-    }
-    // Answer landed: the trail turn is closed server-side, so this connection has
-    // no open bubble any more. Clearing the pointer is what lets the NEXT turn open
-    // a fresh one instead of appending to a turn that already has an answer.
-    clearTrailState();
-    logPoll(`mirrorLatestReply: posted last.id=${last.info.id} via connection_id` +
-        ` devspec_message_id=${postedDevspecMessageId}` +
-        (model ? ` model=${model.providerID}/${model.modelID}` : ' model=(none)'));
-    logRemoteControlStory({
-        phase: 'mirror_post',
-        outcome: 'posted',
-        connectionId: fresh.connectionId,
-        sessionId: fresh.sessionId,
-        agent: AGENT_NAME,
-        codename: fresh.codename,
-        tool: 'post_session_message',
-        reason: 'plugin_mirror',
-        data: {
-            message_id: last.info.id,
-            devspec_message_id: postedDevspecMessageId,
-            ...modelStoryData(model),
-            model_stamped: Boolean(model),
-        },
-    });
-    logRemoteControlStory({
-        phase: 'done',
-        outcome: model ? 'mirrored' : 'mirrored_without_model',
-        connectionId: fresh.connectionId,
-        sessionId: fresh.sessionId,
-        agent: AGENT_NAME,
-        codename: fresh.codename,
-        tool: 'post_session_message',
-        reason: 'plugin_mirror',
-        data: {
-            message_id: last.info.id,
-            devspec_message_id: postedDevspecMessageId,
-            ...modelStoryData(model),
-            model_stamped: Boolean(model),
-        },
-    });
-    // Real bug found live-testing: `session.idle` — the event the busy:false
-    // transition was gated on — never fires even once in practice (confirmed
-    // by logging every single event type received over a full connect +
-    // multiple turns: session.created/updated/status/diff, message.updated,
-    // message.part.updated/delta — never session.idle). That left busy stuck
-    // true forever after the first delivered message, exactly matching a
-    // live report of the "OpenCode is working…" indicator never turning off.
-    // A completed reply with real text (this point, right after successfully
-    // posting one) is the clearest signal actually available that a turn
-    // just finished — use it instead of the dead event.
-    // (Later live runs DID see session.idle fire — keep both paths; setBusy
-    // is idempotent when already false.)
-    await setBusy(directory, false);
 }

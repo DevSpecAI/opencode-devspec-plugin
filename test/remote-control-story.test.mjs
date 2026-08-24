@@ -20,7 +20,7 @@ describe('REMOTE_CONTROL_STORY_PHASES', () => {
   it('includes shared OpenCode/Cursor/server vocabulary', () => {
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('seed_filter'))
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('inject'))
-    assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('mirror_decision'))
+    assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('answer_post'))
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('poll_error'))
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('stall'))
     assert.ok(REMOTE_CONTROL_STORY_PHASES.includes('wake'))
