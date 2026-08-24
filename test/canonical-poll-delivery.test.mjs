@@ -116,6 +116,12 @@ let abortCalls
 let summarizeCalls
 let reloadCalls
 let controlAckResults
+let questionReplyCalls
+
+function needsInputReplyBody(requestId, answers) {
+  const payload = encodeURIComponent(JSON.stringify({ requestId, answers }))
+  return `answer\n\n<!--devspec-needs-input-reply:${payload}-->`
+}
 
 function clientDouble() {
   return {
@@ -127,6 +133,7 @@ function clientDouble() {
       update: async (args) => { sessionUpdateCalls.push(args); return { data: true } },
     },
     config: { providers: async () => ({ data: { providers: [], default: {} } }) },
+    question: { reply: async (args) => { questionReplyCalls.push(args); return { data: true } } },
     instance: { dispose: async () => { reloadCalls++; return { data: true } } },
     tui: { executeCommand: async () => ({ data: true }) },
   }
@@ -159,6 +166,7 @@ beforeEach(() => {
   summarizeCalls = 0
   reloadCalls = 0
   controlAckResults = []
+  questionReplyCalls = []
   globalThis.fetch = async (_url, init) => {
     const body = JSON.parse(init.body)
     calls.push({
@@ -203,6 +211,82 @@ afterEach(() => {
 })
 
 describe('pollAndDeliver canonical transaction integration', () => {
+  it('delivers only an exact structured reply into the pending OpenCode question', async () => {
+    runWithBond(opencodeSessionId, () => patchState({
+      pendingQuestion: { requestId: 'que_123', questionCount: 2, postedAt: Date.now() },
+      busy: true,
+    }))
+    const cmd = command(message1, 1, provenance1, needsInputReplyBody('que_123', [['A'], ['B', 'Custom']]), true)
+    pollResults.push(changed({ ingress: ingress([cmd]) }))
+
+    await tick()
+
+    assert.deepEqual(questionReplyCalls, [{ requestID: 'que_123', answers: [['A'], ['B', 'Custom']] }])
+    assert.equal(promptCalls.length, 0)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.pendingQuestion ?? null, null)
+    assert.deepEqual(state.deliveredMessageIds, [message1])
+  })
+
+  it('discards a marked reply instead of prompting when no question is pending', async () => {
+    const cmd = command(message1, 1, provenance1, needsInputReplyBody('stale_question', [['A']]), true)
+    pollResults.push(changed({ ingress: ingress([cmd]) }))
+
+    await tick()
+
+    assert.equal(questionReplyCalls.length, 0)
+    assert.equal(promptCalls.length, 0)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredMessageIds, [message1])
+    assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
+  })
+
+  it('defers ordinary commands that share a poll with a question reply', async () => {
+    runWithBond(opencodeSessionId, () => patchState({
+      pendingQuestion: { requestId: 'que_123', questionCount: 1, postedAt: Date.now() },
+      busy: true,
+    }))
+    const reply = command(message1, 1, provenance1, needsInputReplyBody('que_123', [['A']]), true)
+    const followUp = command(message2, 2, provenance2, 'Start another task', false)
+    pollResults.push(changed({ ingress: ingress([reply, followUp]) }))
+
+    await tick()
+
+    assert.equal(questionReplyCalls.length, 1)
+    assert.equal(promptCalls.length, 0)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredMessageIds, [message1])
+    assert.deepEqual(state.deferredCanonicalCommands?.map((row) => row.message_id), [message2])
+    assert.deepEqual(state.deferredCanonicalTransaction?.ingress.command_message_ids, [message2])
+  })
+
+  it('retries local bookkeeping without repeating a host-accepted question reply', async () => {
+    runWithBond(opencodeSessionId, () => patchState({
+      pendingQuestion: { requestId: 'que_123', questionCount: 1, postedAt: Date.now() },
+      busy: true,
+    }))
+    const reply = command(message1, 1, provenance1, needsInputReplyBody('que_123', [['A']]), true)
+    pollResults.push(changed({ ingress: ingress([reply]) }))
+    let failOnce = true
+
+    await tick(clientDouble(), {
+      acceptanceBookkeepingFault: (stage) => {
+        if (stage === 'needs_input_delivered_ids' && failOnce) {
+          failOnce = false
+          throw new Error('synthetic disk fault')
+        }
+      },
+    })
+    assert.equal(questionReplyCalls.length, 1)
+
+    pollResults.push(changed({ changed: false, ingress: ingress() }))
+    await tick()
+
+    assert.equal(questionReplyCalls.length, 1)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredMessageIds, [message1])
+  })
+
   it('keeps live/catch-up cursors and ids uncommitted until promptAsync accepts, then commits each cursor separately', async () => {
     const cmd = command(message1, 1, provenance1, 'full body', true)
     pollResults.push(changed({ ingress: ingress([cmd], { has_more: true, next_cursor: 'older-page', truncated: true, fetch_id: 'fetch-1', omission_reason: 'history_before_window' }) }))

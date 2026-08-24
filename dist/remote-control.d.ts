@@ -373,6 +373,10 @@ export declare function formatQuestionPrompt(props: {
  * open live trail turn. Idempotent on the same request id.
  */
 export declare function handleQuestionAsked(directory: string, props: Record<string, unknown> | null | undefined): Promise<void>;
+export declare function parseNeedsInputReply(content: unknown): {
+    requestId: string;
+    answers: string[][];
+} | null;
 /** Clear a pending question after reply/reject/disconnect. */
 export declare function clearPendingQuestion(): void;
 /**
@@ -382,7 +386,8 @@ export declare function clearPendingQuestion(): void;
 export declare function replyPendingQuestion(input: {
     client: Parameters<Plugin>[0]['client'];
     directory: string;
-    answerText: string;
+    requestId: string;
+    answers: string[][];
 }): Promise<boolean>;
 /**
  * Reject a pending OpenCode question (terminal dismiss / disconnect path).
