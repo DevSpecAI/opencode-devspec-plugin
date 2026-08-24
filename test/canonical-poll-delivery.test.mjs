@@ -6,14 +6,17 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   attachSession,
   bondLocalId,
+  clearInjectTurnState,
   forgetOpenCodeBond,
   forgetPumpState,
   isBondedOpenCodeSession,
+  patchState,
   pollAndDeliver,
   readState,
   rememberOpenCodeBond,
   runWithBond,
   runWithBondAsync,
+  settlePlaybookRunResult,
   writeState,
 } from '../dist/remote-control.js'
 import {
@@ -210,6 +213,8 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
     assert.equal(state.remoteIngressCatchUpCursor ?? null, null)
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
+    assert.equal(state.currentCommandTurnId ?? null, null)
+    assert.equal(state.currentCommandMessageId ?? null, null)
     const rendered = promptCalls[0].body.parts[0].text
     assert.match(rendered, /policy_version=2026-08-21\.1/)
     assert.match(rendered, /returned=1/)
@@ -221,6 +226,8 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.match(rendered, /next_cursor=older-page/)
     assert.match(rendered, /fetch_id=fetch-1/)
     assert.match(rendered, /omission_reason=history_before_window/)
+    assert.match(rendered, /call `post_session_message` exactly once/)
+    assert.match(rendered, /There is no mirror fallback/)
 
     // The serial pump may re-enter before the SDK queue promise settles. The
     // repeated server envelope must not schedule a second promptAsync.
@@ -234,6 +241,9 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
     assert.equal(state.remoteIngressCatchUpCursor, 'older-page')
     assert.deepEqual(state.deliveredMessageIds, [message1])
+    assert.equal(state.currentCommandTurnId, turnId)
+    assert.equal(state.currentCommandMessageId, message1)
+    assert.equal(state.awaitingRemoteReply, true)
 
     pollResults.push({ connection_id: connectionId, session_id: devspecSessionId, changed: false, cursor_v2: 'live-v2-next', dispatch_cursor: 'dispatch-next' })
     await tick()
@@ -259,7 +269,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
       }),
     }))
     let state = runWithBond(opencodeSessionId, () => readState())
-    runWithBond(opencodeSessionId, () => writeState({ ...state, connectMirrorSuppressed: true }))
+    runWithBond(opencodeSessionId, () => writeState({ ...state, connectHandshakePending: true }))
 
     await tick(); await settle()
     state = runWithBond(opencodeSessionId, () => readState())
@@ -270,7 +280,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
 
-    runWithBond(opencodeSessionId, () => writeState({ ...state, connectMirrorSuppressed: false }))
+    runWithBond(opencodeSessionId, () => writeState({ ...state, connectHandshakePending: false }))
     let accept
     promptImpl = () => new Promise((resolve) => { accept = resolve })
     pollResults.push({
@@ -427,6 +437,10 @@ describe('pollAndDeliver canonical transaction integration', () => {
       await settle()
       assert.equal(faulted, true)
       assert.equal(promptCalls.length, index + 1)
+      runWithBond(opencodeSessionId, () => {
+        clearInjectTurnState()
+        patchState({ busy: false, busySince: null })
+      })
 
       pollResults.push(structuredClone(response))
       await tick(); await settle()
@@ -445,7 +459,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     pollResults.push(changed({ cursor_v2: 'later-new-turn', ingress: ingress([next]) }))
     await tick(); await settle()
     assert.equal(promptCalls.length, stages.length + 1, 'later turn remained deferred')
-    const state = runWithBond(opencodeSessionId, () => readState())
+    let state = runWithBond(opencodeSessionId, () => readState())
     assert.ok(state.deliveredMessageIds.includes(next.message_id))
     assert.equal(state.remoteIngressCursorV2, 'later-new-turn')
   })
@@ -476,6 +490,16 @@ describe('pollAndDeliver canonical transaction integration', () => {
       await settle()
       assert.equal(faulted, true)
       assert.equal(promptCalls.length, index + 1)
+      assert.equal(
+        runWithBond(opencodeSessionId, () =>
+          settlePlaybookRunResult(
+            'devspec_record_playbook_run',
+            { status: 'succeeded' },
+            { run_id: `run-${index + 1}` },
+          ),
+        ),
+        true,
+      )
 
       pollResults.push(structuredClone(response))
       await tick(); await settle()
@@ -493,6 +517,10 @@ describe('pollAndDeliver canonical transaction integration', () => {
     pollResults.push(oldResponse)
     await tick()
     assert.equal(promptCalls.length, 1)
+    let pendingState = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(pendingState.busy, true)
+    assert.equal(pendingState.awaitingRemoteReply ?? false, false)
+    assert.equal(pendingState.currentCommandTurnId ?? null, null)
 
     const newRoomId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
     pollResults.push(changed({ session_id: newRoomId, cursor_v2: 'discarded-adopt-cursor' }))
@@ -523,6 +551,9 @@ describe('pollAndDeliver canonical transaction integration', () => {
     state = runWithBond(opencodeSessionId, () => readState())
     assert.equal(state.remoteIngressCursorV2, 'new-room-context-cursor')
     assert.equal((state.deliveredMessageIds ?? []).includes(message1), false)
+    runWithBond(opencodeSessionId, () => clearInjectTurnState())
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.busy, false)
 
     promptImpl = async () => ({ data: true })
     const next = command(message2, 3, provenance2, 'new-room turn', true)
@@ -544,7 +575,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     runWithBond(opencodeSessionId, () => writeState({ connectionId, sessionId: devspecSessionId, codename: 'Otter', busy: false, deliveredMessageIds: [message1] }))
     pollResults.push(changed({ ingress: ingress(commands) }))
     await tick(); await settle()
-    const state = runWithBond(opencodeSessionId, () => readState())
+    let state = runWithBond(opencodeSessionId, () => readState())
     assert.equal(promptCalls.length, 1)
     assert.doesNotMatch(promptCalls[0].body.parts[0].text, /first/)
     assert.match(promptCalls[0].body.parts[0].text, /second/)
@@ -568,6 +599,18 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
   })
 
+  it('consumes a malformed playbook dispatch without injecting or stranding lifecycle state', async () => {
+    pollResults.push(changed({
+      dispatches: [{ id: 'play-without-run-id', kind: 'playbook_run', instruction: 'Must remain inert.' }],
+    }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 0)
+    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.remoteDispatchCursor, 'dispatch-next')
+    assert.deepEqual(state.activePlaybookRunIds ?? [], [])
+    assert.equal(state.busy, false)
+  })
+
   it('keeps simultaneous playbook and command acceptance/failure state independent', async () => {
     const cmd = command(message1, 1, provenance1, 'canonical fails', true)
     pollResults.push(changed({
@@ -578,25 +621,36 @@ describe('pollAndDeliver canonical transaction integration', () => {
       ? { data: true }
       : { error: { message: 'canonical queue failed' } }
     await tick(); await settle()
-    assert.equal(promptCalls.length, 2)
+    assert.equal(promptCalls.length, 1, 'canonical prompt waits for the playbook turn to finish')
     let state = runWithBond(opencodeSessionId, () => readState())
     assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-simultaneous'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
     assert.equal(state.busy, true)
-    assert.equal(state.awaitingRemoteReply, true)
-    assert.equal(state.replyBaselineCaptured, true)
+    assert.equal(state.awaitingRemoteReply ?? false, false, 'the playbook turn owns no conversational answer correlation')
+
+    assert.equal(
+      runWithBond(opencodeSessionId, () =>
+        settlePlaybookRunResult(
+          'devspec_record_playbook_run',
+          { status: 'succeeded' },
+          { run_id: 'run-simultaneous' },
+        ),
+      ),
+      true,
+    )
 
     pollResults.push(changed({ ingress: ingress([cmd]), dispatches: [] }))
     promptImpl = async () => ({ data: true })
     await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
     state = runWithBond(opencodeSessionId, () => readState())
     assert.deepEqual(state.deliveredMessageIds, [message1])
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
   })
 
-  it('preserves accepted canonical busy/reply correlation when simultaneous playbook prompt rejects', async () => {
+  it('retries a rejected playbook before delivering the canonical command', async () => {
     const cmd = command(message1, 1, provenance1, 'canonical succeeds', true)
     pollResults.push(changed({
       ingress: ingress([cmd]),
@@ -606,15 +660,90 @@ describe('pollAndDeliver canonical transaction integration', () => {
       ? { error: { message: 'playbook queue failed' } }
       : { data: true }
     await tick(); await settle()
-    assert.equal(promptCalls.length, 2)
-    const state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(promptCalls.length, 1)
+    let state = runWithBond(opencodeSessionId, () => readState())
     assert.deepEqual(state.deliveredPlaybookDispatchIds ?? [], [])
     assert.equal(state.remoteDispatchCursor ?? null, null)
+    assert.deepEqual(state.deliveredMessageIds ?? [], [])
+    assert.equal(state.remoteIngressCursorV2 ?? null, null)
+    assert.equal(state.busy, false)
+
+    pollResults.push(changed({ ingress: ingress([cmd]), dispatches: [] }))
+    promptImpl = async () => ({ data: true })
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-rejects'])
+    assert.deepEqual(state.deliveredMessageIds ?? [], [])
+
+    assert.equal(
+      runWithBond(opencodeSessionId, () =>
+        settlePlaybookRunResult(
+          'devspec_record_playbook_run',
+          { status: 'succeeded' },
+          { run_id: 'run-rejects' },
+        ),
+      ),
+      true,
+    )
+    state = runWithBond(opencodeSessionId, () => readState())
+    pollResults.push(changed({ ingress: ingress([cmd]), dispatches: [] }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 3)
+    state = runWithBond(opencodeSessionId, () => readState())
     assert.deepEqual(state.deliveredMessageIds, [message1])
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
-    assert.equal(state.busy, true)
     assert.equal(state.awaitingRemoteReply, true)
-    assert.equal(state.replyBaselineCaptured, true)
+  })
+
+  it('persists a playbook arriving during a canonical turn and runs it after settlement', async () => {
+    const cmd = command(message1, 1, provenance1, 'canonical first', true)
+    pollResults.push(changed({ ingress: ingress([cmd]), dispatches: [] }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1)
+    let state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.awaitingRemoteReply, true)
+
+    pollResults.push(changed({
+      ingress: ingress([]),
+      dispatches: [{ id: 'play-after-command', kind: 'playbook_run', run_id: 'run-after-command', instruction: 'Run later.' }],
+    }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1)
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.deferredPlaybookDispatches?.[0]?.id, 'play-after-command')
+    assert.equal(
+      runWithBond(opencodeSessionId, () =>
+        settlePlaybookRunResult(
+          'devspec_record_playbook_run',
+          { status: 'succeeded' },
+          { run_id: 'run-after-command' },
+        ),
+      ),
+      false,
+      'a deferred playbook result cannot settle the active canonical command',
+    )
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(state.awaitingRemoteReply, true)
+
+    runWithBond(opencodeSessionId, () => {
+      clearInjectTurnState()
+      patchState({ busy: false, busySince: null })
+    })
+    pollResults.push({
+      connection_id: connectionId,
+      session_id: devspecSessionId,
+      changed: false,
+      cursor_v2: 'live-v2-next',
+      dispatch_cursor: 'dispatch-next',
+    })
+    await tick(); await settle()
+
+    assert.equal(promptCalls.length, 2)
+    assert.match(promptCalls[1].body.parts[0].text, /claim_playbook_run/)
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-after-command'])
+    assert.deepEqual(state.deferredPlaybookDispatches, [])
   })
 
   it('delivers only explicit playbook_run dispatches through playbook text and advances dispatch_cursor after acceptance', async () => {
@@ -659,8 +788,19 @@ describe('pollAndDeliver canonical transaction integration', () => {
     const text = promptCalls[0].body.parts[0].text
     assert.match(text, /run-new/)
     assert.doesNotMatch(text, /run-legacy|assignment-shaped|Must remain inert/)
-    const state = runWithBond(opencodeSessionId, () => readState())
+    let state = runWithBond(opencodeSessionId, () => readState())
     assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-legacy', 'play-new'])
+    assert.equal(
+      runWithBond(opencodeSessionId, () =>
+        settlePlaybookRunResult(
+          'devspec_record_playbook_run',
+          { status: 'succeeded' },
+          { run_id: 'run-new' },
+        ),
+      ),
+      true,
+    )
+    state = runWithBond(opencodeSessionId, () => readState())
 
     // Once the new field exists it is authoritative; legacy data cannot be
     // reintroduced into the runtime dedupe set.

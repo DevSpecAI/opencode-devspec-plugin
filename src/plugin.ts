@@ -2,7 +2,8 @@ import type { Plugin } from '@opencode-ai/plugin'
 import {
   clearPermissionAsked,
   clearPendingQuestion,
-  flushMirrorNow,
+  claimAgentAnswerPost,
+  handleSessionIdle,
   handleQuestionAsked,
   handleSessionError,
   listOpenCodeBondSessions,
@@ -11,15 +12,17 @@ import {
   postPermissionWaitNotice,
   pollAndDeliver,
   recordConnectionEventFromTool,
-  recordManualPostSessionMessage,
   bondLocalId,
   isBondedOpenCodeSession,
-  recordRemoteControlSkillCommand,
+  readState,
   rejectPendingQuestion,
   runWithBondAsync,
-  scheduleMirrorNow,
+  runWithBond,
+  resolveCurrentAssistantModel,
+  resetAnswerPostLatchForUserTurn,
   scheduleWorkTrailPost,
-  setBusy,
+  settleAgentPostResult,
+  settlePlaybookRunResult,
   shouldAutoAllowRemoteControlPermission,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
@@ -124,16 +127,14 @@ function permissionRequestId(props: Record<string, unknown> | undefined): string
  * `@opencode-ai/plugin`/`@opencode-ai/sdk` type definitions, not assumed
  * from docs.
  *
- * DELIVERY vs MIRRORING (changed in 0.3.0, items c9457ab8 + 807eadcb):
+ * DELIVERY vs ANSWER EGRESS:
  *   - DELIVERY is the long-poll pump below. It no longer depends on any OpenCode
  *     event at all, which matters because `session.idle` was historically observed
  *     never to fire in this host — the old `setInterval` was doing all the work while
  *     being documented as a mere "backstop".
- *   - MIRRORING is driven by OpenCode's own `message.updated` (plus `session.idle`
- *     when it does fire). It used to ride the 8s poll tick; with a ~25s hold that
- *     would have traded delivery latency for reply latency, so the two concerns are
- *     now separate. Later runs DID see `session.idle` fire, so both paths are kept —
- *     `setBusy` and `mirrorNow` are both idempotent.
+ *   - ANSWERS are written by the model through `post_session_message`. The plugin
+ *     binds connection identity and exact command correlation; it never reads an
+ *     assistant message and republishes that text.
  *
  * MULTI-BOND (item 7a9b7b0f): one OpenCode process may host several chat sessions,
  * each `/devspec.remote`-bonded to a different DevSpec room. The pump iterates
@@ -348,33 +349,18 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         runWithBondAsync(sessionId, fn)
 
       if (event.type === 'session.idle') {
-        // Turn finished: clear busy and mirror the reply immediately. Delivery is the
-        // pump's job now, so this no longer needs to poll. Flush any pending settle
-        // timer from message.updated so we do not double-fire after the idle path.
-        await inBond(() => setBusy(directory, false))
-        flushMirrorNow(client, directory, sessionId)
+        await inBond(() => handleSessionIdle(directory))
+      } else if (event.type === 'message.updated' && eventInfo?.role === 'user') {
+        await inBond(async () => resetAnswerPostLatchForUserTurn())
       } else if (event.type === 'message.updated') {
-        // MIRRORING is event-driven now, not a side-effect of the poll tick (see
-        // scheduleMirrorNow). Debounce so a model that still calls
-        // post_session_message (against skill docs) can record its content hash
-        // before we mirror — otherwise text lands first and we double-post.
-        scheduleMirrorNow(client, directory, sessionId)
-        // The live work trail (item bfca2495) rides the SAME event but must not
-        // wait for the mirror's settle debounce: the whole point is that the
-        // room sees progress while the turn is still running, so this publishes
-        // on its own throttle and closes nothing.
+        // The live work trail publishes mechanical progress only. Full answer text
+        // is written exactly once by the model through post_session_message.
         scheduleWorkTrailPost(client, directory, sessionId)
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the
         // type line landed in poll.log and the UI stayed "working…".
         await inBond(() => handleSessionError(directory, event))
-      } else if (event.type === 'command.executed') {
-        // `/devspec.remote` / `/devspec.remote-stop` assistant turns must never
-        // mirror into the room (session e7ecc1de connect-turn race).
-        await inBond(async () => {
-          recordRemoteControlSkillCommand(props ?? null)
-        })
       } else if (isPermissionAskedEvent(event.type)) {
         // A permission wait is not model progress, but the OpenCode turn remains
         // resumable. Keep its activity/correlation intact until the request is
@@ -426,38 +412,35 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
     'tool.execute.before': async (input, output) => {
       provenance.before(input.tool, input.sessionID, output.args, input.callID)
 
-      // ---- Single-writer enforcement (item 4c639620) -------------------------
-      // While this session holds a bond, the plugin owns answer egress, so a
-      // model call to post_session_message is refused before it reaches the
-      // server rather than deduplicated after it lands.
-      //
-      // Prose was not enough. The skill has said "never call this" since
-      // 42391f84, and on 2026-08-17 the model called it anyway at 16:14:56; the
-      // mirror then suppressed ITSELF using a remembered content hash, which is
-      // a second writer racing a first and choosing a winner after the fact
-      // (a70cdf78). Two OpenCode sessions posted contradictory answers under one
-      // connection that way.
-      //
-      // This blocks the MODEL's tool surface only. The plugin's canonical
-      // answer delivery is raw JSON-RPC from this process and never passes
-      // through here. Current work-pull verbs — reserve_work_items,
-      // claim_work_item, record_implementation — and memories remain untouched:
-      // the boundary is answer egress, not the MCP server.
       if (isPostSessionMessageTool(input.tool)) {
         const bonded =
           typeof input.sessionID === 'string' && isBondedOpenCodeSession(input.sessionID)
-        if (bonded) {
-          logPoll(
-            `post_session_message refused for opencodeSession=${input.sessionID} — ` +
-              `plugin owns egress while a bond is active`,
-          )
-          throw new Error(
-            'DevSpec: this OpenCode session is connected to DevSpec, and the plugin posts your ' +
-              'reply for you. Do not call post_session_message — just answer normally in the ' +
-              'terminal and your answer reaches the room verbatim. (Calling it would create a ' +
-              'second, competing writer; see DevSpec item 4c639620.)',
-          )
+        if (!bonded || typeof input.sessionID !== 'string') {
+          throw new Error('DevSpec: post_session_message is unavailable outside this conversation\'s active bond')
         }
+        await runWithBondAsync(input.sessionID, async () => {
+            const state = claimAgentAnswerPost(input.callID)
+            const supplied = output.args && typeof output.args === 'object'
+              ? output.args as Record<string, unknown>
+              : {}
+            const message = supplied.message
+            const model = await resolveCurrentAssistantModel(client, input.sessionID, input.callID)
+            output.args = {
+              message,
+              connection_id: state.connectionId,
+              agent_name: 'OpenCode',
+              turn_kind: 'agent',
+              phase: 'answer',
+              complete_turn: true,
+              ...(model ? { model } : {}),
+              ...(state.awaitingRemoteReply && state.currentCommandTurnId && state.currentCommandMessageId
+                ? {
+                    command_turn_id: state.currentCommandTurnId,
+                    command_message_id: state.currentCommandMessageId,
+                  }
+                : { command_turn_unbound: true }),
+            }
+        })
       }
 
       try {
@@ -499,7 +482,8 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
         // stamp a content hash onto some other session's remote-turn state.
         if (opencodeSessionId && isBondedOpenCodeSession(opencodeSessionId)) {
           await runWithBondAsync(opencodeSessionId, async () => {
-            recordManualPostSessionMessage(input.tool, input.args)
+            settleAgentPostResult(input.tool, output, input.callID)
+            settlePlaybookRunResult(input.tool, output, input.args)
           })
         }
         if ((isRegisterConnectionTool(input.tool) || isAttachConnectionTool(input.tool)) && opencodeSessionId) {

@@ -2,7 +2,7 @@
 /**
  * Live work trail serialization + throttle (DevSpec item bfca2495).
  *
- * The trail is the opposite of the mirror: unfiltered, cumulative, and posted
+ * The trail is unfiltered, cumulative, and posted
  * many times per turn. These cover the three things that would break the feature
  * quietly — losing a tool call to an unfamiliar part shape, republishing an older
  * turn as live work, and turning `message.updated` into an MCP call per token.
@@ -20,9 +20,21 @@ import {
   serializeTurnTrail,
   shouldPostTrail,
 } from '../dist/work-trail.js'
-import { extractPostedMessageId } from '../dist/remote-control.js'
+import {
+  extractPostedMessageId,
+  hashPostedContent,
+  normalizePostedContent,
+} from '../dist/remote-control.js'
 
 const assistant = (id, parts) => ({ info: { id, role: 'assistant' }, parts })
+
+describe('trail content fingerprints', () => {
+  it('normalize CRLF and surrounding whitespace while distinguishing different content', () => {
+    assert.equal(normalizePostedContent('  one\r\ntwo  '), 'one\ntwo')
+    assert.equal(hashPostedContent('one\r\ntwo\n'), hashPostedContent('one\ntwo'))
+    assert.notEqual(hashPostedContent('one'), hashPostedContent('two'))
+  })
+})
 
 describe('serializeTrailPart', () => {
   it('keeps assistant text verbatim (no chrome filtering)', () => {

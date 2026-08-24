@@ -20,7 +20,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 | Identity | `register_connection` → `connection_id` + server-minted `codename`. Fixed `AGENT_NAME` per plugin. |
 | Tick / ingress | Use one held `poll_connection` with numeric `ingress_version: 1` and `delegated_scope_version: 1`. The negotiated wire contract is `devspec://product/remote-ingress-contract`. |
 | Authority, scope, and advisory | Consume canonical `ingress` only for conversation/context; explicit playbook `dispatches[]` remains an independent host workflow with its own cursor. Validate authority/scope fail-closed, render the delegated server instruction verbatim, and do not restate mutable policy here. This is model steering, not a claim of mechanical permission enforcement. |
-| Answers (attached) | Agent (or host bridge) posts **one direct answer** via `post_session_message({ connection_id })`. |
+| Answers (attached) | The agent or its canonical bridge posts **one direct answer** via `post_session_message({ connection_id })`; each host has exactly one full-answer writer. |
 | Answers (sessionless) | No conversational answer path. A separately accepted `playbook_run` reports through `record_playbook_run`; never invent chat. |
 | Activity | `report_pickup` → `report_keepalive` → `report_complete`. Server never infers Working. |
 | Chrome | Connect/status banners are **terminal-only**. Never post them into the session. |
@@ -34,7 +34,7 @@ A **session is optional**. Never invent a session because a cwd or another agent
 |---|---|---|---|
 | **Local-poller** | Claude Code, Cursor, Grok Build, Antigravity | Detached Node poller long-polls DevSpec → writes inbox file → wait process wakes the model. Model posts the reply (skill-driven). | Host-specific. **Cursor:** IDE mid-turn hooks + **CLI transcript watcher** (hooks often skip on Agents `--resume`). |
 | **Bridge** | Codex | Poller + **app-server bridge** injects into the Codex thread via `turn/start`. Bridge posts remote-turn replies. | Bridge/plugin as implemented for that host. |
-| **Native runtime** | OpenCode | In-process TypeScript: self-scheduling held `poll_connection` inside OpenCode → fire-and-forget `promptAsync` inject → plugin mirrors assistant reply (with dedup). **Presence constraint:** the pump must keep returning to `poll_connection` while a turn runs (`last_seen` ≈ 90s); awaiting inject on the critical path caused mid-conversation `idle_timeout`. See `remote-control-opencode.md`. | In-process serialize of the OpenCode turn (`work-trail.ts`) — closest to a live terminal dump; unfiltered by design. |
+| **Native runtime** | OpenCode | In-process TypeScript: self-scheduling held `poll_connection` inside OpenCode → serialized fire-and-forget `promptAsync` inject → model posts one connection-scoped answer while the plugin binds exact routing/correlation. **Presence constraint:** the pump must keep returning to `poll_connection` while a turn runs (`last_seen` ≈ 90s). See `remote-control-opencode.md`. | In-process serialize of the OpenCode turn (`work-trail.ts`) — closest to a live terminal dump; unfiltered by design. |
 
 Same MCP verbs and delivery rules. Different laptop plumbing. **Do not port one family’s wake/inject mechanism onto another without a host reason.**
 
@@ -45,11 +45,11 @@ Same MCP verbs and delivery rules. Different laptop plumbing. **Do not port one 
 3. Host plugin receives it via `poll_connection`.
 4. Host delivers it to the model (wake **or** inject — family-specific).
 5. Model works on the machine.
-6. Reply returns to the DevSpec session (model post **or** bridge/plugin mirror — family-specific).
+6. The host's one canonical answer writer posts into the current DevSpec attachment.
 
 ## What not to break
 
-- Do not reintroduce Stop-hook **full-turn** mirroring as the primary answer path.
+- Do not introduce a second full-answer writer or an assistant-text fallback.
 - Do not copy wake/auth/state files across plugin repos — plugins are independent; no file crosses a repo boundary.
 - Do not treat advisory room traffic as instructions.
 - Do not treat dispatch-shaped data as work-item delivery; only explicit `playbook_run` wakes enter the independent playbook workflow.

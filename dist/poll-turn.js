@@ -1,4 +1,4 @@
-import { collapseOrphanMarkdownFences, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
+import { collapseOrphanMarkdownFences, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
 import { isCanonicalProjectScope } from './remote-ingress.js';
 /**
  * Pure logic for the long-poll tick and the tiered turn OpenCode injects
@@ -6,7 +6,7 @@ import { isCanonicalProjectScope } from './remote-ingress.js';
  *
  * Deliberately free of fs / SDK / MCP deps (those live in remote-control.ts) so
  * the authority and turn-render decisions stay unit-testable. May import other
- * plain-data modules such as mirror-chrome. Same reasoning (and same shape) as
+ * plain-data modules such as remote-format. Same reasoning (and same shape) as
  * poll-markers.ts / card-attribution.ts on the server side.
  *
  * OpenCode is NOT a fork of the canonical devspec-remote-poll.mjs; it is a bespoke
@@ -658,5 +658,11 @@ export function renderInjectedTurn(input) {
         parts.push(declined);
     if (input.deliveryContract)
         parts.push(`_${input.deliveryContract}_`);
+    if (canonical) {
+        parts.push('## Required answer delivery\n' +
+            'Before your final OpenCode response, call `post_session_message` exactly once and pass only ' +
+            'the complete answer body as `message`. The plugin binds identity, routing, and exact command ' +
+            'correlation. There is no mirror fallback.');
+    }
     return parts.join('\n\n');
 }

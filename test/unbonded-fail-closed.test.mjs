@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
  * Regression (item 2a5d212b): an OpenCode session with NO DevSpec bond must be
- * completely inert — no mirror, no trail, no client call, no state write.
+ * completely inert — no trail, no answer routing, no client call, no state write.
  *
  * Live failure, 2026-08-17, DevSpec session 8fd18ec0: an unbonded `@explore`
  * child (`ses_fef87a…`) produced 3,886 tokens of internal handoff material, and
  * on its `session.idle` the plugin published that text into the room under
  * bonded connection 7695c4dc / "Drifting Mongoose". The cause was
- * an unbonded session resolving to 'no bond' and both `mirrorNow` and
- * `postWorkTrail` reading that as "fall back to the process-global bind"
+ * an unbonded session resolving to 'no bond' and `postWorkTrail` reading that
+ * as "fall back to the process-global bind"
  * instead of "refuse".
  *
  * The fixture is a fully live bonded connection in the same process, so the
@@ -22,7 +22,6 @@ import path from 'node:path'
 import { describe, it, beforeEach, afterEach, mock } from 'node:test'
 import {
   forgetOpenCodeBond,
-  mirrorNow,
   postWorkTrail,
   rememberOpenCodeBond,
   resetBondsForTests,
@@ -36,7 +35,7 @@ const UNRELATED_SIBLING_SESSION = 'ses_unrelated_sibling'
 
 /**
  * Records every call the plugin makes into OpenCode. `session.messages` is the
- * first thing both mirror and trail reach for, so "was it called" is the exact
+ * first thing the trail reaches for, so "was it called" is the exact
  * observable for "did this unbonded session start speaking".
  */
 function recordingClient() {
@@ -65,8 +64,6 @@ function liveState(overrides = {}) {
     busy: true,
     awaitingRemoteReply: true,
     deliveredMessageIds: [],
-    mirroredMessageIds: [],
-    recentPostedContentHashes: [],
     ...overrides,
   }
 }
@@ -122,37 +119,16 @@ describe('unbonded OpenCode sessions are inert (2a5d212b)', () => {
     fs.rmSync(projectDir, { recursive: true, force: true })
   })
 
-  it('an unbonded @explore child never mirrors, even with a live bonded connection in scope', async () => {
-    const client = recordingClient()
-    await mirrorNow(client, projectDir, EXPLORE_CHILD_SESSION, { force: true })
-    assert.deepEqual(
-      client.calls,
-      [],
-      'the child session must not be read or published — this is the 3,886-token leak',
-    )
-  })
-
   it('an unbonded @explore child never opens a work trail', async () => {
     const client = recordingClient()
     await postWorkTrail(client, projectDir, EXPLORE_CHILD_SESSION, { force: true })
     assert.deepEqual(client.calls, [], 'a child session is not the trail of any remote turn')
   })
 
-  it('an unrelated unbonded top-level sibling is inert on both paths', async () => {
+  it('an unrelated unbonded top-level sibling is inert', async () => {
     const client = recordingClient()
-    await mirrorNow(client, projectDir, UNRELATED_SIBLING_SESSION, { force: true })
     await postWorkTrail(client, projectDir, UNRELATED_SIBLING_SESSION, { force: true })
     assert.deepEqual(client.calls, [], 'another tab in the same process is not this bond')
-  })
-
-  it('the BONDED session still mirrors — fail-closed must not mean fail-silent', async () => {
-    const client = recordingClient()
-    await mirrorNow(client, projectDir, BONDED_OPENCODE_SESSION, { force: true })
-    assert.deepEqual(
-      client.calls,
-      [`session.messages:${BONDED_OPENCODE_SESSION}`],
-      'the bonded session is exactly the one that should still be read and published',
-    )
   })
 
   it('the BONDED session still opens a work trail', async () => {

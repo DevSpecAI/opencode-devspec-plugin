@@ -8,7 +8,7 @@
  * `post_session_message({ phase: 'trail' })` grows on a single DevSpec turn.
  *
  * UNFILTERED, deliberately — and since item 68cc567c the answer path is too.
- * The mirror used to strip banners and "operational chrome" so an answer would
+ * The former answer mirror stripped banners and "operational chrome" so an answer would
  * read as an answer, which is exactly the guessing that published "Done." into a
  * room; a handshake turn is now excluded by what it did, so both surfaces carry
  * the model's words as written. The only thing this module shortens is a single
@@ -184,7 +184,7 @@ export function clampTrail(trail: string): string {
  * Serialize the assistant turn(s) of this OpenCode session that belong to the
  * remote turn in flight, newest last.
  *
- * `afterMessageId` is the pre-inject baseline the mirror already tracks
+ * `afterMessageId` is the pre-inject baseline the remote turn already tracks
  * (`replyAfterOpenCodeMessageId`): everything after it is this remote turn's
  * work. Without a baseline only the newest assistant message is serialized —
  * never the whole session history, which would republish old turns as live work.

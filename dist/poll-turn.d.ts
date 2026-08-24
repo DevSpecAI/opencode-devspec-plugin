@@ -5,7 +5,7 @@ import { type CanonicalProjectScope } from './remote-ingress.js';
  *
  * Deliberately free of fs / SDK / MCP deps (those live in remote-control.ts) so
  * the authority and turn-render decisions stay unit-testable. May import other
- * plain-data modules such as mirror-chrome. Same reasoning (and same shape) as
+ * plain-data modules such as remote-format. Same reasoning (and same shape) as
  * poll-markers.ts / card-attribution.ts on the server side.
  *
  * OpenCode is NOT a fork of the canonical devspec-remote-poll.mjs; it is a bespoke

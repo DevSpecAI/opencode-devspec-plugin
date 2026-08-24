@@ -2,7 +2,7 @@ import type { Plugin } from '@opencode-ai/plugin';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
 import { type CanonicalCommand, type CanonicalControl, type CanonicalIngress } from './remote-ingress.js';
 import { type OpencodeControlSlash } from './opencode-control-slash.js';
-export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './mirror-chrome.js';
+export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 export declare function logPoll(line: string): void;
 /**
@@ -10,7 +10,7 @@ export declare function logPoll(line: string): void;
  * treat it as stalled. Progress means reply text, a new assistant message,
  * or an in-flight tool on the latest assistant — not merely "busy wall-clock
  * with empty text" (Tembo / Racing Heron false stalls: MiniMax tool loops
- * spent minutes with no mirrorable text while still working). Override via
+ * spent minutes with no assistant text while still working). Override via
  * DEVSPEC_OPENCODE_STALL_MS (milliseconds).
  */
 export declare const STALL_TIMEOUT_MS: number;
@@ -56,24 +56,12 @@ interface ConnectionState {
     sessionId: string | null;
     codename: string | null;
     /**
-     * Id of the last OpenCode assistant message we mirrored back to DevSpec via
-     * post_session_message. Prevents re-posting the same reply on every idle
-     * poll — there is no other cursor for "have we already reported this one".
-     */
-    lastMirroredMessageId?: string | null;
-    /**
-     * After we inject an owner command, only mirror assistant messages that
-     * appear *after* this OpenCode message id (correlation). Null with
-     * replyBaselineCaptured=true means the snapshot succeeded and there was no
-     * prior assistant (empty history at inject). Null with capture failed must
-     * fail closed — never fall back to newest-in-history.
+     * Last assistant present before an injected owner command. Work-trail and
+     * stall checks scope session history after this baseline; answer delivery
+     * never reads assistant text.
      */
     replyAfterOpenCodeMessageId?: string | null;
-    /**
-     * Whether the pre-inject assistant baseline snapshot succeeded.
-     * false → fail closed on mirror (do not post any assistant for that remote turn).
-     * true + null replyAfter → empty history at inject; any later assistant is new.
-     */
+    /** Whether the pre-inject assistant baseline snapshot succeeded. */
     replyBaselineCaptured?: boolean;
     /** True while waiting for an assistant reply after injecting an owner command. */
     awaitingRemoteReply?: boolean;
@@ -128,8 +116,26 @@ interface ConnectionState {
      * `clearInjectTurnState` on stall/error.
      */
     currentTurnMessageIds?: string[] | null;
+    /** Canonical command turn bound to the model's final answer post. */
+    currentCommandTurnId?: string | null;
+    /** Final ordered canonical command message bound to the model's answer post. */
+    currentCommandMessageId?: string | null;
+    /** A bonded answer tool call has started but has not returned yet. */
+    answerPostInFlight?: boolean;
+    /** OpenCode tool call that owns the in-flight answer settlement. */
+    answerPostCallId?: string | null;
+    /** Process instance that created the in-flight answer reservation. */
+    answerPostProcessId?: string | null;
+    /** A confirmed answer row already landed during the current OpenCode turn. */
+    answerPostedThisTurn?: boolean;
     /** Playbook dispatch ids already injected into OpenCode. */
     deliveredPlaybookDispatchIds?: string[];
+    /** Playbook dispatches held while another OpenCode prompt owns the bond. */
+    deferredPlaybookDispatches?: Array<Record<string, unknown>>;
+    /** Dispatch cursor committed only after the deferred playbook prompt is accepted. */
+    deferredPlaybookDispatchCursor?: string | null;
+    /** Accepted playbook runs whose recorded outcomes can settle the current prompt. */
+    activePlaybookRunIds?: string[];
     /**
      * Our own last-known assertion of heartbeat_connection's `busy` flag —
      * the SOLE signal that drives the "OpenCode is working…" indicator on the
@@ -192,45 +198,6 @@ interface ConnectionState {
     /** Prevent stale message parts from resurrecting a permission after its reply. */
     permissionResolutionObserved?: boolean;
     /**
-     * Bounded list of OpenCode assistant message ids already mirrored to
-     * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
-     * pointer only stops re-posting the SAME message twice in a row). Real
-     * bug found live-testing: two unrelated OpenCode-internal sessions ended
-     * up alternately "last known" (see plugin.ts's lastKnownSessionId fix),
-     * so this pointer kept flipping between two DIFFERENT already-seen
-     * messages and reposting each one every time the OTHER one's post
-     * overwrote the pointer — an infinite ping-pong between two messages
-     * that were each individually "new" relative to whatever the pointer
-     * happened to hold at that moment. A set makes that structurally
-     * impossible regardless of how the pointer itself gets confused.
-     */
-    mirroredMessageIds?: string[];
-    /**
-     * Recent content hashes of replies already posted to DevSpec (manual
-     * model `post_session_message` OR plugin mirror). Live regression
-     * (session 506e2926 / Climbing Zebra): docs told the model not to call
-     * `post_session_message`, but it still did — so mirror + model each
-     * posted the same answer ~1–2s apart. Hash dedup makes that structurally
-     * impossible even when the model ignores the skill wording.
-     */
-    recentPostedContentHashes?: string[];
-    /**
-     * True once the model has itself called `post_session_message` during the
-     * CURRENT `awaitingRemoteReply` turn (item 5f75c2cb). A message-id-independent
-     * double-post guard alongside the hash/tool-part checks in `mirrorLatestReply` —
-     * it survives even if the posting assistant message is not (or is no longer)
-     * the candidate `mirrorLatestReply` is evaluating. Set by
-     * `recordManualPostSessionMessage`; reset to false whenever a turn ends
-     * (answer landed, chrome-only, stalled, errored) or a new one is injected.
-     */
-    manualAnswerPostedThisTurn?: boolean;
-    /**
-     * OpenCode assistant message ids that must never be mirrored — filled from
-     * `command.executed` for `/devspec.remote` / `/devspec.remote-stop` so the
-     * connect skill turn cannot settle a pending owner dispatch (e7ecc1de).
-     */
-    nonMirrorMessageIds?: string[];
-    /**
      * This turn is the plugin's OWN protocol (a DevSpec connect handshake), so
      * it produces no room post — item 68cc567c.
      *
@@ -250,7 +217,7 @@ interface ConnectionState {
      * tag a LATER answer turn, which then had to be rescued by inspecting text. A
      * flag that starts and ends with the connect turn cannot tag a later one.
      */
-    connectMirrorSuppressed?: boolean;
+    connectHandshakePending?: boolean;
     /**
      * Owner commands that arrived while inject had to wait (connect handshake
      * still settling, or another host acceptance in flight). Item 4414d2d9:
@@ -338,7 +305,7 @@ export type OpenCodeAssistantModelSource = 'info.flat' | 'info.model' | 'info.me
  *
  * Assistant turns store flat `info.providerID` + `info.modelID` (e.g. MiniMax).
  * Nested `info.model` is the user-message / Model.Ref shape. Reading only
- * `info.model` caused false `model_missing` / `mirrored_without_model` when
+ * `info.model` caused false missing-model diagnostics when
  * the model was present on the assistant message.
  *
  * Tries in order: flat info fields → nested `info.model` → legacy
@@ -466,34 +433,17 @@ export declare function decideBusyStall(input: {
     /** Hung permission wait — never treated as active_tool progress. */
     permissionAskPending?: boolean;
 }): BusyStallDecision;
-/** Normalize reply text before hashing so trivial whitespace drift cannot bypass dedup. */
+/** Normalize text before hashing so trivial whitespace drift shares a trail fingerprint. */
 export declare function normalizePostedContent(text: string): string;
-/** Stable short hash of a reply body (used for mirror ↔ manual-post dedup). */
+/** Stable short hash used by work-trail update deduplication. */
 export declare function hashPostedContent(text: string): string;
-/**
- * True when this OpenCode assistant message already invoked DevSpec's
- * `post_session_message` (any MCP name variant). Mirror must not post again.
- */
-export declare function messageHasPostSessionMessageTool(message: {
-    parts?: unknown;
-} | null | undefined): boolean;
-/**
- * Record a successful model-initiated `post_session_message` so the auto-mirror
- * skips the same body. Wired from `tool.execute.after` in plugin.ts.
- *
- * Item 5f75c2cb / turn-scoped tool detection: `tool.execute.after` carries no
- * `messageID` (verified against the plugin's own hook signature), so this
- * cannot correlate the call back to a specific OpenCode assistant message —
- * the content-hash remembered below is the mechanical guard for that. This
- * also sets `manualAnswerPostedThisTurn`, a second, message-id-independent
- * guard scoped to "did the model post at all during THIS remote turn" —
- * `mirrorLatestReply` checks both, so a manual post cannot double up with the
- * mirror even in a shape neither the hash nor the tool-part scan catches.
- * Only set while `awaitingRemoteReply`: a manual post during a plain local
- * OpenCode turn (not remote-injected) has no turn to scope it to, and this
- * flag must never suppress an unrelated later remote turn's mirror.
- */
-export declare function recordManualPostSessionMessage(toolName: string, args: unknown): void;
+/** Keep one promptAsync answer correlation active at a time on a connection. */
+export declare function shouldDeferCanonicalPrompt(opts: {
+    busy?: boolean | null;
+    awaitingRemoteReply?: boolean | null;
+    pendingQuestionRequestId?: string | null;
+    connectHandshakePending?: boolean | null;
+}): boolean;
 /**
  * Spill an oversize attachment to ~/.devspec/opencode-remote-control/attachments/
  * and return a file:// URL OpenCode can open. Used when decoded size exceeds
@@ -572,22 +522,21 @@ export declare function readState(): ConnectionState | null;
  * Full replace of the on-disk state file. Only safe for handshake / clear paths
  * that intentionally own the whole snapshot. Mid-tick poll updates MUST use
  * patchState — a stale `writeState({ ...inMemory })` rolls back concurrent
- * mirror claims (live: session f3af591e double-posted msg_fc80605c).
+ * answer-post claims (live: session f3af591e double-posted msg_fc80605c).
  */
 export declare function writeState(state: ConnectionState): void;
 /**
  * Re-read the on-disk state, merge `patch`, write back. Real bug found
- * live-testing: setBusy(false) on the session.idle path and
- * mirrorLatestReply both did `writeState({ ...staleInMemory, … })`, so
- * whichever finished second rolled back the other's cursor fields —
- * lastMirrored got reset to the previous id and the next poll posted the
- * same reply twice into DevSpec. Always merge onto the latest disk
- * snapshot so concurrent writers only touch their own keys.
+ * live-testing: concurrent turn-settlement writers both used
+ * `writeState({ ...staleInMemory, … })`, so whichever finished second rolled
+ * back the other's cursor fields and the next poll posted the same reply twice.
+ * Always merge onto the latest disk snapshot so concurrent writers only touch
+ * their own keys.
  *
  * Regression (67794386 / f3af591e): pollAndDeliver still used writeState with
- * a stale in-memory spread for cursor / delivered-ids / inject-baseline; the
- * advisory echo of a just-mirrored reply then re-mirrored the same OpenCode
- * message. Every mid-tick persistence must go through this helper.
+ * a stale in-memory spread for cursor / delivered-ids / inject-baseline; an
+ * advisory echo then caused a duplicate answer post. Every mid-tick persistence
+ * must go through this helper.
  */
 export declare function patchState(patch: Partial<ConnectionState>): ConnectionState | null;
 /**
@@ -614,16 +563,6 @@ export declare function patchState(patch: Partial<ConnectionState>): ConnectionS
  * trusting the declared type, which is only accurate for the built-in case.
  */
 export declare function recordConnectionEventFromTool(toolName: string, args: unknown, hookOutput: unknown, opencodeSessionId?: string | null): void;
-/**
- * Record an OpenCode `command.executed` for `/devspec.remote` /
- * `/devspec.remote-stop` so mirrorLatestReply never posts that assistant turn.
- *
- * While `awaitingRemoteReply` is set, ignore the event: OpenCode has been
- * observed to fire a late `devspec.remote` command.executed against the
- * *post-inject answer* message id (session 8a97effc). Recording that id would
- * poison nonMirrorMessageIds and skip-mirror the real reply.
- */
-export declare function recordRemoteControlSkillCommand(props: Record<string, unknown> | null | undefined): void;
 /**
  * Register (or resume) THIS OpenCode session as a DevSpec connection.
  *
@@ -658,7 +597,7 @@ export declare const POLL_ERROR_REPORT_AFTER_TRANSIENT = 3;
 /** True for gateway / redeploy-shaped MCP transport errors the pump already retries. */
 export declare function isTransientMcpGatewayError(err: unknown): boolean;
 /**
- * Whether a poll failure should be mirrored into the DevSpec room.
+ * Whether a poll failure should be posted into the DevSpec room.
  * Transient 5xx waits until `POLL_ERROR_REPORT_AFTER_TRANSIENT` consecutive
  * failures; everything else reports immediately (still cooldown-deduped).
  */
@@ -773,13 +712,17 @@ export declare function deliverInjectedTurn(input: {
         modelID: string;
     };
     thinking?: string;
+    answerCorrelation?: {
+        turnId: string;
+        messageId: string | null;
+    };
     onAccepted?: () => void;
     onRejected?: () => void;
     /** False while a sibling prompt transaction still owns busy/reply correlation. */
     shouldCleanupRejectedTurn?: () => boolean;
 }): Promise<void>;
 /**
- * Decide how to correlate assistants while awaiting a remote inject reply.
+ * Decide how to scope assistant history while a remote inject is active.
  *
  * Live (8d0f1726): a concrete baseline id that is *gone* from the current
  * OpenCode session means the serve process rotated under an abandoned inject
@@ -809,10 +752,8 @@ export declare function decideAwaitingBaseline(opts: {
 }): AwaitingBaselineDecision;
 /**
  * Turn an `AwaitingBaselineDecision` into the assistant messages `checkBusyStall`
- * should evaluate progress against (item 40279ae0). Unlike `mirrorLatestReply`'s
- * own use of the same decision — where several actions must `return` outright
- * (never post an answer without a confident correlation) — stall detection has
- * a safe meaning for "nothing after baseline yet": empty input is exactly what
+ * should evaluate progress against (item 40279ae0). Stall detection has a safe
+ * meaning for "nothing after baseline yet": empty input is exactly what
  * `decideBusyStall` needs to correctly declare `empty_assistant_timeout` for a
  * freshly-injected turn that has produced nothing at all, rather than falling
  * back to whatever a completely unrelated, already-answered turn's last
@@ -829,18 +770,6 @@ export declare function scopeAssistantsAfterBaseline<T extends {
  * rotate). Returns true when state was cleared.
  */
 export declare function clearAbandonedInjectCursor(baseline: string): boolean;
-/** Wait after the last message.updated before mirroring — covers tool-call lag. */
-export declare const MIRROR_SETTLE_MS = 2000;
-export declare function mirrorNow(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string, { force }?: {
-    force?: boolean;
-}): Promise<void>;
-/**
- * Debounced mirror for `message.updated` — resets on every update so we only
- * run after the turn has gone quiet long enough for a manual post tool to land.
- */
-export declare function scheduleMirrorNow(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string): void;
-/** Cancel any pending settle timer and mirror immediately (session.idle path). */
-export declare function flushMirrorNow(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string): void;
 /** Debounced/throttled trail publish for `message.updated`. */
 export declare function scheduleWorkTrailPost(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string): void;
 /**
@@ -849,7 +778,7 @@ export declare function scheduleWorkTrailPost(client: Parameters<Plugin>[0]['cli
  * Only while a remote turn is actually in flight (`busy` or `awaitingRemoteReply`):
  * a trail posted outside one would open a streaming bubble that nothing is going
  * to close. Best-effort throughout — a failed trail post must never disturb the
- * turn or the mirror that ends it.
+ * turn or the final post that ends it.
  */
 export declare function postWorkTrail(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string, { force, seed }?: {
     force?: boolean;
@@ -860,9 +789,25 @@ export declare function postWorkTrail(client: Parameters<Plugin>[0]['client'], d
  *
  * `mcpToolsCall` unwraps JSON to `{ message_id, … }`; tests and some call
  * sites still pass the raw MCP envelope. Both shapes are accepted.
- * Mirror answer posts MUST require this id before claiming success (item 6990fd9e).
+ * Answer posts require this id before local lifecycle settlement.
  */
 export declare function extractPostedMessageId(result: unknown): string | null;
+/** Reserve the one model-owned answer post allowed for the current OpenCode turn. */
+export declare function claimAgentAnswerPost(callId: string): ConnectionState;
+/** Release the prior turn's success latch when OpenCode starts a new user turn. */
+export declare function resetAnswerPostLatchForUserTurn(): void;
+/** Resolve the actual model stamp from the firing OpenCode session, never model-supplied routing. */
+export declare function resolveCurrentAssistantModel(client: Parameters<Plugin>[0]['client'], sessionId: string, callId: string): Promise<OpenCodeModelStamp | null>;
+/** Commit local lifecycle only after DevSpec confirms the model-owned answer row. */
+export declare function settleAgentPostResult(toolName: string, result: unknown, callId: string): boolean;
+/** A reported playbook outcome is the deterministic terminal boundary for that prompt. */
+export declare function settlePlaybookRunResult(toolName: string, result: unknown, args: unknown): boolean;
+/**
+ * Settle an OpenCode idle event without ever reading assistant text. A remote
+ * turn that failed to post gets one bounded mechanical error; an already
+ * settled or handshake/local turn only drops stale local busy state.
+ */
+export declare function handleSessionIdle(directory: string): Promise<void>;
 /** Whether `phase:'error'|'answer'` actually closed a server-open trail turn. */
 export declare function extractClosedTrailTurn(result: unknown): boolean;
 /**

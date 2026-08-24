@@ -7,6 +7,7 @@ This project is connected to DevSpec over MCP. DevSpec indexes the codebase and 
 3. **Keep shared memory fresh.** DevSpec memory (`record_memory`, `search_memories`, `supersede_memory`, `retract_memory`) is the team's shared source of truth. Search first, read the closest match in full, and supersede rather than duplicating durable decisions, conventions, architecture, or risks.
 4. **Respect project standards.** Read applicable conventions and decisions in full before relying on or contradicting them.
 5. **Do not force conflicts.** Never force past a `possible_conflict` rejection without explicit human direction.
+6. **Deliver attached-conversation answers explicitly.** In a bonded local terminal turn, call `post_session_message` exactly once before the final response and pass only the complete answer body as `message`. Remote injected turns carry the same instruction. The plugin binds current connection identity and correlation; there is no assistant-text mirror fallback. The `devspec.remote` connect/status handshake itself must not post.
 
 ## Session plans — high threshold, on demand
 

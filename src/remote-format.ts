@@ -1,5 +1,5 @@
 /**
- * Mirror helpers — dependency-free, and deliberately content-BLIND.
+ * Remote-control formatting and sequencing helpers.
  *
  * This module used to decide whether a turn was postable by reading it: banner
  * matching, status-field counting, "internal note" stripping, an
@@ -8,10 +8,9 @@
  * failure, and the last of them let the word "Done." through into DevSpec
  * session 8fd18ec0 on 2026-08-17 because it did not look like chrome.
  *
- * Egress is now decided by what a turn DID — a handshake turn has no answer to
- * post — so there is nothing left to classify (item 68cc567c). What survives
- * here is formatting that never changes whether something is posted, plus two
- * non-text checks: a command NAME test and inject sequencing during connect.
+ * Answer egress is model-owned now, so there is nothing left to classify. What
+ * survives here is generic markdown formatting plus command-name and inject
+ * sequencing checks used outside answer delivery.
  */
 
 export function unwrapSingleOuterMarkdownFence(text: string): string {
@@ -28,7 +27,6 @@ export function collapseOrphanMarkdownFences(text: string): string {
     .trim()
 }
 
-/** How many distinct status-field labels appear at line start. */
 /** Slash commands whose assistant turn is the plugin's own protocol, not an answer. */
 export const DEVSPEC_REMOTE_CONTROL_COMMANDS = new Set([
   'devspec.remote',
@@ -48,30 +46,15 @@ export function isDevspecRemoteControlCommand(name: unknown): boolean {
  * and the handshake never completed cleanly. This is about SEQUENCING a turn,
  * not about judging any text.
  *
- * Session 8a97effc / connection 4aab7fe0: OpenCode fired a late
- * `command.executed` for `devspec.remote` against the *post-inject answer*
- * message id. nonMirrorMessageIds then won over awaitingRemoteReply and the
- * real reply was skip-claimed forever. When awaiting an inject reply, never
- * skip — that flag is the mechanical "this turn is the owner's answer" signal.
- */
-/**
- * Defer owner-command inject while the connect/handshake turn is still settling.
+ * `connectHandshakePending` means the handshake is still settling.
  *
- * Live session bf7acd8c / item 6990fd9e: an owner dispatch landed mid-
- * `/devspec.remote` (register done, attach not finished). Seed inject fired
- * `promptAsync` into that connect turn; the model answered in the terminal, the
- * mirror claimed success without a room row, and the handshake never completed
- * cleanly. `connectMirrorSuppressed` already means "handshake still settling"
- * for the mirror path — reuse it so inject waits until suppress clears.
- *
- * Does NOT apply when `awaitingRemoteReply` is already true (a real inject turn
- * is in flight — suppress may still be set from register; do not starve that
- * turn's follow-ups).
+ * This helper only handles connect sequencing. `shouldDeferCanonicalPrompt`
+ * separately serializes follow-up prompts while an answer is outstanding.
  */
 export function shouldDeferInjectDuringConnect(opts: {
-  connectMirrorSuppressed?: boolean | null
+  connectHandshakePending?: boolean | null
   awaitingRemoteReply?: boolean | null
 }): boolean {
   if (opts.awaitingRemoteReply) return false
-  return Boolean(opts.connectMirrorSuppressed)
+  return Boolean(opts.connectHandshakePending)
 }

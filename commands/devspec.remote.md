@@ -8,7 +8,7 @@ Arguments: $ARGUMENTS
 
 Register this OpenCode session as a DevSpec **connection** so it appears on the Agents page and, when attached to a session, receives server-authorized exact-target commands from phone or web.
 
-The plugin does the rest in-process: polling, delivery, identity, and posting your replies. There is no poller to start and nothing to re-arm — this command exists for the few decisions only you can make.
+The plugin does the rest in-process: polling, delivery, identity, and answer routing. There is no poller to start and nothing to re-arm — this command exists for the few decisions only you can make.
 
 ## Steps
 
@@ -53,7 +53,9 @@ The plugin does the rest in-process: polling, delivery, identity, and posting yo
 
 ## Answering
 
-Write your answer in this OpenCode session, as you would to anyone. The plugin carries it to the room verbatim; you have no posting step and no formatting to perform.
+For every substantive turn in an attached conversation, call `post_session_message` exactly once before the final OpenCode response, passing only the complete answer body as `message`. The plugin overwrites identity, routing, lifecycle, and command correlation. There is no mirror fallback.
+
+The connect/status handshake itself must not call `post_session_message`; its confirmation stays in this terminal.
 
 - **If real work will happen before the answer**, write one short sentence first ("got it, I'll look at X") — it lands as the live trail while you work. If the answer is ready now, skip that: a trail and answer arriving together are just a slower answer.
 - **Sessionless:** there is no conversational answer path. Separately accepted owner-scoped playbook runs report through `record_playbook_run`; never invent a room.

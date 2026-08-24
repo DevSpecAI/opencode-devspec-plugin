@@ -170,11 +170,9 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
     assert.deepEqual(client.calls, [], 'nor read the child session for mirroring')
   })
 
-  it('session.idle from the bonded session still ends the turn', async () => {
+  it('session.idle from the bonded session clears stale local busy state without a broad completion', async () => {
     await hooks.event({ event: { type: 'session.idle', properties: { sessionID: BONDED } } })
-    const beats = heartbeats()
-    assert.equal(beats.length, 1, 'the bonded session must still settle normally')
-    assert.equal(beats[0].arguments.busy, false)
+    assert.deepEqual(heartbeats(), [], 'complete_turn posts own lifecycle; idle sends no duplicate heartbeat')
     assert.equal(readBonded()?.busy, false)
   })
 
@@ -210,18 +208,14 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
   })
 
   it('command.executed from an unbonded child does not touch the bonded state', async () => {
-    const before = readBonded()?.nonMirrorMessageIds ?? []
+    const before = readBonded()
     await hooks.event({
       event: {
         type: 'command.executed',
         properties: { sessionID: CHILD, name: 'devspec.remote', messageID: 'msg_child' },
       },
     })
-    assert.deepEqual(
-      readBonded()?.nonMirrorMessageIds ?? [],
-      before,
-      "a child's command must not record a skip-mirror id on the bonded connection",
-    )
+    assert.deepEqual(readBonded(), before)
   })
 
   it('permission.ask auto-allow is scoped to the bonded session', async () => {

@@ -88,7 +88,6 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
         connectionId: '1cce2c8c-549c-4388-96d0-8e480b3a1ce4',
         sessionId: devspecSession,
         codename: 'Gliding Coyote',
-        lastMirroredMessageId: 'msg_prior',
         replyAfterOpenCodeMessageId: 'msg_prior',
         replyBaselineCaptured: true,
         awaitingRemoteReply: true,
@@ -118,7 +117,6 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
     assert.equal(moved?.codename, 'Gliding Coyote')
     assert.equal(moved?.lastDeliveredMessageId, 'owner-msg-keep')
     assert.deepEqual(moved?.deliveredMessageIds, ['owner-msg-keep'])
-    assert.equal(moved?.lastMirroredMessageId, null)
     assert.equal(moved?.awaitingRemoteReply, false)
     assert.equal(moved?.replyAfterOpenCodeMessageId, null)
 
