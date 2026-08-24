@@ -1,4 +1,4 @@
-import { clearPermissionAsked, clearPendingQuestion, flushMirrorNow, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markPermissionAsked, pollAndDeliver, recordConnectionEventFromTool, recordManualPostSessionMessage, bondLocalId, isBondedOpenCodeSession, recordRemoteControlSkillCommand, rejectPendingQuestion, runWithBondAsync, scheduleMirrorNow, scheduleWorkTrailPost, setBusy, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
+import { clearPermissionAsked, clearPendingQuestion, flushMirrorNow, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recordConnectionEventFromTool, recordManualPostSessionMessage, bondLocalId, isBondedOpenCodeSession, recordRemoteControlSkillCommand, rejectPendingQuestion, runWithBondAsync, scheduleMirrorNow, scheduleWorkTrailPost, setBusy, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
 import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
 import { CommitProvenance } from './commit-provenance.js';
@@ -54,6 +54,10 @@ function isQuestionResolvedEvent(type) {
         type === 'question.rejected' ||
         type === 'question.v2.replied' ||
         type === 'question.v2.rejected');
+}
+function permissionRequestId(props) {
+    const value = props?.requestID ?? props?.id;
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 /**
  * DevSpec OpenCode plugin entry point.
@@ -250,9 +254,11 @@ export const DevSpecPlugin = async ({ client, directory }) => {
                 : undefined;
             const sessionId = typeof props?.sessionID === 'string'
                 ? props.sessionID
-                : event.type === 'session.deleted' && typeof eventInfo?.id === 'string'
-                    ? eventInfo.id
-                    : undefined;
+                : typeof eventInfo?.sessionID === 'string'
+                    ? eventInfo.sessionID
+                    : event.type === 'session.deleted' && typeof eventInfo?.id === 'string'
+                        ? eventInfo.id
+                        : undefined;
             if (event.type === 'session.deleted' && sessionId) {
                 provenance.clearSession(sessionId);
                 clearConnectionCapability(sessionId);
@@ -317,16 +323,18 @@ export const DevSpecPlugin = async ({ client, directory }) => {
                 });
             }
             else if (isPermissionAskedEvent(event.type)) {
-                // Hung permission wait is NOT stall progress — mark so checkBusyStall
-                // never slides on the still-"running" tool (bb633917). OpenCode emits
-                // `permission.asked` live; SDK Event typings may lag — compare as string.
+                // A permission wait is not model progress, but the OpenCode turn remains
+                // resumable. Keep its activity/correlation intact until the request is
+                // answered or OpenCode settles the session.
                 await inBond(async () => {
-                    markPermissionAsked();
+                    if (markPermissionAsked(permissionRequestId(props))) {
+                        await postPermissionWaitNotice(directory);
+                    }
                 });
             }
             else if (isPermissionResolvedEvent(event.type)) {
                 await inBond(async () => {
-                    clearPermissionAsked();
+                    clearPermissionAsked(permissionRequestId(props));
                 });
             }
             else if (isQuestionAskedEvent(event.type)) {

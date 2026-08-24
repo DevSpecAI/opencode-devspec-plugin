@@ -47,14 +47,6 @@ export declare const PRESENCE_GAP_WARN_COOLDOWN_MS = 30000;
  */
 export declare const MAX_SAME_ASSISTANT_ACTIVE_TOOL_SLIDES = 2;
 /**
- * After OpenCode emits `permission.asked` (or a tool part is stuck in an ask /
- * permission-wait state), how long we wait before clearing busy. A hung
- * permission prompt is not progress — do not slide the busy timer the way a
- * healthy `active_tool` does (live hang: write tool `running` + external_directory
- * ask → multi-slide then ~6 min empty_assistant_timeout).
- */
-export declare const PERMISSION_ASK_STALL_MS = 15000;
-/**
  * Race a promise against a wall-clock ceiling. Used for OpenCode session API
  * calls that have no built-in timeout.
  */
@@ -189,10 +181,16 @@ interface ConnectionState {
      */
     permissionAskedPending?: boolean;
     /**
-     * Epoch ms when we first observed the pending permission ask. Used with
-     * `PERMISSION_ASK_STALL_MS` for an early stall (sooner than `STALL_TIMEOUT_MS`).
+     * Epoch ms when we first observed the oldest unresolved permission ask.
      */
     permissionAskedAt?: number | null;
+    /** Unresolved OpenCode permission requests, retained across long human waits. */
+    pendingPermissions?: Array<{
+        requestId: string | null;
+        askedAt: number;
+    }>;
+    /** Prevent stale message parts from resurrecting a permission after its reply. */
+    permissionResolutionObserved?: boolean;
     /**
      * Bounded list of OpenCode assistant message ids already mirrored to
      * DevSpec — defense in depth alongside `lastMirroredMessageId` (a single
@@ -385,12 +383,13 @@ export declare function messageHasPendingPermissionAsk(message: {
 } | null | undefined): boolean;
 /**
  * Record that OpenCode asked for permission (plugin `permission.asked` path).
- * Idempotent on the timestamp — keep the first ask time so the early stall
- * clock does not reset if the event repeats.
+ * Requests are correlated so a stale reply cannot clear a newer wait.
  */
-export declare function markPermissionAsked(nowMs?: number): void;
-/** Clear a pending permission ask (resolved / denied / replied, or busy clear). */
-export declare function clearPermissionAsked(): void;
+export declare function markPermissionAsked(requestId?: string | null, nowMs?: number): boolean;
+/** Clear a matching permission ask and restart the ordinary progress window. */
+export declare function clearPermissionAsked(requestId?: string | null, nowMs?: number): boolean;
+/** Tell the remote owner where the local-only OpenCode permission can be resolved. */
+export declare function postPermissionWaitNotice(directory: string): Promise<void>;
 /** Format OpenCode question.asked properties into a DevSpec-readable prompt. */
 export declare function formatQuestionPrompt(props: {
     questions?: Array<{
@@ -429,6 +428,8 @@ export declare function rejectPendingQuestion(input: {
 export type BusyStallDecision = {
     action: 'under_timeout';
 } | {
+    action: 'waiting_permission';
+} | {
     action: 'has_text';
 } | {
     action: 'slide';
@@ -439,13 +440,13 @@ export type BusyStallDecision = {
 } | {
     action: 'stall';
     assistantId: string | null;
-    reason: 'permission_asked' | 'empty_assistant_timeout' | 'active_tool_cap';
+    reason: 'empty_assistant_timeout' | 'active_tool_cap';
 };
 /**
  * Pure stall policy (unit-tested). Call only after `elapsedMs >= timeoutMs`
  * except the early `under_timeout` branch used by callers that still gate
- * on wall-clock first — and the permission-ask early path, which can stall
- * before `timeoutMs` once `permissionAskElapsedMs >= permissionAskStallMs`.
+ * on wall-clock first. Permission waits remain active until OpenCode reports
+ * a reply or the session itself settles.
  */
 export declare function decideBusyStall(input: {
     elapsedMs: number;
@@ -464,9 +465,6 @@ export declare function decideBusyStall(input: {
     previousReasoningFingerprint?: string | null;
     /** Hung permission wait — never treated as active_tool progress. */
     permissionAskPending?: boolean;
-    /** ms since `permissionAskedAt` (0 if pending but clock unknown). */
-    permissionAskElapsedMs?: number;
-    permissionAskStallMs?: number;
 }): BusyStallDecision;
 /** Normalize reply text before hashing so trivial whitespace drift cannot bypass dedup. */
 export declare function normalizePostedContent(text: string): string;
@@ -512,8 +510,8 @@ export declare function materializeLargeAttachmentToDisk(input: {
  * (no reply text, no new assistant step, no in-flight tool, no growing
  * reasoning), clear busy and warn in the DevSpec session. Healthy tool-heavy
  * and long-think turns slide `busySince` instead of false-stalling. A pending
- * `permission.asked` is NOT progress — it never slides and stalls after
- * PERMISSION_ASK_STALL_MS. Called every poll while busy.
+ * `permission.asked` is a live human wait: it does not count as progress, but
+ * it also cannot terminalize a resumable OpenCode turn. Called every poll while busy.
  */
 export declare function checkBusyStall(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string): Promise<void>;
 /**

@@ -23,6 +23,7 @@ import path from 'node:path'
 import { describe, it, beforeEach, afterEach, mock } from 'node:test'
 import { DevSpecPlugin } from '../dist/plugin.js'
 import {
+  checkBusyStall,
   forgetOpenCodeBond,
   readState,
   rememberOpenCodeBond,
@@ -129,6 +130,11 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
         sessionId: '8fd18ec0-2a4f-4242-8172-1c76e06a3b8e',
         codename: 'Drifting Mongoose',
         busy: true,
+        busySince: 1_000,
+        awaitingRemoteReply: true,
+        currentTurnMessageIds: ['cmd_remote'],
+        deliveredMessageIds: ['cmd_remote'],
+        activeTrailMessageId: 'trail_remote',
       })
     })
   })
@@ -230,5 +236,77 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
     const bondedOutput = { status: 'ask' }
     await hooks['permission.ask']({ sessionID: BONDED, type: 'bash' }, bondedOutput)
     assert.equal(bondedOutput.status, 'allow', 'the bonded remote turn still auto-allows')
+  })
+
+  it('keeps the same active turn while a permission is approved', async () => {
+    await hooks.event({
+      event: {
+        type: 'permission.asked',
+        properties: { sessionID: BONDED, id: 'perm_1' },
+      },
+    })
+
+    const waiting = readBonded()
+    assert.equal(waiting?.busy, true)
+    assert.equal(waiting?.awaitingRemoteReply, true)
+    assert.deepEqual(waiting?.currentTurnMessageIds, ['cmd_remote'])
+    assert.deepEqual(waiting?.deliveredMessageIds, ['cmd_remote'])
+    assert.equal(waiting?.activeTrailMessageId, 'trail_remote')
+    assert.deepEqual(waiting?.pendingPermissions, [{ requestId: 'perm_1', askedAt: waiting.permissionAskedAt }])
+    assert.equal(heartbeats().some((call) => call.arguments.busy === false), false)
+    const notice = mcp.toolCalls.find((call) => call.name === 'post_session_message')
+    assert.match(notice?.arguments?.message ?? '', /OpenCode terminal/)
+    assert.doesNotMatch(notice?.arguments?.message ?? '', /perm_1|poll\.log|assistant/i)
+
+    client.calls.length = 0
+    await runWithBond(BONDED, () => checkBusyStall(client, projectDir, BONDED))
+    assert.deepEqual(client.calls, [], 'the stall watchdog must not inspect or terminate a live permission wait')
+
+    await hooks.event({
+      event: {
+        type: 'permission.replied',
+        properties: { sessionID: BONDED, requestID: 'perm_1' },
+      },
+    })
+
+    const resumed = readBonded()
+    assert.equal(resumed?.busy, true)
+    assert.equal(resumed?.awaitingRemoteReply, true)
+    assert.deepEqual(resumed?.currentTurnMessageIds, ['cmd_remote'])
+    assert.equal(resumed?.activeTrailMessageId, 'trail_remote')
+    assert.deepEqual(resumed?.pendingPermissions, [])
+    assert.equal(resumed?.permissionAskedPending, false)
+    assert.ok(resumed?.busySince > 1_000, 'approval restarts the ordinary stall window')
+  })
+
+  it('does not let an old reply clear a newer permission request', async () => {
+    await hooks.event({
+      event: { type: 'permission.asked', properties: { sessionID: BONDED, id: 'perm_old' } },
+    })
+    await hooks.event({
+      event: { type: 'permission.replied', properties: { sessionID: BONDED, requestID: 'perm_old' } },
+    })
+    await hooks.event({
+      event: { type: 'permission.asked', properties: { sessionID: BONDED, id: 'perm_new' } },
+    })
+    await hooks.event({
+      event: { type: 'permission.replied', properties: { sessionID: BONDED, requestID: 'perm_old' } },
+    })
+
+    assert.equal(readBonded()?.permissionAskedPending, true)
+    assert.deepEqual(readBonded()?.pendingPermissions?.map((request) => request.requestId), ['perm_new'])
+    assert.equal(heartbeats().some((call) => call.arguments.busy === false), false)
+  })
+
+  it('accepts the SDK message.updated sessionID nested under info', async () => {
+    await hooks.event({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: { id: 'msg_assistant', sessionID: BONDED, role: 'assistant' },
+        },
+      },
+    })
+    assert.equal(readBonded()?.busy, true)
   })
 })
