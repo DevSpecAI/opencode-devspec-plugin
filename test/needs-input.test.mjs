@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { formatQuestionPrompt } from '../dist/remote-control.js'
+import { formatQuestionPrompt, parseNeedsInputReply } from '../dist/remote-control.js'
 
 describe('formatQuestionPrompt', () => {
   it('formats a single question with options', () => {
@@ -27,5 +27,25 @@ describe('formatQuestionPrompt', () => {
     })
     assert.match(text, /1\. A\?/)
     assert.match(text, /2\. B\?/)
+  })
+})
+
+describe('parseNeedsInputReply', () => {
+  it('returns the exact request and per-question answer arrays', () => {
+    const payload = encodeURIComponent(JSON.stringify({
+      requestId: 'que_123',
+      answers: [['A'], ['B', 'Custom']],
+    }))
+    assert.deepEqual(
+      parseNeedsInputReply(`A\n2: B, Custom\n\n<!--devspec-needs-input-reply:${payload}-->`),
+      { requestId: 'que_123', answers: [['A'], ['B', 'Custom']] },
+    )
+  })
+
+  it('rejects missing, malformed, and empty markers', () => {
+    assert.equal(parseNeedsInputReply('ordinary owner command'), null)
+    assert.equal(parseNeedsInputReply('\n\n<!--devspec-needs-input-reply:%7Bbad-->'), null)
+    const empty = encodeURIComponent(JSON.stringify({ requestId: 'que_123', answers: [[]] }))
+    assert.equal(parseNeedsInputReply(`x\n\n<!--devspec-needs-input-reply:${empty}-->`), null)
   })
 })

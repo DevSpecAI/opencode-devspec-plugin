@@ -1094,6 +1094,37 @@ export async function handleQuestionAsked(
   }
 }
 
+const NEEDS_INPUT_REPLY_RE = /\n\n<!--devspec-needs-input-reply:([^\n]+)-->\s*$/
+const hostAcceptedQuestionReplies = new Set<string>()
+
+export function parseNeedsInputReply(content: unknown): {
+  requestId: string
+  answers: string[][]
+} | null {
+  if (typeof content !== 'string') return null
+  const encoded = content.match(NEEDS_INPUT_REPLY_RE)?.[1]
+  if (!encoded) return null
+  try {
+    const parsed = JSON.parse(decodeURIComponent(encoded)) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const row = parsed as Record<string, unknown>
+    if (typeof row.requestId !== 'string' || !row.requestId.trim() || !Array.isArray(row.answers)) return null
+    const answers = row.answers.map((answer) => {
+      if (!Array.isArray(answer)) throw new Error('invalid answer row')
+      const values = answer.map((value) => {
+        if (typeof value !== 'string' || !value.trim()) throw new Error('invalid answer')
+        return value.trim()
+      })
+      if (values.length === 0) throw new Error('empty answer row')
+      return values
+    })
+    if (answers.length === 0) return null
+    return { requestId: row.requestId.trim(), answers }
+  } catch {
+    return null
+  }
+}
+
 /** Clear a pending question after reply/reject/disconnect. */
 export function clearPendingQuestion(): void {
   const state = readState()
@@ -1109,18 +1140,21 @@ export function clearPendingQuestion(): void {
 export async function replyPendingQuestion(input: {
   client: Parameters<Plugin>[0]['client']
   directory: string
-  answerText: string
+  requestId: string
+  answers: string[][]
 }): Promise<boolean> {
-  const { client, directory, answerText } = input
+  const { client, directory, requestId, answers } = input
   const state = readState()
   const pending = state?.pendingQuestion
-  if (!state || !pending?.requestId) return false
-  const text = answerText.trim()
-  if (!text) {
-    logPoll('replyPendingQuestion: empty answer — not sending')
+  if (!state || !pending?.requestId || pending.requestId !== requestId) return false
+  if (answers.length !== Math.max(1, pending.questionCount)) {
+    logPoll('replyPendingQuestion: answer count mismatch — not sending')
     return false
   }
-  const answers = Array.from({ length: Math.max(1, pending.questionCount) }, () => [text])
+  if (hostAcceptedQuestionReplies.has(requestId)) {
+    try { clearPendingQuestion() } catch { /* retry the local write on the next poll */ }
+    return true
+  }
   try {
     await withTimeout(
       (client as any).question.reply({
@@ -1130,7 +1164,14 @@ export async function replyPendingQuestion(input: {
       OPENCODE_SESSION_API_TIMEOUT_MS,
       'question.reply',
     )
-    clearPendingQuestion()
+    // The host effect is irreversible. Remember it before touching local disk so
+    // a write fault can never make this process answer the same question twice.
+    hostAcceptedQuestionReplies.add(requestId)
+    try {
+      clearPendingQuestion()
+    } catch (err) {
+      logPoll(`replyPendingQuestion: host accepted but local clear failed: ${err}`)
+    }
     logPoll(`replyPendingQuestion: replied to ${pending.requestId}`)
     logRemoteControlStory({
       phase: 'inject',
@@ -3264,53 +3305,141 @@ export async function pollAndDeliver(
   }
   pump.consecutiveEmpty = 0
 
+  const parsedReplies = commands.map((command) => ({
+    command,
+    reply: parseNeedsInputReply(command.content.body),
+  }))
+  const markedReplyIds = parsedReplies
+    .filter(({ reply }) => reply !== null)
+    .map(({ command }) => command.message_id)
+
+  // A marked question reply is never an ordinary prompt, even after the local
+  // pending state was cleared or lost. Consume it as stale rather than asking
+  // the model to act on protocol text.
+  if (!state.pendingQuestion?.requestId && markedReplyIds.length > 0) {
+    for (const id of markedReplyIds) deliveredIds.add(id)
+    patchState({ deliveredMessageIds: [...deliveredIds].slice(-50) })
+    commands.splice(
+      0,
+      commands.length,
+      ...commands.filter((command) => !markedReplyIds.includes(command.message_id)),
+    )
+    logPoll(`needs_input: discarded ${markedReplyIds.length} reply command(s) with no pending question`)
+    if (commands.length === 0) {
+      commitConversationCursor()
+      pump.carry.take()
+      return { delayMs: 0, stop: false }
+    }
+  }
+
+  // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
+  // question, only a server-validated reply carrying the exact request id may
+  // answer it. Ordinary commands remain pending; stale replies are consumed
+  // without becoming a fresh promptAsync turn.
+  if (state.pendingQuestion?.requestId && commands.length > 0) {
+    const matching = parsedReplies.find(({ reply }) =>
+      reply?.requestId === state.pendingQuestion?.requestId)
+    const staleIds = parsedReplies
+      .filter(({ reply }) => reply && reply.requestId !== state.pendingQuestion?.requestId)
+      .map(({ command }) => command.message_id)
+    for (const id of staleIds) deliveredIds.add(id)
+    if (staleIds.length > 0) {
+      patchState({ deliveredMessageIds: [...deliveredIds].slice(-50) })
+      logPoll(`needs_input: discarded ${staleIds.length} stale question reply command(s)`)
+    }
+    if (!matching?.reply) {
+      logPoll('needs_input: no exact question reply in command delta — leaving ordinary commands pending')
+      return { delayMs: 1000, stop: false }
+    }
+    const answerCommandId = matching.command.message_id
+    const answerAcceptanceKey = `canonical:${matching.command.delivery.turn_id}:${answerCommandId}`
+    // Keep this existing non-prompt transaction path independent from the
+    // promptAsync acceptance recovery introduced below.
+    pump.acceptingTurn = { key: answerAcceptanceKey, commandIds: [answerCommandId] }
+    pump.promptTransactions.set(answerAcceptanceKey, 'pending')
+    const pendingRequestId = state.pendingQuestion.requestId
+    const replied = await replyPendingQuestion({
+      client,
+      directory,
+      requestId: matching.reply.requestId,
+      answers: matching.reply.answers,
+    })
+    if (replied) {
+      deliveredIds.add(answerCommandId)
+      const remainingCommands = commands.filter((command) =>
+        command.message_id !== answerCommandId && !staleIds.includes(command.message_id))
+      const stages: AcceptanceBookkeepingStage[] = [
+        acceptanceStage('needs_input_delivered_ids', answerAcceptanceKey, () => {
+          const acceptedState = readState()
+          if (!acceptedState) throw new Error('bond state unavailable')
+          const acceptedIds = new Set(acceptedState.deliveredMessageIds ?? [])
+          for (const id of deliveredIds) acceptedIds.add(id)
+          if (!patchState({
+            deliveredMessageIds: [...acceptedIds].slice(-50),
+            currentTurnMessageIds: Array.from(
+              new Set([...(acceptedState.currentTurnMessageIds ?? []), answerCommandId]),
+            ).slice(-50),
+          })) {
+            throw new Error('needs-input delivery ids were not persisted')
+          }
+          hostAcceptedQuestionReplies.delete(pendingRequestId)
+        }),
+      ]
+      if (remainingCommands.length === 0) {
+        stages.push(
+          acceptanceStage('needs_input_conversation_cursor', answerAcceptanceKey, () => {
+            if (!commitConversationCursor()) throw new Error('conversation cursor was not persisted')
+          }),
+          acceptanceStage('needs_input_advisory_carry', answerAcceptanceKey, () => { pump.carry.take() }),
+          acceptanceStage('needs_input_deferred_clear', answerAcceptanceKey, () => {
+            if (!patchState({ deferredCanonicalCommands: [], deferredCanonicalTransaction: null })) {
+              throw new Error('deferred question state was not cleared')
+            }
+          }),
+        )
+      } else {
+        const deferredIngress = freezeCanonicalTurn(structuredClone({
+          ...ingress,
+          command_message_ids: remainingCommands.map((command) => command.message_id),
+          commands: remainingCommands,
+        }))
+        stages.push(acceptanceStage('needs_input_follow_up_deferred', answerAcceptanceKey, () => {
+          if (!patchState({
+            deferredCanonicalCommands: freezeCanonicalTurn(structuredClone(remainingCommands)),
+            deferredCanonicalTransaction: freezeCanonicalTurn(structuredClone({
+              ingress: deferredIngress,
+              liveCursorCandidate,
+              catchUpCursorCandidate,
+            })),
+          })) {
+            throw new Error('follow-up commands were not deferred')
+          }
+        }))
+      }
+      finalizeAcceptedPrompt({
+        pump,
+        key: answerAcceptanceKey,
+        owner: 'canonical',
+        stages,
+        roomGeneration: pump.roomGeneration,
+        devspecSessionId: state.sessionId,
+      })
+      logPoll(`needs_input: delivered owner reply to question ${pendingRequestId}`)
+      if (remainingCommands.length > 0) {
+        logPoll(`needs_input: deferred ${remainingCommands.length} follow-up command(s) until resumed turn settlement`)
+      }
+      return { delayMs: remainingCommands.length > 0 ? 1000 : 0, stop: false }
+    } else {
+      pump.promptTransactions.delete(answerAcceptanceKey)
+      pump.acceptingTurn = null
+      logPoll('needs_input: question.reply failed — immutable command turn remains uncommitted')
+      return { delayMs: 2000, stop: false }
+    }
+  }
+
   const commandIds = commands.map((command) => command.message_id as string)
   const canonicalTurnId = commands[0]!.delivery.turn_id
   const acceptanceKey = `canonical:${canonicalTurnId}:${commandIds.join(',')}`
-
-  // Needs-your-input round-trip (item 7b4090e4): when OpenCode is blocked on a
-  // question, the next owner command answers THAT question — it must not start
-  // a fresh promptAsync turn. Advisory chatter never reaches this branch
-  // (commands are local_agent_dispatch only).
-  if (state.pendingQuestion?.requestId && commands.length > 0) {
-    // Keep this existing non-prompt transaction path independent from the
-    // promptAsync acceptance recovery introduced below.
-    pump.acceptingTurn = { key: acceptanceKey, commandIds }
-    pump.promptTransactions.set(acceptanceKey, 'pending')
-    const pendingRequestId = state.pendingQuestion.requestId
-    const answerText = commands
-      .map((c: any) =>
-        typeof c?.content === 'string'
-          ? c.content
-          : typeof c?.content?.body === 'string'
-            ? c.content.body
-            : typeof c?.text === 'string'
-              ? c.text
-              : '',
-      )
-      .filter((t: string) => t.trim())
-      .join('\n\n')
-    const replied = await replyPendingQuestion({ client, directory, answerText })
-    if (replied) {
-      for (const id of commandIds) deliveredIds.add(id)
-      patchState({
-        deliveredMessageIds: [...deliveredIds].slice(-50),
-        currentTurnMessageIds: Array.from(new Set([...(state.currentTurnMessageIds ?? []), ...commandIds])).slice(-50),
-        deferredCanonicalCommands: [],
-        deferredCanonicalTransaction: null,
-      })
-      commitConversationCursor()
-      pump.carry.take()
-      pump.promptTransactions.set(acceptanceKey, 'accepted')
-      pump.acceptingTurn = null
-      logPoll(`needs_input: delivered owner reply to question ${pendingRequestId}`)
-      return { delayMs: 0, stop: false }
-    }
-    pump.promptTransactions.delete(acceptanceKey)
-    pump.acceptingTurn = null
-    logPoll('needs_input: question.reply failed — immutable command turn remains uncommitted')
-    return { delayMs: 2000, stop: false }
-  }
 
   if (pump.promptTransactions.get(acceptanceKey) === 'accepted') {
     logPoll(`suppressing in-process reoffer of host-accepted canonical turn ${acceptanceKey}`)
