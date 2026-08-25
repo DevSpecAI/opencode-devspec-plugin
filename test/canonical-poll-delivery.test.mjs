@@ -133,9 +133,16 @@ function clientDouble() {
       update: async (args) => { sessionUpdateCalls.push(args); return { data: true } },
     },
     config: { providers: async () => ({ data: { providers: [], default: {} } }) },
-    question: { reply: async (args) => { questionReplyCalls.push(args); return { data: true } } },
     instance: { dispose: async () => { reloadCalls++; return { data: true } } },
     tui: { executeCommand: async () => ({ data: true }) },
+  }
+}
+function questionClientDouble() {
+  return {
+    question: {
+      reply: async (args) => { questionReplyCalls.push(args); return { data: true } },
+      reject: async () => ({ data: true }),
+    },
   }
 }
 function statePath() {
@@ -144,7 +151,10 @@ function statePath() {
 async function tick(client = clientDouble(), opts = {}) {
   return runWithBondAsync(
     opencodeSessionId,
-    () => pollAndDeliver(client, process.cwd(), opencodeSessionId, opts),
+    () => pollAndDeliver(client, process.cwd(), opencodeSessionId, {
+      questionClient: questionClientDouble(),
+      ...opts,
+    }),
   )
 }
 async function settle() {
@@ -221,7 +231,11 @@ describe('pollAndDeliver canonical transaction integration', () => {
 
     await tick()
 
-    assert.deepEqual(questionReplyCalls, [{ requestID: 'que_123', answers: [['A'], ['B', 'Custom']] }])
+    assert.deepEqual(questionReplyCalls, [{
+      requestID: 'que_123',
+      directory: process.cwd(),
+      answers: [['A'], ['B', 'Custom']],
+    }])
     assert.equal(promptCalls.length, 0)
     const state = runWithBond(opencodeSessionId, () => readState())
     assert.equal(state.pendingQuestion ?? null, null)

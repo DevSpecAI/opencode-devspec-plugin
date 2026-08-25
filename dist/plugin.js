@@ -171,6 +171,7 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
                     try {
                         const outcome = await runWithBondAsync(sessionId, () => pollAndDeliver(client, directory, sessionId, {
                             signal: abort.signal,
+                            questionClient: tuiClient ?? undefined,
                             selectOpenCodeSession: async (nextSessionId) => {
                                 if (!tuiClient)
                                     throw new Error('OpenCode server URL is unavailable');
@@ -350,7 +351,7 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
                     // already cleared pendingQuestion before this event arrives.
                     if (event.type.includes('rejected')) {
                         await rejectPendingQuestion({
-                            client,
+                            questionClient: tuiClient ?? undefined,
                             directory,
                             reason: 'OpenCode question was dismissed before an answer arrived.',
                         });

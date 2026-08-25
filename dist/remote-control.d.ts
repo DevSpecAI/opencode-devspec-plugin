@@ -379,12 +379,25 @@ export declare function parseNeedsInputReply(content: unknown): {
 } | null;
 /** Clear a pending question after reply/reject/disconnect. */
 export declare function clearPendingQuestion(): void;
+export interface OpenCodeQuestionClient {
+    question: {
+        reply(input: {
+            requestID: string;
+            directory?: string;
+            answers?: string[][];
+        }): Promise<unknown>;
+        reject(input: {
+            requestID: string;
+            directory?: string;
+        }): Promise<unknown>;
+    };
+}
 /**
  * Deliver an owner command into a waiting OpenCode question (not a new prompt).
  * Returns true when the reply was sent (caller should not also promptAsync).
  */
 export declare function replyPendingQuestion(input: {
-    client: Parameters<Plugin>[0]['client'];
+    questionClient?: OpenCodeQuestionClient;
     directory: string;
     requestId: string;
     answers: string[][];
@@ -393,7 +406,7 @@ export declare function replyPendingQuestion(input: {
  * Reject a pending OpenCode question (terminal dismiss / disconnect path).
  */
 export declare function rejectPendingQuestion(input: {
-    client: Parameters<Plugin>[0]['client'];
+    questionClient?: OpenCodeQuestionClient;
     directory: string;
     reason?: string;
 }): Promise<void>;
@@ -648,6 +661,8 @@ export interface PollOutcome {
 }
 export declare function pollAndDeliver(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string, opts?: {
     signal?: AbortSignal;
+    /** Authenticated v2 client; the legacy plugin client has no question API. */
+    questionClient?: OpenCodeQuestionClient;
     /** Navigate the attached TUI before a deliberate blank-session bond transfer. */
     selectOpenCodeSession?: (sessionId: string) => Promise<void>;
     /** Test-only fault injection at named post-acceptance bookkeeping stages. */
