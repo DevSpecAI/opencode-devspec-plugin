@@ -1,3 +1,4 @@
+import { createOpencodeClient as createOpencodeV2Client } from '@opencode-ai/sdk/v2';
 import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, resolveCurrentAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settlePlaybookRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
 import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
@@ -111,13 +112,22 @@ function permissionRequestId(props) {
  * Watching every tool call for those two names keeps local state in sync
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
-export const DevSpecPlugin = async ({ client, directory }) => {
+export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
     // Commit provenance is process-local. A restart forgets claims, which only
     // disables stamping — it never blocks edits or execution.
     const provenance = new CommitProvenance({ directory });
     // Defensive: older OpenCode builds omit Authorization on the plugin client
     // when a serve password is set. No-op on builds that already inject it.
     applyServeAuthToPluginClient(client, interactiveServeAuth);
+    const tuiClient = serverUrl
+        ? createOpencodeV2Client({
+            baseUrl: serverUrl.toString(),
+            directory,
+            headers: {
+                Authorization: `Basic ${Buffer.from(`${interactiveServeAuth.username}:${interactiveServeAuth.password}`, 'utf8').toString('base64')}`,
+            },
+        })
+        : null;
     // There is deliberately NO fallback session id here (item 2a5d212b). An event
     // that carries no sessionID cannot be attributed to a bond, and "the last
     // session that ran a connect handshake" was never a correct answer to "which
@@ -161,6 +171,16 @@ export const DevSpecPlugin = async ({ client, directory }) => {
                     try {
                         const outcome = await runWithBondAsync(sessionId, () => pollAndDeliver(client, directory, sessionId, {
                             signal: abort.signal,
+                            selectOpenCodeSession: async (nextSessionId) => {
+                                if (!tuiClient)
+                                    throw new Error('OpenCode server URL is unavailable');
+                                const result = await tuiClient.tui.selectSession({
+                                    directory,
+                                    sessionID: nextSessionId,
+                                });
+                                if (result.error)
+                                    throw result.error;
+                            },
                         }));
                         if (outcome.stop) {
                             // One bond ended — keep polling the others (forgetOpenCodeBond already

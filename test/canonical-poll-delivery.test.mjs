@@ -412,11 +412,18 @@ describe('pollAndDeliver canonical transaction integration', () => {
       pending_context_wipe: true,
       pending_context_wipe_reason: 'test',
     })
-    await tick(); await settle()
+    const replacementSessionId = 'ses_blank_after_wipe'
+    const wipeClient = clientDouble()
+    wipeClient.session.create = async () => ({ data: { id: replacementSessionId } })
+    await tick(wipeClient, { selectOpenCodeSession: async () => {} }); await settle()
 
     const control = { id: controlId, verb: 'abort', issued_at: '2026-08-20T12:00:01.000Z', issued_by_user_id: ownerId }
     pollResults.push(changed({ ingress: ingress([], { wake: { kind: 'control', active: true, reason_id: 'owner_control' }, control }) }))
-    await tick(); await settle()
+    await runWithBondAsync(
+      replacementSessionId,
+      () => pollAndDeliver(clientDouble(), process.cwd(), replacementSessionId),
+    )
+    await settle()
 
     const pollCalls = calls.filter((call) => call.name === 'poll_connection')
     assert.ok(pollCalls.some((call) => call.arguments.context_wipe_ack === true), 'context wipe ack path was not exercised')

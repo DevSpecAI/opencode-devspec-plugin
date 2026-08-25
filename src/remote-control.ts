@@ -1750,6 +1750,16 @@ export function listOpenCodeBondSessions(): string[] {
   return [...openCodeBonds.keys()]
 }
 
+/** The active OpenCode session already responsible for a server connection. */
+function bondedSessionForConnection(connectionId: string): string | null {
+  for (const opencodeSessionId of openCodeBonds.keys()) {
+    if (readBondState(opencodeSessionId)?.connectionId === connectionId) {
+      return opencodeSessionId
+    }
+  }
+  return null
+}
+
 /**
  * Whether OpenCode's `permission.ask` hook should auto-allow.
  *
@@ -2023,6 +2033,26 @@ function recordConnectionEventInBond(
   const prior = readState()
   const connectionId = connectionIdHint ?? prior?.connectionId
   if (!connectionId) return
+
+  // An attach tool may be called from an unrelated OpenCode chat while the
+  // referenced connection is already driven by its original chat. Observing
+  // that result must not create a second local pump for the same server row:
+  // the two state files would race busy:true/busy:false and route commands into
+  // different terminal histories. The existing owner learns server-authoritative
+  // room changes from its next poll; this chat remains unbonded.
+  const connectionOwner = bondedSessionForConnection(connectionId)
+  if (connectionOwner && connectionOwner !== opencodeSessionId) {
+    if (prior?.connectionId === connectionId) {
+      clearState()
+      forgetOpenCodeBond(opencodeSessionId)
+      clearConnectionCapability(opencodeSessionId)
+    }
+    logPoll(
+      `attach observation ignored for opencodeSession=${opencodeSessionId}: ` +
+        `connection ${connectionId} is already owned by ${connectionOwner}`,
+    )
+    return
+  }
 
   if (!prior) {
     writeState({
@@ -2652,6 +2682,8 @@ export async function pollAndDeliver(
   sessionId: string,
   opts: {
     signal?: AbortSignal
+    /** Navigate the attached TUI before a deliberate blank-session bond transfer. */
+    selectOpenCodeSession?: (sessionId: string) => Promise<void>
     /** Test-only fault injection at named post-acceptance bookkeeping stages. */
     acceptanceBookkeepingFault?: (stage: string, key: string) => void
   } = {},
@@ -2804,6 +2836,7 @@ export async function pollAndDeliver(
         client,
         directory,
         opencodeSessionId: sessionId,
+        selectOpenCodeSession: opts.selectOpenCodeSession,
       })
     } catch (err) {
       logPoll(`pending_context_wipe failed: ${err}`)
@@ -3692,8 +3725,10 @@ export async function wipeOpenCodeContextInPlace(input: {
   directory: string
   /** Current OpenCode session id (the one the bond / pump is on). */
   opencodeSessionId: string
+  /** Host-supported navigation to make the replacement chat visible in the TUI. */
+  selectOpenCodeSession?: (sessionId: string) => Promise<void>
 }): Promise<{ newOpenCodeSessionId: string; preservedDevspecSessionId: string | null }> {
-  const { client, directory, opencodeSessionId } = input
+  const { client, directory, opencodeSessionId, selectOpenCodeSession } = input
   // Read the bond being transferred explicitly rather than relying on the
   // caller's ambient scope: this function is handed the session id, so it does
   // not need to be told twice, and a transfer that read the wrong bond would be
@@ -3711,6 +3746,31 @@ export async function wipeOpenCodeContextInPlace(input: {
   const session = unwrapSdkData<{ id?: string }>(created)
   const newId = typeof session?.id === 'string' ? session.id : null
   if (!newId) throw new Error('session.create returned no id')
+
+  // Creating an SDK session does not navigate an attached TUI. Move the user
+  // onto the blank chat before changing bond ownership, otherwise remote work
+  // executes invisibly while the watched terminal remains on the old history.
+  // Fail closed: if navigation is unavailable, retain the old visible bond and
+  // do not acknowledge the server's context-wipe request.
+  if (!selectOpenCodeSession) {
+    throw new Error('OpenCode TUI session selection is unavailable; retaining the visible bond')
+  }
+  try {
+    await withTimeout(
+      selectOpenCodeSession(newId),
+      OPENCODE_SESSION_API_TIMEOUT_MS,
+      'tui.selectSession',
+    )
+  } catch (err) {
+    try {
+      if (typeof (client as any).session?.delete === 'function') {
+        await (client as any).session.delete({ path: { id: newId } })
+      }
+    } catch {
+      // Best-effort orphan cleanup; preserving the visible bond is mandatory.
+    }
+    throw err
+  }
 
   // The bond MOVES to the fresh OpenCode session, and because the state file
   // is keyed on that id, moving it is a real file transfer. This is the one

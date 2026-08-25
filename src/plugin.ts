@@ -1,4 +1,5 @@
 import type { Plugin } from '@opencode-ai/plugin'
+import { createOpencodeClient as createOpencodeV2Client } from '@opencode-ai/sdk/v2'
 import {
   clearPermissionAsked,
   clearPendingQuestion,
@@ -161,7 +162,7 @@ function permissionRequestId(props: Record<string, unknown> | undefined): string
  * Watching every tool call for those two names keeps local state in sync
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
-export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
+export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   // Commit provenance is process-local. A restart forgets claims, which only
   // disables stamping — it never blocks edits or execution.
   const provenance = new CommitProvenance({ directory })
@@ -169,6 +170,18 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
   // Defensive: older OpenCode builds omit Authorization on the plugin client
   // when a serve password is set. No-op on builds that already inject it.
   applyServeAuthToPluginClient(client, interactiveServeAuth)
+  const tuiClient = serverUrl
+    ? createOpencodeV2Client({
+        baseUrl: serverUrl.toString(),
+        directory,
+        headers: {
+          Authorization: `Basic ${Buffer.from(
+            `${interactiveServeAuth.username}:${interactiveServeAuth.password}`,
+            'utf8',
+          ).toString('base64')}`,
+        },
+      })
+    : null
 
   // There is deliberately NO fallback session id here (item 2a5d212b). An event
   // that carries no sessionID cannot be attributed to a bond, and "the last
@@ -215,6 +228,14 @@ export const DevSpecPlugin: Plugin = async ({ client, directory }) => {
             const outcome = await runWithBondAsync(sessionId, () =>
               pollAndDeliver(client, directory, sessionId, {
                 signal: abort.signal,
+                selectOpenCodeSession: async (nextSessionId) => {
+                  if (!tuiClient) throw new Error('OpenCode server URL is unavailable')
+                  const result = await tuiClient.tui.selectSession({
+                    directory,
+                    sessionID: nextSessionId,
+                  })
+                  if (result.error) throw result.error
+                },
               }),
             )
             if (outcome.stop) {
