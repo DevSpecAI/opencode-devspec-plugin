@@ -648,6 +648,8 @@ export interface PollOutcome {
 }
 export declare function pollAndDeliver(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string, opts?: {
     signal?: AbortSignal;
+    /** Navigate the attached TUI before a deliberate blank-session bond transfer. */
+    selectOpenCodeSession?: (sessionId: string) => Promise<void>;
     /** Test-only fault injection at named post-acceptance bookkeeping stages. */
     acceptanceBookkeepingFault?: (stage: string, key: string) => void;
 }): Promise<PollOutcome>;
@@ -670,6 +672,8 @@ export declare function wipeOpenCodeContextInPlace(input: {
     directory: string;
     /** Current OpenCode session id (the one the bond / pump is on). */
     opencodeSessionId: string;
+    /** Host-supported navigation to make the replacement chat visible in the TUI. */
+    selectOpenCodeSession?: (sessionId: string) => Promise<void>;
 }): Promise<{
     newOpenCodeSessionId: string;
     preservedDevspecSessionId: string | null;

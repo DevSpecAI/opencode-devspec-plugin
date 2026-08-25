@@ -104,6 +104,11 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
       client: { session: { create: async () => ({ data: { id: newOpenCode } }) } },
       directory: dir,
       opencodeSessionId: oldOpenCode,
+      selectOpenCodeSession: async (sessionId) => {
+        assert.equal(sessionId, newOpenCode)
+        assert.equal(isBondedOpenCodeSession(oldOpenCode), true, 'old bond must remain until the TUI moves')
+        assert.equal(isBondedOpenCodeSession(newOpenCode), false)
+      },
     })
 
     assert.equal(result.newOpenCodeSessionId, newOpenCode)
@@ -142,6 +147,7 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
       client: { session: { create: async () => ({ data: { id: newOpenCode } }) } },
       directory: dir,
       opencodeSessionId: oldOpenCode,
+      selectOpenCodeSession: async () => {},
     })
 
     // The chat the owner walked away from must not be able to speak as this
@@ -155,5 +161,36 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
     assert.equal(live?.sessionId, devspecSession)
 
     forgetOpenCodeBond(newOpenCode)
+  })
+
+  it('retains the visible bond when TUI navigation fails', async () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    const devspecSession = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const oldOpenCode = 'ses_visible'
+    const newOpenCode = 'ses_invisible'
+
+    await runWithBondAsync(oldOpenCode, async () => {
+      writeState({ connectionId: 'conn-visible', sessionId: devspecSession, codename: 'Visible Bird' })
+    })
+    rememberOpenCodeBond(oldOpenCode, devspecSession)
+
+    await assert.rejects(
+      wipeOpenCodeContextInPlace({
+        client: { session: { create: async () => ({ data: { id: newOpenCode } }) } },
+        directory: dir,
+        opencodeSessionId: oldOpenCode,
+        selectOpenCodeSession: async () => { throw new Error('no attached TUI') },
+      }),
+      /no attached TUI/,
+    )
+
+    assert.equal(isBondedOpenCodeSession(oldOpenCode), true)
+    assert.equal(isBondedOpenCodeSession(newOpenCode), false)
+    assert.equal(
+      (await runWithBondAsync(oldOpenCode, async () => readState()))?.connectionId,
+      'conn-visible',
+    )
+    assert.equal(await runWithBondAsync(newOpenCode, async () => readState()), null)
   })
 })

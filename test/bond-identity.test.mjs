@@ -309,6 +309,29 @@ describe('bond identity is the OpenCode session id (a72a4e22)', () => {
     assert.equal(runWithBond(SESSION_B, () => readState()), null, 'and only for that session')
   })
 
+  it('does not create a second local bond when another chat attaches the same connection', () => {
+    recordConnectionEventFromTool(
+      'devspec_register_connection',
+      { local_id: bondLocalId(SESSION_A) },
+      { content: [{ type: 'text', text: JSON.stringify({ connection_id: 'conn-live', codename: 'Live Otter' }) }] },
+      SESSION_A,
+    )
+
+    recordConnectionEventFromTool(
+      'devspec_attach_connection',
+      { connection_id: 'conn-live', session_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' },
+      { content: [{ type: 'text', text: JSON.stringify({
+        connection_id: 'conn-live',
+        session_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      }) }] },
+      SESSION_B,
+    )
+
+    assert.deepEqual(listOpenCodeBondSessions(), [SESSION_A])
+    assert.equal(runWithBond(SESSION_B, () => readState()), null)
+    assert.equal(runWithBond(SESSION_A, () => readState())?.connectionId, 'conn-live')
+  })
+
   it('a handshake with no OpenCode session id is ignored rather than written somewhere', () => {
     recordConnectionEventFromTool(
       'devspec_register_connection',
