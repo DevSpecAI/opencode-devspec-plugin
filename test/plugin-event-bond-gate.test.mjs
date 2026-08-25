@@ -29,6 +29,7 @@ import {
   rememberOpenCodeBond,
   resetBondsForTests,
   runWithBond,
+  setBusy,
   writeState,
 } from '../dist/remote-control.js'
 
@@ -158,6 +159,18 @@ describe('plugin event hook is bond-gated (2a5d212b)', () => {
 
   const readBonded = () => runWithBond(BONDED, () => readState())
   const heartbeats = () => mcp.toolCalls.filter((c) => c.name === 'heartbeat_connection')
+
+  it('picks up the command attempt before asserting legacy busy', async () => {
+    runWithBond(BONDED, () => writeState({ ...readState(), busy: false }))
+
+    await runWithBond(BONDED, () => setBusy(projectDir, true))
+
+    const activityCalls = mcp.toolCalls
+      .filter((call) => call.name === 'report_pickup' || call.name === 'heartbeat_connection')
+      .map((call) => call.name)
+    assert.deepEqual(activityCalls, ['report_pickup', 'heartbeat_connection'])
+    assert.equal(readBonded()?.busy, true)
+  })
 
   it('session.idle from an unbonded child does not end the bonded turn', async () => {
     await hooks.event({ event: { type: 'session.idle', properties: { sessionID: CHILD } } })

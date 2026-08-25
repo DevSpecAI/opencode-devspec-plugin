@@ -345,7 +345,7 @@ describe('agent-canonical bonded answer egress', () => {
     assert.deepEqual(state().deliveredMessageIds, [])
   })
 
-  it('preserves an unanswered command when idle error settlement fails', async () => {
+  it('releases an unanswered command when idle error settlement fails', async () => {
     seed({
       awaitingRemoteReply: true,
       deliveredMessageIds: ['cmd_final'],
@@ -358,10 +358,11 @@ describe('agent-canonical bonded answer egress', () => {
 
     await hooks.event({ event: { type: 'session.idle', properties: { sessionID: BONDED } } })
 
-    assert.equal(state().busy, true)
-    assert.equal(state().awaitingRemoteReply, true)
-    assert.equal(state().currentCommandTurnId, 'turn_canonical')
-    assert.deepEqual(state().deliveredMessageIds, ['cmd_final'])
+    assert.equal(state().busy, false)
+    assert.equal(state().awaitingRemoteReply, false)
+    assert.equal(state().currentCommandTurnId, null)
+    assert.equal(state().currentCommandMessageId, null)
+    assert.deepEqual(state().deliveredMessageIds, [])
   })
 
   it('serializes follow-up prompts without blocking a pending question reply', () => {

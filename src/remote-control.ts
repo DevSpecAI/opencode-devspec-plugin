@@ -448,11 +448,11 @@ interface ConnectionState {
  * below) is the OLDER mechanism; the server still translates it, but that
  * translation is documented as a rollout safety net, not the long-term
  * design — report_pickup/keepalive/complete is. Kept additive (both fire
- * together from setBusy, never as a replacement) for exactly the same
- * reason the Claude poller kept its busy-heartbeat unchanged when adding
- * this: both feed the same server-side attempt idempotently, so there's no
- * migration risk in running them side by side. Connection-scoped
- * (attempt_id omitted) — the server resolves the current attempt.
+ * together from setBusy, never as a replacement), but pickup MUST precede
+ * busy=true: the heartbeat's compatibility translation promotes the pending
+ * command attempt, after which a connection-scoped pickup would otherwise
+ * see no pending attempt and open a source-less Working attempt. Connection-
+ * scoped (attempt_id omitted) — the server resolves the current attempt.
  */
 async function reportActivity(directory: string, verb: 'pickup' | 'keepalive' | 'complete'): Promise<void> {
   const auth = resolveDevspecAuth(directory)
@@ -492,6 +492,9 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
     return // already asserted — avoid a redundant call
   }
   logPoll(`setBusy(${busy}) — was ${state.busy}`)
+  // Establish the command-bound attempt before the legacy busy bridge runs.
+  // Reversing these calls supersedes the real attempt with local Working.
+  if (busy) await reportActivity(directory, 'pickup')
   try {
     await mcpToolsCall({
       mcpUrl: auth.mcp_url,
@@ -523,7 +526,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
     logPoll(`setBusy(${busy}) heartbeat_connection call failed: ${err}`)
     return
   }
-  await reportActivity(directory, busy ? 'pickup' : 'complete')
+  if (!busy) await reportActivity(directory, 'complete')
   if (!busy) {
     const after = readState()
     if (after) {
@@ -4619,8 +4622,7 @@ export async function handleSessionIdle(directory: string): Promise<void> {
       'OpenCode finished this remote turn without posting an answer. The command remains pending for retry.',
     )
     if (!errorPosted) {
-      logPoll('handleSessionIdle: error post failed; preserving command correlation for retry')
-      return
+      logPoll('handleSessionIdle: error post failed; releasing command for redelivery and clearing Working')
     }
     clearInjectTurnState({ unclaim: true })
   }
