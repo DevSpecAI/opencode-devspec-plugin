@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -454,10 +455,38 @@ export function stampCommand(command: string, commit: SimpleGitCommit, itemId: s
   return `${command.slice(0, commit.insertOffset)}${tag}${command.slice(commit.insertOffset)}`
 }
 
+type ProjectPin = { projectId: string; pinPath: string }
+
+function readProjectPinAt(directory: string): ProjectPin | null {
+  const pinPath = path.join(directory, '.devspec', 'project.json')
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pinPath, 'utf8')) as { project_id?: unknown }
+    if (typeof parsed.project_id === 'string' && FULL_UUID.test(parsed.project_id.trim())) {
+      return { projectId: parsed.project_id.trim().toLowerCase(), pinPath }
+    }
+  } catch {
+  }
+  return null
+}
+
+export function resolveRepositoryMainWorktree(startDir: string): string | null {
+  if (!startDir) return null
+  const result = spawnSync(
+    'git',
+    ['-C', path.resolve(startDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+    { encoding: 'utf8', timeout: 1000, windowsHide: true },
+  )
+  if (result.status !== 0 || result.error) return null
+  const commonDir = result.stdout.trim()
+  if (!path.isAbsolute(commonDir) || path.basename(commonDir) !== '.git') return null
+  return path.dirname(commonDir)
+}
+
 export function readProjectPin(
   startDir: string,
   homeDir: string = os.homedir(),
-): { projectId: string; pinPath: string } | null {
+  mainWorktree: string | null = resolveRepositoryMainWorktree(startDir),
+): ProjectPin | null {
   if (!startDir) return null
   let dir = path.resolve(startDir)
   const home = path.resolve(homeDir)
@@ -465,17 +494,15 @@ export function readProjectPin(
   while (!seen.has(dir)) {
     seen.add(dir)
     if (dir === home) break
-    const pinPath = path.join(dir, '.devspec', 'project.json')
-    try {
-      const parsed = JSON.parse(fs.readFileSync(pinPath, 'utf8')) as { project_id?: unknown }
-      if (typeof parsed.project_id === 'string' && FULL_UUID.test(parsed.project_id.trim())) {
-        return { projectId: parsed.project_id.trim().toLowerCase(), pinPath }
-      }
-    } catch {
-    }
+    const pin = readProjectPinAt(dir)
+    if (pin) return pin
     const parent = path.dirname(dir)
     if (parent === dir) break
     dir = parent
+  }
+  if (mainWorktree) {
+    const main = path.resolve(mainWorktree)
+    if (main !== home && !seen.has(main)) return readProjectPinAt(main)
   }
   return null
 }
@@ -540,6 +567,7 @@ function nudgeText(): string {
 export class CommitProvenance {
   readonly #directory: string
   readonly #homeDir: string
+  readonly #mainWorktree: string | null
   readonly #claimsBySession = new Map<string, Set<string>>()
   readonly #nudged = new Set<string>()
   readonly #pendingNotes = new Map<string, string>()
@@ -547,10 +575,13 @@ export class CommitProvenance {
   constructor(options: { directory: string; homeDir?: string } = { directory: process.cwd() }) {
     this.#directory = options.directory
     this.#homeDir = options.homeDir ?? os.homedir()
+    // Repository identity is stable for the plugin lifetime; resolve it once rather
+    // than invoking Git on every edit and commit hook.
+    this.#mainWorktree = resolveRepositoryMainWorktree(this.#directory)
   }
 
   hasJurisdiction(): boolean {
-    return readProjectPin(this.#directory, this.#homeDir) !== null
+    return this.#projectPin() !== null
   }
 
   claimsForSession(sessionID: string): string[] {
@@ -558,7 +589,7 @@ export class CommitProvenance {
   }
 
   didNudge(sessionID: string): boolean {
-    const pin = readProjectPin(this.#directory, this.#homeDir)
+    const pin = this.#projectPin()
     return this.#nudged.has(`${sessionID}\0${pin?.projectId ?? this.#directory}`)
   }
 
@@ -605,7 +636,7 @@ export class CommitProvenance {
 
     if (!session || !isKnownEditTool(tool) || !this.hasJurisdiction()) return
     if (this.claimsForSession(session).length > 0) return
-    const pin = readProjectPin(this.#directory, this.#homeDir)
+    const pin = this.#projectPin()
     const key = `${session}\0${pin?.projectId ?? this.#directory}`
     if (this.#nudged.has(key)) return
     this.#nudged.add(key)
@@ -623,6 +654,10 @@ export class CommitProvenance {
     this.#claimsBySession.clear()
     this.#nudged.clear()
     this.#pendingNotes.clear()
+  }
+
+  #projectPin(): ProjectPin | null {
+    return readProjectPin(this.#directory, this.#homeDir, this.#mainWorktree)
   }
 
   #observeClaim(tool: string, session: string, args: unknown, hookOutput: unknown): void {

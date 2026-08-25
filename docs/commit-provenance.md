@@ -15,10 +15,10 @@ is ported from another host.
 |---|---|---|---|
 | **Edit events** (`edit`, `write`) | `tool.execute.after` fires after the write; `before` can throw (that would *deny*) | **Never denies.** Appends at most one reminder to the tool result per session+project when a pin exists and no claim is held | Instructions keep early claiming as the normal workflow |
 | **Arbitrary execution** (`bash` and every other tool) | `tool.execute.before` sees the tool name and `args` | **Never denies** for lack of a claim. No allowlist, no tokenizer over arbitrary commands, no unknown-tool classification | — |
-| **Commit message inspection** | Only a string: `bash` args `command` / `cmd`. No first-class commit event | Reads the message from the narrow `git commit … -m <quoted>` shape, including a leading `cd <single-path> &&` and `git -C <path>`. Every other shape is allowed untouched | Server-side commit ingestion + unlinked-commit analyzer |
+| **Commit message inspection** | Only a string: `bash` args `command` / `cmd`. No first-class commit event | Reads quoted `-m`, single-quoted heredocs through `-F -` or `-m "$(cat …)"`, and a leading `cd <single-path> &&`, `git add … &&`, or `git -C <path>`. Every ambiguous shape is allowed untouched | Server-side commit ingestion + unlinked-commit analyzer |
 | **Commit message transformation** | **Yes** — `tool.execute.before` may mutate `output.args` (already used for `register_connection.local_id`) | Appends `[devspec:<uuid>]` inside the quoted message when exactly one session claim is active, and reports it on the tool result | — |
 | **Push observation** | The `git push` command string is visible on `bash` | **Recognised but never blocked.** OpenCode does not expose outgoing commit objects, and this item does not invent a history rewrite or a network linkage check | Analyzer |
-| **Project association** | Plugin `directory` plus `.devspec/project.json`; `/devspec.remote` already *offers* to write a pin | Jurisdiction is a well-formed pin walked cwd→parents, never at `$HOME`. The plugin never writes the pin. No pin means no deny and no nudge. **Known gap (`f81e105d`): the repository's main working tree is not consulted, so a session running in a linked worktree has no jurisdiction at all** — the pin is untracked and lives in the main checkout, while the contract asks for isolated worktrees | Ingestion never depends on a pin. The contract states what this must meet: jurisdiction is a property of the repository, not of the working directory (`commit_provenance_contract.project_association`) |
+| **Project association** | Plugin `directory`, Git's common directory, and `.devspec/project.json`; `/devspec.remote` may explicitly offer to write a pin | Jurisdiction stays deliberately **pin-only**: first walk cwd→parents (never `$HOME`), then check the repository's main working tree resolved once from `git rev-parse --path-format=absolute --git-common-dir`. The plugin never writes a pin during generic connection. No pin or uncertain Git identity means no deny and no nudge | Ingestion never depends on a pin. The contract states that jurisdiction belongs to the repository rather than the current worktree (`commit_provenance_contract.project_association`) |
 | **Offline / server error** | n/a — this module makes no network call | Reference checking is **local shape only**. Offline work is unaffected | Server-side linkage catches a well-formed-but-wrong uuid |
 | **Feedback continuation** | Throwing from `tool.execute.before` fails one tool call and returns the error; it does not end the session | Denials carry a complete recovery route. No terminate/stop field is emitted | — |
 | **Session identity** | Every hook carries `sessionID` | Claims and the one nudge are session-scoped. Remote `local_id` injection, bonds, and egress are unchanged | — |
@@ -28,7 +28,7 @@ is ported from another host.
 
 Only when all of these are true:
 
-1. The `bash` command is a readable simple commit (including the two worktree forms).
+1. The `bash` command is a readable commit (quoted `-m` or one of the bounded single-quoted heredoc forms).
 2. A positive local pin exists.
 3. The visible message has **no** well-formed `[devspec:<id>]` (full uuid or 8-char short code).
 4. The message is not ambiguous (two or more well-formed references).

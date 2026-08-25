@@ -24,6 +24,7 @@ import {
   localReferenceOutcome,
   readProjectPin,
   referencesIn,
+  resolveRepositoryMainWorktree,
   simpleGitCommit,
   stampCommand,
 } from '../dist/commit-provenance.js'
@@ -51,6 +52,27 @@ function pinDir() {
   fs.mkdirSync(path.join(dir, '.devspec'))
   fs.writeFileSync(path.join(dir, '.devspec', 'project.json'), JSON.stringify({ project_id: PIN_ID }))
   return dir
+}
+
+function linkedWorktreeFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-linked-pin-'))
+  const main = path.join(root, 'main')
+  const linked = path.join(root, 'linked')
+  fs.mkdirSync(main)
+  const git = (args, cwd = main) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr)
+  }
+  git(['init', '-q'])
+  git(['config', 'user.email', 'test@example.com'])
+  git(['config', 'user.name', 'Test'])
+  fs.writeFileSync(path.join(main, 'tracked.txt'), 'initial')
+  git(['add', 'tracked.txt'])
+  git(['commit', '-q', '-m', 'initial'])
+  git(['worktree', 'add', '-q', '-b', 'linked-test', linked])
+  fs.mkdirSync(path.join(main, '.devspec'))
+  fs.writeFileSync(path.join(main, '.devspec', 'project.json'), JSON.stringify({ project_id: PIN_ID }))
+  return { root, main, linked }
 }
 
 describe('capability-honest surfaces', () => {
@@ -331,6 +353,51 @@ describe('project pin is positive local jurisdiction only', () => {
       assert.equal(readProjectPin(home, home), null)
     } finally {
       fs.rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('inherits the main checkout pin through a real linked worktree', () => {
+    const fixture = linkedWorktreeFixture()
+    try {
+      assert.equal(resolveRepositoryMainWorktree(fixture.linked), fixture.main)
+      assert.equal(readProjectPin(fixture.linked, fixture.root)?.projectId, PIN_ID)
+
+      const tracker = new CommitProvenance({ directory: fixture.linked, homeDir: fixture.root })
+      fs.renameSync(path.join(fixture.linked, '.git'), path.join(fixture.linked, '.git-hidden'))
+      assert.equal(tracker.hasJurisdiction(), true)
+      assert.throws(
+        () => tracker.before('bash', 'linked-session', { command: "git commit -m 'untagged'" }),
+        /would land unlinked/,
+      )
+
+      const output = { output: 'wrote file' }
+      tracker.after('edit', 'linked-session', { filePath: 'tracked.txt' }, output, 'edit-1')
+      assert.match(output.output, /claim_work_item/)
+
+      tracker.after('devspec_claim_work_item', 'linked-session', { action_item_id: ITEM }, claimed())
+      const args = { command: "git commit -m 'tagged'" }
+      tracker.before('bash', 'linked-session', args, 'commit-1')
+      assert.match(args.command, new RegExp(`\\[devspec:${ITEM}\\]`))
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps unpinned, unreadable, and unresolvable folders fail-open', () => {
+    const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-unpinned-'))
+    const fixture = linkedWorktreeFixture()
+    try {
+      fs.writeFileSync(path.join(fixture.main, '.devspec', 'project.json'), '{')
+      for (const directory of [plain, fixture.linked]) {
+        const tracker = new CommitProvenance({ directory, homeDir: path.dirname(directory) })
+        assert.equal(tracker.hasJurisdiction(), false)
+        assert.doesNotThrow(() =>
+          tracker.before('bash', 'fail-open', { command: "git commit -m 'untagged'" }),
+        )
+      }
+    } finally {
+      fs.rmSync(plain, { recursive: true, force: true })
+      fs.rmSync(fixture.root, { recursive: true, force: true })
     }
   })
 })
