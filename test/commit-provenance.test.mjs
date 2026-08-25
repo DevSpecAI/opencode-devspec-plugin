@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { afterEach, beforeEach, describe, it, mock } from 'node:test'
 import { DevSpecPlugin } from '../dist/plugin.js'
 import {
@@ -16,6 +17,7 @@ import {
   CommitProvenance,
   CONTRACT_URI,
   decideCommit,
+  heredocGitCommit,
   isBashTool,
   isKnownEditTool,
   isSimpleGitPush,
@@ -117,6 +119,86 @@ describe('readable commit shapes include isolated-worktree forms', () => {
       decideCommit({ command: 'git commit -m unquoted', claims: [ITEM], hasJurisdiction: true }).action,
       'deny',
     )
+  })
+})
+
+describe('readable multi-line commit shapes', () => {
+  const stdinMessage = (body) => `git commit -q -F - <<'MSG'\n${body}\nMSG`
+  const substitutionMessage = (body) => `git commit -q -m "$(cat <<'MSG'\n${body}\nMSG\n)"`
+
+  it('reads both single-quoted heredoc forms and their full message bodies', () => {
+    assert.equal(heredocGitCommit(stdinMessage('subject\n\nbody')).message, 'subject\n\nbody')
+    assert.equal(heredocGitCommit(substitutionMessage('subject\n\nbody')).message, 'subject\n\nbody')
+    assert.equal(
+      heredocGitCommit(`git add -A && ${stdinMessage('subject')}`).message,
+      'subject',
+    )
+  })
+
+  it('denies without a claim and stamps exactly one claim into the subject', () => {
+    for (const command of [stdinMessage('subject\n\nbody'), substitutionMessage('subject\n\nbody')]) {
+      assert.equal(decideCommit({ command, claims: [], hasJurisdiction: true }).action, 'deny')
+      const decision = decideCommit({ command, claims: [ITEM], hasJurisdiction: true })
+      assert.equal(decision.action, 'stamp')
+      assert.match(decision.command, new RegExp(`subject \\[devspec:${ITEM}\\]\\n\\nbody`))
+      assert.equal(heredocGitCommit(decision.command).message.match(/\[devspec:/g)?.length, 1)
+    }
+  })
+
+  it('keeps every ambiguous or externally-backed message fail-open', () => {
+    for (const command of [
+      `git commit -F - <<MSG\nsubject\nMSG`,
+      `git commit -F - <<-'MSG'\nsubject\nMSG`,
+      `git commit -F - <<'A'\nx\nA\ncat <<'B'\ny\nB`,
+      `git commit -F - <<'MSG'\nsubject`,
+      `git commit -F - <<'MSG'\nsubject\nMSG\n; true`,
+      `git commit -m "$(printf <<'MSG'\nsubject\nMSG\n)"`,
+      `git commit -m "$(cat <<'MSG'\nsubject\nMSG\n)$(date)"`,
+      `git commit -m "one" -m "$(cat <<'MSG'\nsubject\nMSG\n)"`,
+      `git commit -F message.txt`,
+      `git commit --file=message.txt`,
+    ]) {
+      assert.equal(heredocGitCommit(command), null, command)
+      assert.deepEqual(
+        decideCommit({ command, claims: [], hasJurisdiction: true }),
+        { action: 'allow' },
+        command,
+      )
+    }
+  })
+
+  it('produces commands that execute as real commits', () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-stamp-exec-'))
+    try {
+      for (const args of [
+        ['init', '-q'],
+        ['config', 'user.email', 'test@example.com'],
+        ['config', 'user.name', 'Test'],
+      ]) {
+        assert.equal(spawnSync('git', args, { cwd: scratch }).status, 0)
+      }
+
+      for (const [name, makeCommand] of [
+        ['stdin', stdinMessage],
+        ['substitution', substitutionMessage],
+      ]) {
+        fs.writeFileSync(path.join(scratch, `${name}.txt`), name)
+        assert.equal(spawnSync('git', ['add', `${name}.txt`], { cwd: scratch }).status, 0)
+        const command = makeCommand(`subject ${name}\n\nbody`)
+        const decision = decideCommit({ command, claims: [ITEM], hasJurisdiction: true })
+        assert.equal(decision.action, 'stamp')
+        const run = spawnSync('bash', ['-c', decision.command], { cwd: scratch, encoding: 'utf8' })
+        assert.equal(run.status, 0, run.stderr)
+        const message = spawnSync('git', ['log', '-1', '--format=%B'], {
+          cwd: scratch,
+          encoding: 'utf8',
+        }).stdout
+        assert.match(message, new RegExp(`subject ${name} \\[devspec:${ITEM}\\]`))
+        assert.match(message, /\n\nbody/)
+      }
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true })
+    }
   })
 })
 
@@ -291,6 +373,7 @@ describe('CommitProvenance does not claim-gate work', () => {
     tracker.after('write', 's1', {}, first, 'a')
     tracker.after('edit', 's1', {}, second, 'b')
     assert.match(first.output, /claim_work_item/)
+    assert.doesNotMatch(first.output, /will be refused|analy[sz]er/i)
     assert.equal(second.output, 'ok')
     assert.equal(tracker.didNudge('s1'), true)
     const other = { output: 'ok' }

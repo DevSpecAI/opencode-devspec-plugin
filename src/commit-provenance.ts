@@ -257,15 +257,18 @@ function tokenizeReadable(command: string): Token[][] | null {
   return segments.every((segment) => segment.length > 0) ? segments : null
 }
 
+function readablePrefix(prefix: Token[]): boolean {
+  if (prefix.length === 2 && prefix[0]?.value === 'cd' && !prefix[1]!.value.startsWith('-')) {
+    return true
+  }
+  return prefix.length >= 3 && prefix[0]?.value === 'git' && prefix[1]?.value === 'add'
+}
+
 export function simpleGitCommit(command: string): SimpleGitCommit | null {
   const segments = tokenizeReadable(command)
   if (!segments) return null
 
-  if (segments.length === 2) {
-    const prefix = segments[0]!
-    if (prefix.length !== 2 || prefix[0]!.value !== 'cd') return null
-    if (prefix[1]!.value.startsWith('-')) return null
-  }
+  if (segments.length === 2 && !readablePrefix(segments[0]!)) return null
 
   const words = segments[segments.length - 1]!
   if (words[0]?.value !== 'git') return null
@@ -334,6 +337,67 @@ export function simpleGitCommit(command: string): SimpleGitCommit | null {
     insertOffset: message.end - 1,
     appendable: quoted && !message.joined,
   }
+}
+
+const HEREDOC_DELIMITER = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+// Only single-quoted inline heredocs are deterministic: the shell performs no
+// expansion, and stamping rewrites the command rather than a caller-owned file.
+export function heredocGitCommit(command: string): SimpleGitCommit | null {
+  if (!command || command.length > 8192 || command.includes('`')) return null
+
+  const open = command.indexOf("<<'")
+  if (open === -1 || command.indexOf('<<') !== open || command.indexOf('<<', open + 3) !== -1) {
+    return null
+  }
+
+  const delimiterEnd = command.indexOf("'", open + 3)
+  if (delimiterEnd === -1) return null
+  const delimiter = command.slice(open + 3, delimiterEnd)
+  if (!HEREDOC_DELIMITER.test(delimiter)) return null
+
+  let cursor = delimiterEnd + 1
+  if (command[cursor] === '\r') cursor += 1
+  if (command[cursor] !== '\n') return null
+  const bodyStart = cursor + 1
+
+  const terminator = `\n${delimiter}`
+  let close = command.indexOf(terminator, bodyStart - 1)
+  while (close !== -1) {
+    const after = command[close + terminator.length]
+    if (after === undefined || after === '\n' || after === '\r') break
+    close = command.indexOf(terminator, close + 1)
+  }
+  if (close === -1 || close < bodyStart - 1) return null
+
+  const body = command.slice(bodyStart, close)
+  const head = command.slice(0, open)
+  const tail = command.slice(close + terminator.length)
+  if (head.includes('\n') || head.includes('\r')) return null
+
+  let normalized: string
+  const viaStdin = /^(?<pre>.*?)\s(?:-F|--file)\s+-\s*$/.exec(head)
+  const viaSubstitution = /^(?<pre>.*?)\s-m\s+"\$\(cat\s*$/.exec(head)
+  const stdinPrefix = viaStdin?.groups?.pre
+  const substitutionPrefix = viaSubstitution?.groups?.pre
+  if (stdinPrefix !== undefined) {
+    if (tail.trim() !== '' || head.includes('$')) return null
+    normalized = `${stdinPrefix} -m "x"`
+  } else if (substitutionPrefix !== undefined) {
+    if (tail.trim() !== ')"' || command.indexOf('$(') !== command.lastIndexOf('$(')) return null
+    if (substitutionPrefix.includes('$')) return null
+    normalized = `${substitutionPrefix} -m "x"`
+  } else {
+    return null
+  }
+
+  const simple = simpleGitCommit(normalized)
+  if (!simple || simple.message !== 'x') return null
+
+  // Put the reference on the subject, never after the delimiter or a body trailer.
+  const firstBreak = body.indexOf('\n')
+  const subjectEnd = firstBreak === -1 ? bodyStart + body.length : bodyStart + firstBreak
+  return { message: body, insertOffset: subjectEnd, appendable: true }
 }
 
 export function isSimpleGitPush(command: string): boolean {
@@ -437,7 +501,7 @@ export function decideCommit(input: {
   claims: string[]
   hasJurisdiction: boolean
 }): ProvenanceDecision {
-  const commit = simpleGitCommit(input.command)
+  const commit = simpleGitCommit(input.command) ?? heredocGitCommit(input.command)
   if (!commit) return { action: 'allow' }
 
   const outcome = localReferenceOutcome(commit.message)
