@@ -1136,17 +1136,31 @@ export function clearPendingQuestion(): void {
   logPoll('clearPendingQuestion: cleared')
 }
 
+export interface OpenCodeQuestionClient {
+  question: {
+    reply(input: {
+      requestID: string
+      directory?: string
+      answers?: string[][]
+    }): Promise<unknown>
+    reject(input: {
+      requestID: string
+      directory?: string
+    }): Promise<unknown>
+  }
+}
+
 /**
  * Deliver an owner command into a waiting OpenCode question (not a new prompt).
  * Returns true when the reply was sent (caller should not also promptAsync).
  */
 export async function replyPendingQuestion(input: {
-  client: Parameters<Plugin>[0]['client']
+  questionClient?: OpenCodeQuestionClient
   directory: string
   requestId: string
   answers: string[][]
 }): Promise<boolean> {
-  const { client, directory, requestId, answers } = input
+  const { questionClient, directory, requestId, answers } = input
   const state = readState()
   const pending = state?.pendingQuestion
   if (!state || !pending?.requestId || pending.requestId !== requestId) return false
@@ -1159,14 +1173,17 @@ export async function replyPendingQuestion(input: {
     return true
   }
   try {
-    await withTimeout(
-      (client as any).question.reply({
+    if (!questionClient) throw new Error('OpenCode v2 question client is unavailable')
+    const result = await withTimeout(
+      questionClient.question.reply({
         requestID: pending.requestId,
+        directory,
         answers,
       }),
       OPENCODE_SESSION_API_TIMEOUT_MS,
       'question.reply',
     )
+    assertSdkAccepted(result, 'question.reply')
     // The host effect is irreversible. Remember it before touching local disk so
     // a write fault can never make this process answer the same question twice.
     hostAcceptedQuestionReplies.add(requestId)
@@ -1198,20 +1215,22 @@ export async function replyPendingQuestion(input: {
  * Reject a pending OpenCode question (terminal dismiss / disconnect path).
  */
 export async function rejectPendingQuestion(input: {
-  client: Parameters<Plugin>[0]['client']
+  questionClient?: OpenCodeQuestionClient
   directory: string
   reason?: string
 }): Promise<void> {
-  const { client, directory, reason } = input
+  const { questionClient, directory, reason } = input
   const state = readState()
   const pending = state?.pendingQuestion
   if (!state || !pending?.requestId) return
   try {
-    await withTimeout(
-      (client as any).question.reject({ requestID: pending.requestId }),
+    if (!questionClient) throw new Error('OpenCode v2 question client is unavailable')
+    const result = await withTimeout(
+      questionClient.question.reject({ requestID: pending.requestId, directory }),
       OPENCODE_SESSION_API_TIMEOUT_MS,
       'question.reject',
     )
+    assertSdkAccepted(result, 'question.reject')
   } catch (err) {
     logPoll(`rejectPendingQuestion: reject call failed: ${err}`)
   }
@@ -2682,6 +2701,8 @@ export async function pollAndDeliver(
   sessionId: string,
   opts: {
     signal?: AbortSignal
+    /** Authenticated v2 client; the legacy plugin client has no question API. */
+    questionClient?: OpenCodeQuestionClient
     /** Navigate the attached TUI before a deliberate blank-session bond transfer. */
     selectOpenCodeSession?: (sessionId: string) => Promise<void>
     /** Test-only fault injection at named post-acceptance bookkeeping stages. */
@@ -3395,7 +3416,7 @@ export async function pollAndDeliver(
     pump.promptTransactions.set(answerAcceptanceKey, 'pending')
     const pendingRequestId = state.pendingQuestion.requestId
     const replied = await replyPendingQuestion({
-      client,
+      questionClient: opts.questionClient,
       directory,
       requestId: matching.reply.requestId,
       answers: matching.reply.answers,

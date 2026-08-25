@@ -811,7 +811,7 @@ export function clearPendingQuestion() {
  * Returns true when the reply was sent (caller should not also promptAsync).
  */
 export async function replyPendingQuestion(input) {
-    const { client, directory, requestId, answers } = input;
+    const { questionClient, directory, requestId, answers } = input;
     const state = readState();
     const pending = state?.pendingQuestion;
     if (!state || !pending?.requestId || pending.requestId !== requestId)
@@ -828,10 +828,14 @@ export async function replyPendingQuestion(input) {
         return true;
     }
     try {
-        await withTimeout(client.question.reply({
+        if (!questionClient)
+            throw new Error('OpenCode v2 question client is unavailable');
+        const result = await withTimeout(questionClient.question.reply({
             requestID: pending.requestId,
+            directory,
             answers,
         }), OPENCODE_SESSION_API_TIMEOUT_MS, 'question.reply');
+        assertSdkAccepted(result, 'question.reply');
         // The host effect is irreversible. Remember it before touching local disk so
         // a write fault can never make this process answer the same question twice.
         hostAcceptedQuestionReplies.add(requestId);
@@ -864,13 +868,16 @@ export async function replyPendingQuestion(input) {
  * Reject a pending OpenCode question (terminal dismiss / disconnect path).
  */
 export async function rejectPendingQuestion(input) {
-    const { client, directory, reason } = input;
+    const { questionClient, directory, reason } = input;
     const state = readState();
     const pending = state?.pendingQuestion;
     if (!state || !pending?.requestId)
         return;
     try {
-        await withTimeout(client.question.reject({ requestID: pending.requestId }), OPENCODE_SESSION_API_TIMEOUT_MS, 'question.reject');
+        if (!questionClient)
+            throw new Error('OpenCode v2 question client is unavailable');
+        const result = await withTimeout(questionClient.question.reject({ requestID: pending.requestId, directory }), OPENCODE_SESSION_API_TIMEOUT_MS, 'question.reject');
+        assertSdkAccepted(result, 'question.reject');
     }
     catch (err) {
         logPoll(`rejectPendingQuestion: reject call failed: ${err}`);
@@ -2698,7 +2705,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         pump.promptTransactions.set(answerAcceptanceKey, 'pending');
         const pendingRequestId = state.pendingQuestion.requestId;
         const replied = await replyPendingQuestion({
-            client,
+            questionClient: opts.questionClient,
             directory,
             requestId: matching.reply.requestId,
             answers: matching.reply.answers,
