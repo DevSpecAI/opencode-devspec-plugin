@@ -73,6 +73,7 @@ import {
   type CarriedContext,
 } from './poll-turn.js'
 import {
+  CONNECT_HANDSHAKE_TIMEOUT_MS,
   shouldDeferInjectDuringConnect,
 } from './remote-format.js'
 import { logRemoteControlStory } from './remote-control-story.js'
@@ -90,6 +91,7 @@ import {
 const ANSWER_POST_PROCESS_ID = crypto.randomBytes(12).toString('hex')
 
 export {
+  CONNECT_HANDSHAKE_TIMEOUT_MS,
   collapseOrphanMarkdownFences,
   isDevspecRemoteControlCommand,
   shouldDeferInjectDuringConnect,
@@ -397,6 +399,10 @@ interface ConnectionState {
    * flag that starts and ends with the connect turn cannot tag a later one.
    */
   connectHandshakePending?: boolean
+  /**
+   * Epoch ms when connectHandshakePending was set, for timeout expiry.
+   */
+  connectHandshakeStartedAt?: number | null
   /**
    * Owner commands that arrived while inject had to wait (connect handshake
    * still settling, or another host acceptance in flight). Item 4414d2d9:
@@ -1346,9 +1352,13 @@ export function shouldDeferCanonicalPrompt(opts: {
   awaitingRemoteReply?: boolean | null
   pendingQuestionRequestId?: string | null
   connectHandshakePending?: boolean | null
+  connectHandshakeStartedAt?: number | null
+  now?: number
 }): boolean {
-  if ((opts.busy || opts.awaitingRemoteReply) && !opts.pendingQuestionRequestId) return true
-  return shouldDeferInjectDuringConnect(opts)
+  if (opts.pendingQuestionRequestId) return false
+  if (opts.awaitingRemoteReply) return true
+  if (shouldDeferInjectDuringConnect(opts)) return true
+  return Boolean(opts.busy)
 }
 
 /**
@@ -2010,6 +2020,7 @@ function recordConnectionEventInBond(
         connectionId,
         codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
         connectHandshakePending: true,
+        connectHandshakeStartedAt: Date.now(),
       })
     } else {
       writeState({
@@ -2017,6 +2028,7 @@ function recordConnectionEventInBond(
         sessionId: null,
         codename: typeof result?.codename === 'string' ? result.codename : null,
         connectHandshakePending: true,
+        connectHandshakeStartedAt: Date.now(),
       })
     }
     // Sessionless bond. The key does not change when this session later
@@ -2082,6 +2094,7 @@ function recordConnectionEventInBond(
       sessionId,
       codename: null,
       connectHandshakePending: true,
+      connectHandshakeStartedAt: Date.now(),
     })
   } else {
     patchState({
@@ -2090,6 +2103,9 @@ function recordConnectionEventInBond(
       // First time this bond learns its room: suppress the connect turn's own
       // assistant message, which is chrome for the terminal, not an answer.
       connectHandshakePending: prior.sessionId ? prior.connectHandshakePending : true,
+      connectHandshakeStartedAt: prior.sessionId
+        ? (prior.connectHandshakeStartedAt ?? null)
+        : Date.now(),
     })
   }
   if (opencodeSessionId) rememberOpenCodeBond(opencodeSessionId, sessionId)
@@ -2200,7 +2216,11 @@ export async function attachSession(
     typeof result?.session_id === 'string' ? result.session_id : sessionId
   // No key flip, so no migration: the same file gains a room.
   runWithBond(opencodeSessionId, () => {
-    patchState({ sessionId: canonicalSessionId, connectHandshakePending: true })
+    patchState({
+      sessionId: canonicalSessionId,
+      connectHandshakePending: true,
+      connectHandshakeStartedAt: Date.now(),
+    })
   })
   rememberOpenCodeBond(opencodeSessionId, canonicalSessionId)
 }
@@ -3013,9 +3033,22 @@ export async function pollAndDeliver(
     const persistedDeferred = state.deferredCanonicalTransaction
     const deferredCommands = state.deferredCanonicalCommands ?? []
       if (persistedDeferred && deferredCommands.length > 0) {
+      if (
+        state.connectHandshakePending &&
+        !state.awaitingRemoteReply &&
+        !shouldDeferInjectDuringConnect({
+          connectHandshakePending: state.connectHandshakePending,
+          connectHandshakeStartedAt: state.connectHandshakeStartedAt,
+          awaitingRemoteReply: state.awaitingRemoteReply,
+          busy: state.busy,
+        })
+      ) {
+        patchState({ connectHandshakePending: false, connectHandshakeStartedAt: null })
+      }
       const deferInject = shouldDeferCanonicalPrompt({
         busy: state.busy,
         connectHandshakePending: state.connectHandshakePending,
+        connectHandshakeStartedAt: state.connectHandshakeStartedAt,
         awaitingRemoteReply: state.awaitingRemoteReply,
         pendingQuestionRequestId: state.pendingQuestion?.requestId,
       })
@@ -3293,9 +3326,22 @@ export async function pollAndDeliver(
   // the connection-scoped command correlation used by the first answer. Queue
   // follow-ups until that answer settles. A pending question is the exception:
   // its next owner command is routed to question.reply below, not promptAsync.
+  if (
+    state.connectHandshakePending &&
+    !state.awaitingRemoteReply &&
+    !shouldDeferInjectDuringConnect({
+      connectHandshakePending: state.connectHandshakePending,
+      connectHandshakeStartedAt: state.connectHandshakeStartedAt,
+      awaitingRemoteReply: state.awaitingRemoteReply,
+      busy: state.busy,
+    })
+  ) {
+    patchState({ connectHandshakePending: false, connectHandshakeStartedAt: null })
+  }
   const deferInject = shouldDeferCanonicalPrompt({
     busy: state.busy,
     connectHandshakePending: state.connectHandshakePending,
+    connectHandshakeStartedAt: state.connectHandshakeStartedAt,
     awaitingRemoteReply: state.awaitingRemoteReply,
     pendingQuestionRequestId: state.pendingQuestion?.requestId,
   })
@@ -4634,6 +4680,7 @@ export function settleAgentPostResult(toolName: string, result: unknown, callId:
     pendingPermissions: [],
     permissionResolutionObserved: false,
     connectHandshakePending: false,
+    connectHandshakeStartedAt: null,
     answerPostInFlight: false,
     answerPostCallId: null,
     answerPostProcessId: null,
@@ -4726,6 +4773,7 @@ export async function handleSessionIdle(directory: string): Promise<void> {
     pendingPermissions: [],
     permissionResolutionObserved: false,
     connectHandshakePending: false,
+    connectHandshakeStartedAt: null,
     answerPostInFlight: false,
     answerPostCallId: null,
     answerPostProcessId: null,

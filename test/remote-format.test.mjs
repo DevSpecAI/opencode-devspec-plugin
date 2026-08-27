@@ -17,6 +17,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  CONNECT_HANDSHAKE_TIMEOUT_MS,
   collapseOrphanMarkdownFences,
   isDevspecRemoteControlCommand,
   shouldDeferInjectDuringConnect,
@@ -60,6 +61,30 @@ describe('isDevspecRemoteControlCommand — a NAME test, not a text test', () =>
 describe('shouldDeferInjectDuringConnect — sequencing, not egress (6990fd9e)', () => {
   it('defers an owner command while the handshake is still settling', () => {
     assert.equal(shouldDeferInjectDuringConnect({ connectHandshakePending: true }), true)
+  })
+
+  it('defers while within the timeout window', () => {
+    const now = 100_000
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectHandshakePending: true,
+        connectHandshakeStartedAt: now - 5_000,
+        now,
+      }),
+      true,
+    )
+  })
+
+  it('does not defer when connect handshake has timed out', () => {
+    const now = 100_000
+    assert.equal(
+      shouldDeferInjectDuringConnect({
+        connectHandshakePending: true,
+        connectHandshakeStartedAt: now - (CONNECT_HANDSHAKE_TIMEOUT_MS + 1000),
+        now,
+      }),
+      false,
+    )
   })
 
   it('does not defer once a real inject turn is in flight', () => {

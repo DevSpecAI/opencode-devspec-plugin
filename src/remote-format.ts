@@ -38,6 +38,8 @@ export function isDevspecRemoteControlCommand(name: unknown): boolean {
   return typeof name === 'string' && DEVSPEC_REMOTE_CONTROL_COMMANDS.has(name)
 }
 
+export const CONNECT_HANDSHAKE_TIMEOUT_MS = 15_000
+
 /**
  * Defer an owner-command inject while a connect handshake is still settling.
  *
@@ -47,14 +49,31 @@ export function isDevspecRemoteControlCommand(name: unknown): boolean {
  * not about judging any text.
  *
  * `connectHandshakePending` means the handshake is still settling.
+ * A timeout guard (CONNECT_HANDSHAKE_TIMEOUT_MS) and idle check ensure an
+ * un-cleared handshake flag does not block subsequent command pickups indefinitely.
  *
  * This helper only handles connect sequencing. `shouldDeferCanonicalPrompt`
  * separately serializes follow-up prompts while an answer is outstanding.
  */
 export function shouldDeferInjectDuringConnect(opts: {
   connectHandshakePending?: boolean | null
+  connectHandshakeStartedAt?: number | null
   awaitingRemoteReply?: boolean | null
+  busy?: boolean | null
+  now?: number
 }): boolean {
   if (opts.awaitingRemoteReply) return false
-  return Boolean(opts.connectHandshakePending)
+  if (!opts.connectHandshakePending) return false
+
+  const now = typeof opts.now === 'number' ? opts.now : Date.now()
+
+  // If startedAt is recorded and has exceeded the handshake timeout window, expire it.
+  if (
+    typeof opts.connectHandshakeStartedAt === 'number' &&
+    now - opts.connectHandshakeStartedAt >= CONNECT_HANDSHAKE_TIMEOUT_MS
+  ) {
+    return false
+  }
+
+  return true
 }

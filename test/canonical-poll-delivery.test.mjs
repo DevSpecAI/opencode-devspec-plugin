@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -416,6 +417,30 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCatchUpCursor, 'deferred-catch-up-cursor')
     assert.deepEqual(state.deferredCanonicalCommands, [])
     assert.equal(state.deferredCanonicalTransaction, null)
+  })
+
+  it('recovers from stale connectHandshakePending via timeout and delivers deferred command', async () => {
+    const messageId = randomUUID()
+    const cmd = command(messageId, 1, provenance1, 'unblock after handshake expiry', true)
+    pollResults.push(changed({
+      cursor_v2: 'cursor-after-expired-handshake',
+      ingress: ingress([cmd]),
+    }))
+    let state = runWithBond(opencodeSessionId, () => readState())
+    // Stale handshake flag with startedAt expired
+    runWithBond(opencodeSessionId, () => writeState({
+      ...state,
+      connectHandshakePending: true,
+      connectHandshakeStartedAt: Date.now() - 30_000,
+      busy: false,
+    }))
+
+    await tick(); await settle()
+    state = runWithBond(opencodeSessionId, () => readState())
+    assert.equal(promptCalls.length, 1)
+    assert.match(promptCalls[0].body.parts[0].text, /unblock after handshake expiry/)
+    assert.equal(state.connectHandshakePending, false)
+    assert.equal(state.connectHandshakeStartedAt, null)
   })
 
   it('negotiates ingress and delegated scope on the main poll and every acknowledgement poll', async () => {

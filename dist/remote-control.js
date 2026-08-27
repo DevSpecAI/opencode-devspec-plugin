@@ -39,7 +39,7 @@ import { logRemoteControlStory } from './remote-control-story.js';
 import { TRAIL_POST_MIN_GAP_MS, TRAIL_SEED_TEXT, serializeTurnTrail, shouldPostTrail, } from './work-trail.js';
 import { controlSlashSuccessMessage, } from './opencode-control-slash.js';
 const ANSWER_POST_PROCESS_ID = crypto.randomBytes(12).toString('hex');
-export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
+export { CONNECT_HANDSHAKE_TIMEOUT_MS, collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
 // Re-exported so the poll-turn split stays an internal refactor for importers.
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 /**
@@ -946,9 +946,13 @@ export function hashPostedContent(text) {
 }
 /** Keep one promptAsync answer correlation active at a time on a connection. */
 export function shouldDeferCanonicalPrompt(opts) {
-    if ((opts.busy || opts.awaitingRemoteReply) && !opts.pendingQuestionRequestId)
+    if (opts.pendingQuestionRequestId)
+        return false;
+    if (opts.awaitingRemoteReply)
         return true;
-    return shouldDeferInjectDuringConnect(opts);
+    if (shouldDeferInjectDuringConnect(opts))
+        return true;
+    return Boolean(opts.busy);
 }
 /**
  * Spill an oversize attachment to ~/.devspec/opencode-remote-control/attachments/
@@ -1475,6 +1479,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
                 connectionId,
                 codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
                 connectHandshakePending: true,
+                connectHandshakeStartedAt: Date.now(),
             });
         }
         else {
@@ -1483,6 +1488,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
                 sessionId: null,
                 codename: typeof result?.codename === 'string' ? result.codename : null,
                 connectHandshakePending: true,
+                connectHandshakeStartedAt: Date.now(),
             });
         }
         // Sessionless bond. The key does not change when this session later
@@ -1541,6 +1547,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
             sessionId,
             codename: null,
             connectHandshakePending: true,
+            connectHandshakeStartedAt: Date.now(),
         });
     }
     else {
@@ -1550,6 +1557,9 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
             // First time this bond learns its room: suppress the connect turn's own
             // assistant message, which is chrome for the terminal, not an answer.
             connectHandshakePending: prior.sessionId ? prior.connectHandshakePending : true,
+            connectHandshakeStartedAt: prior.sessionId
+                ? (prior.connectHandshakeStartedAt ?? null)
+                : Date.now(),
         });
     }
     if (opencodeSessionId)
@@ -1649,7 +1659,11 @@ export async function attachSession(directory, opencodeSessionId, sessionId) {
     const canonicalSessionId = typeof result?.session_id === 'string' ? result.session_id : sessionId;
     // No key flip, so no migration: the same file gains a room.
     runWithBond(opencodeSessionId, () => {
-        patchState({ sessionId: canonicalSessionId, connectHandshakePending: true });
+        patchState({
+            sessionId: canonicalSessionId,
+            connectHandshakePending: true,
+            connectHandshakeStartedAt: Date.now(),
+        });
     });
     rememberOpenCodeBond(opencodeSessionId, canonicalSessionId);
 }
@@ -2317,9 +2331,20 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         const persistedDeferred = state.deferredCanonicalTransaction;
         const deferredCommands = state.deferredCanonicalCommands ?? [];
         if (persistedDeferred && deferredCommands.length > 0) {
+            if (state.connectHandshakePending &&
+                !state.awaitingRemoteReply &&
+                !shouldDeferInjectDuringConnect({
+                    connectHandshakePending: state.connectHandshakePending,
+                    connectHandshakeStartedAt: state.connectHandshakeStartedAt,
+                    awaitingRemoteReply: state.awaitingRemoteReply,
+                    busy: state.busy,
+                })) {
+                patchState({ connectHandshakePending: false, connectHandshakeStartedAt: null });
+            }
             const deferInject = shouldDeferCanonicalPrompt({
                 busy: state.busy,
                 connectHandshakePending: state.connectHandshakePending,
+                connectHandshakeStartedAt: state.connectHandshakeStartedAt,
                 awaitingRemoteReply: state.awaitingRemoteReply,
                 pendingQuestionRequestId: state.pendingQuestion?.requestId,
             });
@@ -2592,9 +2617,20 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     // the connection-scoped command correlation used by the first answer. Queue
     // follow-ups until that answer settles. A pending question is the exception:
     // its next owner command is routed to question.reply below, not promptAsync.
+    if (state.connectHandshakePending &&
+        !state.awaitingRemoteReply &&
+        !shouldDeferInjectDuringConnect({
+            connectHandshakePending: state.connectHandshakePending,
+            connectHandshakeStartedAt: state.connectHandshakeStartedAt,
+            awaitingRemoteReply: state.awaitingRemoteReply,
+            busy: state.busy,
+        })) {
+        patchState({ connectHandshakePending: false, connectHandshakeStartedAt: null });
+    }
     const deferInject = shouldDeferCanonicalPrompt({
         busy: state.busy,
         connectHandshakePending: state.connectHandshakePending,
+        connectHandshakeStartedAt: state.connectHandshakeStartedAt,
         awaitingRemoteReply: state.awaitingRemoteReply,
         pendingQuestionRequestId: state.pendingQuestion?.requestId,
     });
@@ -3736,6 +3772,7 @@ export function settleAgentPostResult(toolName, result, callId) {
         pendingPermissions: [],
         permissionResolutionObserved: false,
         connectHandshakePending: false,
+        connectHandshakeStartedAt: null,
         answerPostInFlight: false,
         answerPostCallId: null,
         answerPostProcessId: null,
@@ -3822,6 +3859,7 @@ export async function handleSessionIdle(directory) {
         pendingPermissions: [],
         permissionResolutionObserved: false,
         connectHandshakePending: false,
+        connectHandshakeStartedAt: null,
         answerPostInFlight: false,
         answerPostCallId: null,
         answerPostProcessId: null,

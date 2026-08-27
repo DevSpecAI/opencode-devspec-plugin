@@ -2,7 +2,7 @@ import type { Plugin } from '@opencode-ai/plugin';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
 import { type CanonicalCommand, type CanonicalControl, type CanonicalIngress } from './remote-ingress.js';
 import { type OpencodeControlSlash } from './opencode-control-slash.js';
-export { collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
+export { CONNECT_HANDSHAKE_TIMEOUT_MS, collapseOrphanMarkdownFences, isDevspecRemoteControlCommand, shouldDeferInjectDuringConnect, unwrapSingleOuterMarkdownFence, } from './remote-format.js';
 export { buildAttachmentParts, isDeliverableCommand, pollTerminalReason, PERMANENT_END_REASONS, renderInjectedTurn, resolveServerAttachment, shouldAdvanceMessageCursor, holdFor, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 export declare function logPoll(line: string): void;
 /**
@@ -218,6 +218,10 @@ interface ConnectionState {
      * flag that starts and ends with the connect turn cannot tag a later one.
      */
     connectHandshakePending?: boolean;
+    /**
+     * Epoch ms when connectHandshakePending was set, for timeout expiry.
+     */
+    connectHandshakeStartedAt?: number | null;
     /**
      * Owner commands that arrived while inject had to wait (connect handshake
      * still settling, or another host acceptance in flight). Item 4414d2d9:
@@ -461,6 +465,8 @@ export declare function shouldDeferCanonicalPrompt(opts: {
     awaitingRemoteReply?: boolean | null;
     pendingQuestionRequestId?: string | null;
     connectHandshakePending?: boolean | null;
+    connectHandshakeStartedAt?: number | null;
+    now?: number;
 }): boolean;
 /**
  * Spill an oversize attachment to ~/.devspec/opencode-remote-control/attachments/
