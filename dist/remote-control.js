@@ -983,6 +983,7 @@ function postMessageArgs(state, message, extras) {
         ...(extras?.phase ? { phase: extras.phase } : {}),
         ...(extras?.needs_input ? { needs_input: extras.needs_input } : {}),
         ...(extras?.complete_turn ? { complete_turn: true } : {}),
+        ...(extras?.work_trail ? { work_trail: extras.work_trail } : {}),
     };
     if (state.connectionId)
         args.connection_id = state.connectionId;

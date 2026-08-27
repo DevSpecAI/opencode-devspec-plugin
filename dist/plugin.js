@@ -4,6 +4,7 @@ import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
 import { CommitProvenance } from './commit-provenance.js';
 import { captureConnectionCapability, clearConnectionCapability, createManagePlanTool, negotiateConnectionCapability, } from './manage-plan-tool.js';
+import { serializeTurnTrail } from './work-trail.js';
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
 // OPENCODE_SERVER_PASSWORD as early as this module loads — same rule as rocket
 // cold-launch — so the door is never unsecured and the warning stays gone.
@@ -392,6 +393,20 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
                         : {};
                     const message = supplied.message;
                     const model = await resolveCurrentAssistantModel(client, input.sessionID, input.callID);
+                    let workTrail = null;
+                    try {
+                        const res = await client.session.messages({ path: { id: input.sessionID } });
+                        const msgs = Array.isArray(res?.data) ? res.data : Array.isArray(res) ? res : [];
+                        const rawTrail = serializeTurnTrail(msgs, {
+                            afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
+                        });
+                        if (rawTrail && rawTrail.trim()) {
+                            workTrail = rawTrail;
+                        }
+                    }
+                    catch (err) {
+                        logPoll(`post_session_message: serializeTurnTrail failed: ${err}`);
+                    }
                     output.args = {
                         message,
                         connection_id: state.connectionId,
@@ -399,6 +414,11 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
                         turn_kind: 'agent',
                         phase: 'answer',
                         complete_turn: true,
+                        ...(workTrail
+                            ? { work_trail: workTrail }
+                            : typeof supplied.work_trail === 'string' && supplied.work_trail.trim()
+                                ? { work_trail: supplied.work_trail.trim() }
+                                : {}),
                         ...(model ? { model } : {}),
                         ...(state.awaitingRemoteReply && state.currentCommandTurnId && state.currentCommandMessageId
                             ? {

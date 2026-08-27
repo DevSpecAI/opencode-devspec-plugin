@@ -1399,6 +1399,8 @@ function postMessageArgs(
     }
     /** End the connection's Working attempt in the same request as the bubble. */
     complete_turn?: boolean
+    /** Complete cumulative turn trail attached to final answer/error post. */
+    work_trail?: string
   },
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {
@@ -1409,6 +1411,7 @@ function postMessageArgs(
     ...(extras?.phase ? { phase: extras.phase } : {}),
     ...(extras?.needs_input ? { needs_input: extras.needs_input } : {}),
     ...(extras?.complete_turn ? { complete_turn: true } : {}),
+    ...(extras?.work_trail ? { work_trail: extras.work_trail } : {}),
   }
   if (state.connectionId) args.connection_id = state.connectionId
   else if (state.sessionId) args.session_id = state.sessionId

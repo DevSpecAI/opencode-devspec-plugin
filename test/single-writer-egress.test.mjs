@@ -184,6 +184,7 @@ describe('agent-canonical bonded answer egress', () => {
       turn_kind: 'agent',
       phase: 'answer',
       complete_turn: true,
+      work_trail: '$ tool\n\n$ tool\n\n$ tool\n\n$ tool',
       model: { providerID: 'openai', modelID: 'gpt-5.6-sol' },
       command_turn_id: 'turn_canonical',
       command_message_id: 'cmd_final',
@@ -205,8 +206,56 @@ describe('agent-canonical bonded answer egress', () => {
       turn_kind: 'agent',
       phase: 'answer',
       complete_turn: true,
+      work_trail: '$ tool\n\n$ tool\n\n$ tool\n\n$ tool',
       model: { providerID: 'openai', modelID: 'gpt-5.6-sol' },
       command_turn_unbound: true,
+    })
+  })
+
+  it('attaches serialized work trail scoped after baseline to answer post', async () => {
+    seed({
+      awaitingRemoteReply: true,
+      currentCommandTurnId: 'turn_canonical',
+      currentCommandMessageId: 'cmd_final',
+      replyAfterOpenCodeMessageId: 'assistant_prev',
+    })
+    clientMessages = [
+      {
+        info: {
+          id: 'assistant_prev',
+          role: 'assistant',
+          providerID: 'openai',
+          modelID: 'gpt-5.6-sol',
+        },
+        parts: [{ type: 'text', text: 'Old conversation text' }],
+      },
+      {
+        info: {
+          id: 'assistant_current',
+          role: 'assistant',
+          providerID: 'openai',
+          modelID: 'gpt-5.6-sol',
+        },
+        parts: [
+          { type: 'tool', callID: 'post-call', tool: { name: 'bash', input: { command: 'npm test' } }, state: { status: 'completed', output: 'All 12 tests passed' } },
+          { type: 'text', text: 'Fixed the issue successfully.' },
+        ],
+      },
+    ]
+    const args = await before(BONDED, {
+      message: 'Fixed the issue successfully.',
+    })
+    assert.deepEqual(args, {
+      message: 'Fixed the issue successfully.',
+      connection_id: CONNECTION,
+      agent_name: 'OpenCode',
+      turn_kind: 'agent',
+      phase: 'answer',
+      complete_turn: true,
+      work_trail: '$ bash command=npm test\nAll 12 tests passed\n\nFixed the issue successfully.',
+      model: { providerID: 'openai', modelID: 'gpt-5.6-sol' },
+      command_turn_id: 'turn_canonical',
+      command_message_id: 'cmd_final',
     })
   })
 
