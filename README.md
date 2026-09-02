@@ -2,7 +2,11 @@
 
 DevSpec integration for [OpenCode](https://opencode.ai) — connects OpenCode to your DevSpec project over MCP, teaches it DevSpec's conventions (briefs, action items, memory), and ports the same `devspec.*` commands and remote-control support that already ship for Claude Code and Cursor.
 
-OpenCode has no plugin marketplace yet, so setup is two manual steps: install the package, then paste two blocks into your `opencode.json`.
+OpenCode has no plugin marketplace yet, so setup is two manual steps: install the package, then paste two blocks into your **user-home** OpenCode config.
+
+The default file is `~/.config/opencode/opencode.jsonc` (Windows: `%USERPROFILE%\.config\opencode\opencode.jsonc`). Put the MCP token there once so every folder has DevSpec. Which project a run belongs to still comes from `git remote get-url origin` in the folder you open.
+
+A project-level `opencode.json` / `opencode.jsonc` in a repo also works — git remote still resolves the project — but it is optional and not the default. Do not copy the MCP JSON into every repo.
 
 ## 1. Install
 
@@ -10,7 +14,7 @@ OpenCode has no plugin marketplace yet, so setup is two manual steps: install th
 npm install --save-dev opencode-devspec-plugin
 ```
 
-## 2. Configure `opencode.json`
+## 2. Configure `~/.config/opencode/opencode.jsonc`
 
 Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry loading this package:
 
@@ -41,7 +45,7 @@ The URL above (`https://devspec.ai/api/mcp`) is DevSpec's production MCP host. O
 
 ## 3. Verify
 
-Start OpenCode in a DevSpec-tracked repo and ask it to list your DevSpec action items — if the MCP connection is wired correctly, it will call straight through.
+Start OpenCode in a second DevSpec-tracked repo without copying the MCP JSON into that repo, and ask it to list your DevSpec action items — if the user-home config is wired correctly, it will call straight through.
 
 ## What this package provides
 
