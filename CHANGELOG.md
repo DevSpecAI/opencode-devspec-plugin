@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Quiet a missing folder-pin probe on `/devspec.remote`
+
+The connect command no longer tells the model to `Read` `.devspec/project.json`
+if it exists. Probe with glob/list first; `Read` only when the file is there.
+A missing pin plus a working git origin is the normal quiet path.
+
 ### Agent-owned answer delivery replaces plugin mirroring
 
 Bonded OpenCode turns now call `post_session_message` exactly once. The plugin
