@@ -17,7 +17,7 @@ import {
   rememberOpenCodeBond,
   runWithBond,
   runWithBondAsync,
-  settlePlaybookRunResult,
+  settleAutomationRunResult,
   writeState,
 } from '../dist/remote-control.js'
 import {
@@ -594,24 +594,24 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2, 'later-new-turn')
   })
 
-  it('finalizes playbook acceptance through every bookkeeping fault without replay', async () => {
+  it('finalizes automation acceptance through every bookkeeping fault without replay', async () => {
     const stages = [
-      'playbook_memory_ids',
-      'playbook_persisted_ids',
-      'playbook_dispatch_cursor',
+      'automation_memory_ids',
+      'automation_persisted_ids',
+      'automation_dispatch_cursor',
     ]
     for (let index = 0; index < stages.length; index++) {
       const stage = stages[index]
       const dispatchId = `play-fault-${index + 1}`
       const response = changed({
         dispatch_cursor: `dispatch-${stage}`,
-        dispatches: [{ id: dispatchId, kind: 'playbook_run', run_id: `run-${index + 1}`, instruction: stage }],
+        dispatches: [{ id: dispatchId, kind: 'automation_run', run_id: `run-${index + 1}`, instruction: stage }],
       })
       pollResults.push(response)
       let faulted = false
       await tick(clientDouble(), {
         acceptanceBookkeepingFault: (candidate, key) => {
-          if (!faulted && candidate === stage && key === `playbook:${dispatchId}`) {
+          if (!faulted && candidate === stage && key === `automation:${dispatchId}`) {
             faulted = true
             throw new Error(`injected ${stage}`)
           }
@@ -622,8 +622,8 @@ describe('pollAndDeliver canonical transaction integration', () => {
       assert.equal(promptCalls.length, index + 1)
       assert.equal(
         runWithBond(opencodeSessionId, () =>
-          settlePlaybookRunResult(
-            'devspec_record_playbook_run',
+          settleAutomationRunResult(
+            'devspec_record_automation_run',
             { status: 'succeeded' },
             { run_id: `run-${index + 1}` },
           ),
@@ -633,9 +633,9 @@ describe('pollAndDeliver canonical transaction integration', () => {
 
       pollResults.push(structuredClone(response))
       await tick(); await settle()
-      assert.equal(promptCalls.length, index + 1, `${stage} replayed playbook prompt`)
+      assert.equal(promptCalls.length, index + 1, `${stage} replayed automation prompt`)
       const state = runWithBond(opencodeSessionId, () => readState())
-      assert.ok(state.deliveredPlaybookDispatchIds.includes(dispatchId))
+      assert.ok(state.deliveredAutomationDispatchIds.includes(dispatchId))
     }
   })
 
@@ -713,57 +713,57 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
   })
 
-  it('delivers a valid playbook independently when canonical ingress is malformed', async () => {
+  it('delivers a valid automation independently when canonical ingress is malformed', async () => {
     const malformed = ingress()
     malformed.schema_version = 99
     pollResults.push(changed({
       ingress: malformed,
-      dispatches: [{ id: 'play-malformed', kind: 'playbook_run', run_id: 'run-malformed', instruction: 'Independent.' }],
+      dispatches: [{ id: 'play-malformed', kind: 'automation_run', run_id: 'run-malformed', instruction: 'Independent.' }],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 1)
-    assert.match(promptCalls[0].body.parts[0].text, /claim_playbook_run/)
+    assert.match(promptCalls[0].body.parts[0].text, /claim_automation_run/)
     const state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-malformed'])
+    assert.deepEqual(state.deliveredAutomationDispatchIds, ['play-malformed'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
   })
 
-  it('consumes a malformed playbook dispatch without injecting or stranding lifecycle state', async () => {
+  it('consumes a malformed automation dispatch without injecting or stranding lifecycle state', async () => {
     pollResults.push(changed({
-      dispatches: [{ id: 'play-without-run-id', kind: 'playbook_run', instruction: 'Must remain inert.' }],
+      dispatches: [{ id: 'play-without-run-id', kind: 'automation_run', instruction: 'Must remain inert.' }],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 0)
     const state = runWithBond(opencodeSessionId, () => readState())
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
-    assert.deepEqual(state.activePlaybookRunIds ?? [], [])
+    assert.deepEqual(state.activeAutomationRunIds ?? [], [])
     assert.equal(state.busy, false)
   })
 
-  it('keeps simultaneous playbook and command acceptance/failure state independent', async () => {
+  it('keeps simultaneous automation and command acceptance/failure state independent', async () => {
     const cmd = command(message1, 1, provenance1, 'canonical fails', true)
     pollResults.push(changed({
       ingress: ingress([cmd]),
-      dispatches: [{ id: 'play-simultaneous', kind: 'playbook_run', run_id: 'run-simultaneous', instruction: 'Playbook succeeds.' }],
+      dispatches: [{ id: 'play-simultaneous', kind: 'automation_run', run_id: 'run-simultaneous', instruction: 'Automation succeeds.' }],
     }))
-    promptImpl = async (args) => args.body.parts[0].text.includes('claim_playbook_run')
+    promptImpl = async (args) => args.body.parts[0].text.includes('claim_automation_run')
       ? { data: true }
       : { error: { message: 'canonical queue failed' } }
     await tick(); await settle()
-    assert.equal(promptCalls.length, 1, 'canonical prompt waits for the playbook turn to finish')
+    assert.equal(promptCalls.length, 1, 'canonical prompt waits for the automation turn to finish')
     let state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-simultaneous'])
+    assert.deepEqual(state.deliveredAutomationDispatchIds, ['play-simultaneous'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
     assert.equal(state.busy, true)
-    assert.equal(state.awaitingRemoteReply ?? false, false, 'the playbook turn owns no conversational answer correlation')
+    assert.equal(state.awaitingRemoteReply ?? false, false, 'the automation turn owns no conversational answer correlation')
 
     assert.equal(
       runWithBond(opencodeSessionId, () =>
-        settlePlaybookRunResult(
-          'devspec_record_playbook_run',
+        settleAutomationRunResult(
+          'devspec_record_automation_run',
           { status: 'succeeded' },
           { run_id: 'run-simultaneous' },
         ),
@@ -780,19 +780,19 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.remoteIngressCursorV2, 'live-v2-next')
   })
 
-  it('retries a rejected playbook before delivering the canonical command', async () => {
+  it('retries a rejected automation before delivering the canonical command', async () => {
     const cmd = command(message1, 1, provenance1, 'canonical succeeds', true)
     pollResults.push(changed({
       ingress: ingress([cmd]),
-      dispatches: [{ id: 'play-rejects', kind: 'playbook_run', run_id: 'run-rejects', instruction: 'Rejected playbook.' }],
+      dispatches: [{ id: 'play-rejects', kind: 'automation_run', run_id: 'run-rejects', instruction: 'Rejected automation.' }],
     }))
-    promptImpl = async (args) => args.body.parts[0].text.includes('claim_playbook_run')
-      ? { error: { message: 'playbook queue failed' } }
+    promptImpl = async (args) => args.body.parts[0].text.includes('claim_automation_run')
+      ? { error: { message: 'automation queue failed' } }
       : { data: true }
     await tick(); await settle()
     assert.equal(promptCalls.length, 1)
     let state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds ?? [], [])
+    assert.deepEqual(state.deliveredAutomationDispatchIds ?? [], [])
     assert.equal(state.remoteDispatchCursor ?? null, null)
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
     assert.equal(state.remoteIngressCursorV2 ?? null, null)
@@ -803,13 +803,13 @@ describe('pollAndDeliver canonical transaction integration', () => {
     await tick(); await settle()
     assert.equal(promptCalls.length, 2)
     state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-rejects'])
+    assert.deepEqual(state.deliveredAutomationDispatchIds, ['play-rejects'])
     assert.deepEqual(state.deliveredMessageIds ?? [], [])
 
     assert.equal(
       runWithBond(opencodeSessionId, () =>
-        settlePlaybookRunResult(
-          'devspec_record_playbook_run',
+        settleAutomationRunResult(
+          'devspec_record_automation_run',
           { status: 'succeeded' },
           { run_id: 'run-rejects' },
         ),
@@ -826,7 +826,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(state.awaitingRemoteReply, true)
   })
 
-  it('persists a playbook arriving during a canonical turn and runs it after settlement', async () => {
+  it('persists an automation arriving during a canonical turn and runs it after settlement', async () => {
     const cmd = command(message1, 1, provenance1, 'canonical first', true)
     pollResults.push(changed({ ingress: ingress([cmd]), dispatches: [] }))
     await tick(); await settle()
@@ -836,22 +836,22 @@ describe('pollAndDeliver canonical transaction integration', () => {
 
     pollResults.push(changed({
       ingress: ingress([]),
-      dispatches: [{ id: 'play-after-command', kind: 'playbook_run', run_id: 'run-after-command', instruction: 'Run later.' }],
+      dispatches: [{ id: 'play-after-command', kind: 'automation_run', run_id: 'run-after-command', instruction: 'Run later.' }],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 1)
     state = runWithBond(opencodeSessionId, () => readState())
-    assert.equal(state.deferredPlaybookDispatches?.[0]?.id, 'play-after-command')
+    assert.equal(state.deferredAutomationDispatches?.[0]?.id, 'play-after-command')
     assert.equal(
       runWithBond(opencodeSessionId, () =>
-        settlePlaybookRunResult(
-          'devspec_record_playbook_run',
+        settleAutomationRunResult(
+          'devspec_record_automation_run',
           { status: 'succeeded' },
           { run_id: 'run-after-command' },
         ),
       ),
       false,
-      'a deferred playbook result cannot settle the active canonical command',
+      'a deferred automation result cannot settle the active canonical command',
     )
     state = runWithBond(opencodeSessionId, () => readState())
     assert.equal(state.awaitingRemoteReply, true)
@@ -870,16 +870,16 @@ describe('pollAndDeliver canonical transaction integration', () => {
     await tick(); await settle()
 
     assert.equal(promptCalls.length, 2)
-    assert.match(promptCalls[1].body.parts[0].text, /claim_playbook_run/)
+    assert.match(promptCalls[1].body.parts[0].text, /claim_automation_run/)
     state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-after-command'])
-    assert.deepEqual(state.deferredPlaybookDispatches, [])
+    assert.deepEqual(state.deliveredAutomationDispatchIds, ['play-after-command'])
+    assert.deepEqual(state.deferredAutomationDispatches, [])
   })
 
-  it('delivers only explicit playbook_run dispatches through playbook text and advances dispatch_cursor after acceptance', async () => {
+  it('delivers only explicit automation_run dispatches through automation text and advances dispatch_cursor after acceptance', async () => {
     pollResults.push(changed({
       dispatches: [
-        { id: 'play-1', kind: 'playbook_run', run_id: 'run-1', playbook_name: 'Review', permission: 'look_only', instruction: 'Inspect only.' },
+        { id: 'play-1', kind: 'automation_run', run_id: 'run-1', automation_name: 'Review', permission: 'look_only', instruction: 'Inspect only.' },
         { id: 'assignment-1', kind: 'assignment', instruction: 'must remain inert' },
       ],
     }))
@@ -887,15 +887,15 @@ describe('pollAndDeliver canonical transaction integration', () => {
     await settle()
     assert.equal(promptCalls.length, 1)
     const text = promptCalls[0].body.parts[0].text
-    assert.match(text, /claim_playbook_run/)
+    assert.match(text, /claim_automation_run/)
     assert.match(text, /LOOK ONLY/)
     assert.doesNotMatch(text, /must remain inert/)
     const state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-1'])
+    assert.deepEqual(state.deliveredAutomationDispatchIds, ['play-1'])
     assert.equal(state.remoteDispatchCursor, 'dispatch-next')
   })
 
-  it('migrates legacy playbook dedupe state one way and does not re-inject an old run', async () => {
+  it('migrates legacy automation dedupe state one way and does not re-inject an old run', async () => {
     runWithBond(opencodeSessionId, () => writeState({
       connectionId,
       sessionId: devspecSessionId,
@@ -906,8 +906,8 @@ describe('pollAndDeliver canonical transaction integration', () => {
     forgetPumpState(connectionId)
     pollResults.push(changed({
       dispatches: [
-        { id: 'play-legacy', kind: 'playbook_run', run_id: 'run-legacy', instruction: 'Must stay deduped.' },
-        { id: 'play-new', kind: 'playbook_run', run_id: 'run-new', instruction: 'Run once.' },
+        { id: 'play-legacy', kind: 'automation_run', run_id: 'run-legacy', instruction: 'Must stay deduped.' },
+        { id: 'play-new', kind: 'automation_run', run_id: 'run-new', instruction: 'Run once.' },
         { id: 'assignment-shaped', kind: 'assignment', instruction: 'Must remain inert.' },
       ],
     }))
@@ -919,11 +919,11 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.match(text, /run-new/)
     assert.doesNotMatch(text, /run-legacy|assignment-shaped|Must remain inert/)
     let state = runWithBond(opencodeSessionId, () => readState())
-    assert.deepEqual(state.deliveredPlaybookDispatchIds, ['play-legacy', 'play-new'])
+    assert.deepEqual(state.deliveredAutomationDispatchIds, ['play-legacy', 'play-new'])
     assert.equal(
       runWithBond(opencodeSessionId, () =>
-        settlePlaybookRunResult(
-          'devspec_record_playbook_run',
+        settleAutomationRunResult(
+          'devspec_record_automation_run',
           { status: 'succeeded' },
           { run_id: 'run-new' },
         ),
@@ -940,7 +940,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     }))
     forgetPumpState(connectionId)
     pollResults.push(changed({
-      dispatches: [{ id: 'play-stale-legacy', kind: 'playbook_run', run_id: 'run-stale', instruction: 'New field wins.' }],
+      dispatches: [{ id: 'play-stale-legacy', kind: 'automation_run', run_id: 'run-stale', instruction: 'New field wins.' }],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 2)

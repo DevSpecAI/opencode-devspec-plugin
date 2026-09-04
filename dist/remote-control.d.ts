@@ -76,7 +76,7 @@ interface ConnectionState {
     remoteIngressCursorV2?: string | null;
     /** Independent older-page continuation from ingress.window.next_cursor. */
     remoteIngressCatchUpCursor?: string | null;
-    /** Independent explicit playbook dispatch watermark. */
+    /** Independent explicit automation dispatch watermark. */
     remoteDispatchCursor?: string | null;
     /** Host-selected model for subsequent remote promptAsync turns. */
     remoteControlModel?: OpenCodeModelStamp | null;
@@ -128,14 +128,14 @@ interface ConnectionState {
     answerPostProcessId?: string | null;
     /** A confirmed answer row already landed during the current OpenCode turn. */
     answerPostedThisTurn?: boolean;
-    /** Playbook dispatch ids already injected into OpenCode. */
-    deliveredPlaybookDispatchIds?: string[];
-    /** Playbook dispatches held while another OpenCode prompt owns the bond. */
-    deferredPlaybookDispatches?: Array<Record<string, unknown>>;
-    /** Dispatch cursor committed only after the deferred playbook prompt is accepted. */
-    deferredPlaybookDispatchCursor?: string | null;
-    /** Accepted playbook runs whose recorded outcomes can settle the current prompt. */
-    activePlaybookRunIds?: string[];
+    /** Automation dispatch ids already injected into OpenCode. */
+    deliveredAutomationDispatchIds?: string[];
+    /** Automation dispatches held while another OpenCode prompt owns the bond. */
+    deferredAutomationDispatches?: Array<Record<string, unknown>>;
+    /** Dispatch cursor committed only after the deferred automation prompt is accepted. */
+    deferredAutomationDispatchCursor?: string | null;
+    /** Accepted automation runs whose recorded outcomes can settle the current prompt. */
+    activeAutomationRunIds?: string[];
     /**
      * Our own last-known assertion of heartbeat_connection's `busy` flag —
      * the SOLE signal that drives the "OpenCode is working…" indicator on the
@@ -830,8 +830,8 @@ export declare function resetAnswerPostLatchForUserTurn(): void;
 export declare function resolveCurrentAssistantModel(client: Parameters<Plugin>[0]['client'], sessionId: string, callId: string): Promise<OpenCodeModelStamp | null>;
 /** Commit local lifecycle only after DevSpec confirms the model-owned answer row. */
 export declare function settleAgentPostResult(toolName: string, result: unknown, callId: string): boolean;
-/** A reported playbook outcome is the deterministic terminal boundary for that prompt. */
-export declare function settlePlaybookRunResult(toolName: string, result: unknown, args: unknown): boolean;
+/** A reported automation outcome is the deterministic terminal boundary for that prompt. */
+export declare function settleAutomationRunResult(toolName: string, result: unknown, args: unknown): boolean;
 /**
  * Settle an OpenCode idle event without ever reading assistant text. A remote
  * turn that failed to post gets one bounded mechanical error; an already

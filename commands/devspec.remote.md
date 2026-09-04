@@ -58,7 +58,7 @@ For every substantive turn in an attached conversation, call `post_session_messa
 The connect/status handshake itself must not call `post_session_message`; its confirmation stays in this terminal.
 
 - **If real work will happen before the answer**, write one short sentence first ("got it, I'll look at X") — it lands as the live trail while you work. If the answer is ready now, skip that: a trail and answer arriving together are just a slower answer.
-- **Sessionless:** there is no conversational answer path. Separately accepted owner-scoped playbook runs report through `record_playbook_run`; never invent a room.
+- **Sessionless:** there is no conversational answer path. Separately accepted owner-scoped automation runs report through `record_automation_run`; never invent a room.
 - Ground the answer in what you **verified** with tools, not in the injected room text alone.
 
 ## Act on authorized commands

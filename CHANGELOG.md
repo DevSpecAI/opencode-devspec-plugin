@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Playbooks are now Automations
+
+DevSpec has renamed Playbooks to Automations. This plugin now uses the renamed tools
+(`claim_automation_run`, `record_automation_run`, `get_automations` and the rest) and reads
+the renamed fields in what the server sends it. It needs a DevSpec server that carries the
+same rename; against an older server, automation runs are not picked up.
+
 ### Quiet a missing folder-pin probe on `/devspec.remote`
 
 The connect command no longer tells the model to `Read` `.devspec/project.json`
@@ -100,7 +107,7 @@ The server retired `get_assignment`, `acknowledge_assignment` and `resolve_assig
 
 One verb replaces them. **`reserve_work_items({ action_item_ids, connection_id })`** holds the ordered set you are about to work so no other agent takes one mid-run; then `claim_work_item` per item as you reach it. `devspec.work` reserves up front when handed several ids, and the batch closes itself when its last member is recorded, failed or released.
 
-The dispatch inbox now serves playbook runs ONLY, so the plugin's assignment-dispatch wake became unreachable. It now reports "the server is ahead of this plugin" instead of instructing an agent to call three tools that no longer exist.
+The dispatch inbox now serves automation runs ONLY, so the plugin's assignment-dispatch wake became unreachable. It now reports "the server is ahead of this plugin" instead of instructing an agent to call three tools that no longer exist.
 
 **Only the agent holding an item can release or fail it.** `release_work_item` and `fail_work_item` had no ownership check at all, and `claim_work_item`'s compared USERS — which cannot tell two of your own agents apart, because a DevSpec token is account-wide. All three now check the reservation against the `connection_id` you pass, server-side. A stale hold stays releasable with `force` and a reason, recorded as a takeover naming who did it.
 

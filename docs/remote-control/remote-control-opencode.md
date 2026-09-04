@@ -12,7 +12,7 @@
 4. **The plugin owns routing and lifecycle.** It overwrites model-supplied identity, target, phase, completion, model stamp, and command correlation with facts from the firing bond.
 5. **Unbonded sessions fail closed.** A child, sibling, or unrelated OpenCode conversation cannot post through another conversation's DevSpec attachment.
 6. **Remote prompts are serialized.** A second `promptAsync` command waits until the current answer settles so its exact command ids cannot replace the first turn's correlation. A pending OpenCode question is the exception because the next owner command goes to `question.reply`, not a new prompt.
-7. **Sessionless connections invent no chat.** Explicit playbook runs use their own claim/report workflow.
+7. **Sessionless connections invent no chat.** Explicit automation runs use their own claim/report workflow.
 8. **Connect/status output stays terminal-only.** `/devspec.remote` and `/devspec.remote-stop` are protocol turns, not conversational answers.
 
 ## Architecture
@@ -101,8 +101,8 @@ The pre-inject assistant baseline remains only to scope trail and stall observat
 Bond state under `~/.devspec/opencode-remote-control/` contains:
 
 - connection and current attachment identity
-- independent ingress, catch-up, and playbook cursors
-- delivered command and playbook ids
+- independent ingress, catch-up, and automation cursors
+- delivered command and automation ids
 - current command turn/message correlation
 - busy, stall, permission, question, and work-trail state
 - one-turn answer-post reservation and success latch

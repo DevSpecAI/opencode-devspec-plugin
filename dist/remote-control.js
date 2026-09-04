@@ -1794,7 +1794,7 @@ function runAcceptanceStages(stages) {
             mustRetry = true;
             logPoll(`accepted prompt bookkeeping stage ${stage.name} failed: ${err}`);
         }
-        // Later bookkeeping may depend on an earlier stage (playbook persistence
+        // Later bookkeeping may depend on an earlier stage (automation persistence
         // follows its in-memory id update), so retain the idempotent suffix from
         // the first failure even when a later attempt happened to succeed now.
         if (mustRetry)
@@ -1846,8 +1846,8 @@ function finalizeAcceptedPrompt(input) {
             if (pump.acceptingTurn?.key === key)
                 pump.acceptingTurn = null;
         }
-        else if (pump.acceptingPlaybook?.key === key) {
-            pump.acceptingPlaybook = null;
+        else if (pump.acceptingAutomation?.key === key) {
+            pump.acceptingAutomation = null;
         }
     }
     if (failed.length > 0) {
@@ -1882,11 +1882,11 @@ function pumpStateFor(connectionId, persisted) {
             consecutiveErrors: 0,
             roomGeneration: 0,
             consecutiveRecoverableEnds: 0,
-            // Seeded from disk so a plugin restart cannot re-inject a playbook run it
+            // Seeded from disk so a plugin restart cannot re-inject an automation run it
             // already handed to the model.
-            deliveredPlaybookDispatchIds: new Set(persisted.playbookDispatchIds),
+            deliveredAutomationDispatchIds: new Set(persisted.automationDispatchIds),
             acceptingTurn: null,
-            acceptingPlaybook: null,
+            acceptingAutomation: null,
             promptTransactions: new Map(),
             acceptanceRecoveries: new Map(),
         };
@@ -1895,19 +1895,19 @@ function pumpStateFor(connectionId, persisted) {
     return s;
 }
 /**
- * One-way local-state compatibility: old OpenCode versions persisted playbook
+ * One-way local-state compatibility: old OpenCode versions persisted automation
  * dispatch ids under an assignment-shaped field. Read it only when the new
- * field is absent; all current writes use the playbook-specific field.
+ * field is absent; all current writes use the automation-specific field.
  */
-const LEGACY_PLAYBOOK_DISPATCH_IDS_FIELD = 'deliveredAssignmentIds';
-function persistedPlaybookDispatchIds(state) {
-    if (Array.isArray(state.deliveredPlaybookDispatchIds)) {
+const LEGACY_AUTOMATION_DISPATCH_IDS_FIELD = 'deliveredAssignmentIds';
+function persistedAutomationDispatchIds(state) {
+    if (Array.isArray(state.deliveredAutomationDispatchIds)) {
         return {
-            ids: [...new Set(state.deliveredPlaybookDispatchIds.filter((id) => typeof id === 'string'))].slice(-50),
+            ids: [...new Set(state.deliveredAutomationDispatchIds.filter((id) => typeof id === 'string'))].slice(-50),
             migratedFromLegacy: false,
         };
     }
-    const legacy = state[LEGACY_PLAYBOOK_DISPATCH_IDS_FIELD];
+    const legacy = state[LEGACY_AUTOMATION_DISPATCH_IDS_FIELD];
     if (!Array.isArray(legacy))
         return { ids: [], migratedFromLegacy: false };
     return {
@@ -1983,28 +1983,28 @@ export function logConnectionEndedStory(input) {
     });
 }
 /**
- * Wake text for a playbook_run dispatch. It is a separate owner-scoped typed
- * wake, not action-item delivery; a look-only playbook must retain its
+ * Wake text for an automation_run dispatch. It is a separate owner-scoped typed
+ * wake, not action-item delivery; a look-only automation must retain its
  * permission line.
  *
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
  */
-function playbookRunCommandText(d) {
+function automationRunCommandText(d) {
     const permission = d.permission === 'can_push'
         ? 'You MAY edit, commit and push.'
         : d.permission === 'can_commit'
             ? 'You MAY edit and commit locally, but MUST NOT push.'
-            : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.';
+            : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.';
     const runId = d.run_id;
-    const name = typeof d.playbook_name === 'string' ? d.playbook_name : 'playbook';
+    const name = typeof d.automation_name === 'string' ? d.automation_name : 'automation';
     return [
-        `▶️ Playbook run dispatched to this connection: "${name}" (run ${runId}).`,
+        `▶️ Automation run dispatched to this connection: "${name}" (run ${runId}).`,
         '',
         'What to do:',
-        `1. claim_playbook_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the playbook names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+        `1. claim_automation_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
         '2. Do the work described below, in this repo.',
-        '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+        '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
         '',
         `Permission: ${permission}`,
         '',
@@ -2064,18 +2064,18 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         return { delayMs: 5_000, stop: false };
     }
     authFailureLogged = false;
-    const persistedPlaybookIds = persistedPlaybookDispatchIds(state);
-    if (persistedPlaybookIds.migratedFromLegacy) {
-        state = patchState({ deliveredPlaybookDispatchIds: persistedPlaybookIds.ids }) ?? {
+    const persistedAutomationIds = persistedAutomationDispatchIds(state);
+    if (persistedAutomationIds.migratedFromLegacy) {
+        state = patchState({ deliveredAutomationDispatchIds: persistedAutomationIds.ids }) ?? {
             ...state,
-            deliveredPlaybookDispatchIds: persistedPlaybookIds.ids,
+            deliveredAutomationDispatchIds: persistedAutomationIds.ids,
         };
     }
     const pump = pumpStateFor(state.connectionId, {
         cursorV2: state.remoteIngressCursorV2 ?? null,
         catchUpCursor: state.remoteIngressCatchUpCursor ?? null,
         dispatchCursor: state.remoteDispatchCursor ?? null,
-        playbookDispatchIds: persistedPlaybookIds.ids,
+        automationDispatchIds: persistedAutomationIds.ids,
     });
     retryAcceptanceRecoveries(pump);
     const acceptanceStage = (name, key, run) => ({
@@ -2291,7 +2291,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             answerPostCallId: null,
             answerPostProcessId: null,
             answerPostedThisTurn: false,
-            activePlaybookRunIds: [],
+            activeAutomationRunIds: [],
             activeTrailMessageId: null,
             pendingQuestion: null,
             pendingPermissions: [],
@@ -2302,8 +2302,8 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             remoteDispatchCursor: null,
             deferredCanonicalCommands: [],
             deferredCanonicalTransaction: null,
-            deferredPlaybookDispatches: [],
-            deferredPlaybookDispatchCursor: null,
+            deferredAutomationDispatches: [],
+            deferredAutomationDispatchCursor: null,
         };
         // patchState — never writeState a stale full snapshot (answer-post claims race).
         state = patchState(adoptedRoomState) ?? { ...state, ...adoptedRoomState };
@@ -2348,14 +2348,14 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                 awaitingRemoteReply: state.awaitingRemoteReply,
                 pendingQuestionRequestId: state.pendingQuestion?.requestId,
             });
-            if (deferInject || pump.acceptingTurn || pump.acceptingPlaybook) {
+            if (deferInject || pump.acceptingTurn || pump.acceptingAutomation) {
                 // Do not accept echoed idle cursors while a command transaction is held.
                 // poll_connection may show the command only once.
                 return { delayMs: 1000, stop: false };
             }
             deferredFollowUpTransaction = freezeCanonicalTurn(structuredClone(persistedDeferred));
         }
-        else if ((state.deferredPlaybookDispatches?.length ?? 0) === 0) {
+        else if ((state.deferredAutomationDispatches?.length ?? 0) === 0) {
             // Idle responses echo all independent cursors. They contain no turn to accept,
             // so applying them cannot skip work.
             if (typeof res?.cursor_v2 === 'string' && res.cursor_v2)
@@ -2373,95 +2373,95 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             return { delayMs: 0, stop: false };
         }
     }
-    // Explicit playbook dispatch is a separate owner-scoped workflow. Extract and
+    // Explicit automation dispatch is a separate owner-scoped workflow. Extract and
     // schedule it before canonical parsing so an unsupported conversation envelope
-    // cannot block a valid playbook. Unknown work-shaped dispatches remain inert.
+    // cannot block a valid automation. Unknown work-shaped dispatches remain inert.
     const offeredDispatches = Array.isArray(res?.dispatches) ? res.dispatches : [];
-    const persistedPlaybookDispatches = state.deferredPlaybookDispatches ?? [];
-    const playbookDispatchesById = new Map();
-    for (const dispatch of [...persistedPlaybookDispatches, ...offeredDispatches]) {
+    const persistedAutomationDispatches = state.deferredAutomationDispatches ?? [];
+    const automationDispatchesById = new Map();
+    for (const dispatch of [...persistedAutomationDispatches, ...offeredDispatches]) {
         if (dispatch &&
-            dispatch.kind === 'playbook_run' &&
+            dispatch.kind === 'automation_run' &&
             typeof dispatch.id === 'string' &&
             typeof dispatch.run_id === 'string' &&
             dispatch.run_id.length > 0) {
-            playbookDispatchesById.set(dispatch.id, dispatch);
+            automationDispatchesById.set(dispatch.id, dispatch);
         }
     }
-    const freshDispatches = [...playbookDispatchesById.values()].filter((dispatch) => dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
-        !pump.deliveredPlaybookDispatchIds.has(dispatch.id) &&
+    const freshDispatches = [...automationDispatchesById.values()].filter((dispatch) => dispatch && dispatch.kind === 'automation_run' && typeof dispatch.id === 'string' &&
+        !pump.deliveredAutomationDispatchIds.has(dispatch.id) &&
         !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')));
-    const playbookDispatchCursor = state.deferredPlaybookDispatchCursor ??
+    const automationDispatchCursor = state.deferredAutomationDispatchCursor ??
         (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor ? res.dispatch_cursor : null);
-    const commitPlaybookCursor = () => {
-        if (playbookDispatchCursor)
-            pump.dispatchCursor = playbookDispatchCursor;
+    const commitAutomationCursor = () => {
+        if (automationDispatchCursor)
+            pump.dispatchCursor = automationDispatchCursor;
         return Boolean(patchState({ remoteDispatchCursor: pump.dispatchCursor }));
     };
     if (freshDispatches.length === 0) {
-        commitPlaybookCursor();
-        if (persistedPlaybookDispatches.length > 0) {
-            patchState({ deferredPlaybookDispatches: [], deferredPlaybookDispatchCursor: null });
+        commitAutomationCursor();
+        if (persistedAutomationDispatches.length > 0) {
+            patchState({ deferredAutomationDispatches: [], deferredAutomationDispatchCursor: null });
         }
     }
     else {
-        const playbookBlocked = Boolean(state.busy || state.awaitingRemoteReply || pump.acceptingTurn || pump.acceptingPlaybook);
-        if (playbookBlocked) {
+        const automationBlocked = Boolean(state.busy || state.awaitingRemoteReply || pump.acceptingTurn || pump.acceptingAutomation);
+        if (automationBlocked) {
             patchState({
-                deferredPlaybookDispatches: structuredClone(freshDispatches),
-                deferredPlaybookDispatchCursor: playbookDispatchCursor,
+                deferredAutomationDispatches: structuredClone(freshDispatches),
+                deferredAutomationDispatchCursor: automationDispatchCursor,
             });
-            logPoll(`deferring ${freshDispatches.length} playbook dispatch(es) until the active OpenCode turn settles`);
+            logPoll(`deferring ${freshDispatches.length} automation dispatch(es) until the active OpenCode turn settles`);
             return { delayMs: 1000, stop: false };
         }
-        const playbookDispatchIds = freshDispatches.map((dispatch) => dispatch.id);
-        const playbookRunIds = freshDispatches
+        const automationDispatchIds = freshDispatches.map((dispatch) => dispatch.id);
+        const automationRunIds = freshDispatches
             .map((dispatch) => dispatch.run_id)
             .filter((runId) => typeof runId === 'string' && runId.length > 0);
-        const playbookKey = `playbook:${playbookDispatchIds.join(',')}`;
-        const playbookAcceptanceStages = () => [
-            acceptanceStage('playbook_active_runs', playbookKey, () => {
-                if (!patchState({ activePlaybookRunIds: playbookRunIds })) {
-                    throw new Error('active playbook run ids were not persisted');
+        const automationKey = `automation:${automationDispatchIds.join(',')}`;
+        const automationAcceptanceStages = () => [
+            acceptanceStage('automation_active_runs', automationKey, () => {
+                if (!patchState({ activeAutomationRunIds: automationRunIds })) {
+                    throw new Error('active automation run ids were not persisted');
                 }
             }),
-            acceptanceStage('playbook_memory_ids', playbookKey, () => {
-                for (const id of playbookDispatchIds)
-                    pump.deliveredPlaybookDispatchIds.add(id);
+            acceptanceStage('automation_memory_ids', automationKey, () => {
+                for (const id of automationDispatchIds)
+                    pump.deliveredAutomationDispatchIds.add(id);
             }),
-            acceptanceStage('playbook_persisted_ids', playbookKey, () => {
+            acceptanceStage('automation_persisted_ids', automationKey, () => {
                 if (!patchState({
-                    deliveredPlaybookDispatchIds: [...pump.deliveredPlaybookDispatchIds].slice(-50),
-                    deferredPlaybookDispatches: [],
-                    deferredPlaybookDispatchCursor: null,
+                    deliveredAutomationDispatchIds: [...pump.deliveredAutomationDispatchIds].slice(-50),
+                    deferredAutomationDispatches: [],
+                    deferredAutomationDispatchCursor: null,
                 })) {
-                    throw new Error('delivered playbook ids were not persisted');
+                    throw new Error('delivered automation ids were not persisted');
                 }
             }),
-            acceptanceStage('playbook_dispatch_cursor', playbookKey, () => {
-                if (!commitPlaybookCursor())
-                    throw new Error('playbook dispatch cursor was not persisted');
+            acceptanceStage('automation_dispatch_cursor', automationKey, () => {
+                if (!commitAutomationCursor())
+                    throw new Error('automation dispatch cursor was not persisted');
             }),
         ];
-        if (pump.promptTransactions.get(playbookKey) === 'accepted') {
-            logPoll(`suppressing in-process reoffer of host-accepted playbook ${playbookKey}`);
+        if (pump.promptTransactions.get(automationKey) === 'accepted') {
+            logPoll(`suppressing in-process reoffer of host-accepted automation ${automationKey}`);
         }
-        else if (!pump.acceptingPlaybook) {
+        else if (!pump.acceptingAutomation) {
             patchState({
-                deferredPlaybookDispatches: structuredClone(freshDispatches),
-                deferredPlaybookDispatchCursor: playbookDispatchCursor,
+                deferredAutomationDispatches: structuredClone(freshDispatches),
+                deferredAutomationDispatchCursor: automationDispatchCursor,
             });
-            pump.acceptingPlaybook = { key: playbookKey, playbookDispatchIds };
-            pump.promptTransactions.set(playbookKey, 'pending');
-            const playbookCommands = freshDispatches.map((dispatch) => ({
+            pump.acceptingAutomation = { key: automationKey, automationDispatchIds };
+            pump.promptTransactions.set(automationKey, 'pending');
+            const automationCommands = freshDispatches.map((dispatch) => ({
                 id: `dispatch:${dispatch.id}`,
                 created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
                 addressed_to: res.addressed_to,
                 authority: { kind: 'owner', capabilities: ['full'] },
-                content: playbookRunCommandText(dispatch),
+                content: automationRunCommandText(dispatch),
                 dispatch_model: dispatch.dispatch_model,
             }));
-            const text = renderInjectedTurn({ commands: playbookCommands, context: null });
+            const text = renderInjectedTurn({ commands: automationCommands, context: null });
             const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model);
             const model = modelExtract.model ?? state.remoteControlModel ?? undefined;
             await setBusy(directory, true);
@@ -2478,18 +2478,18 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                 onAccepted: () => {
                     finalizeAcceptedPrompt({
                         pump,
-                        key: playbookKey,
-                        owner: 'playbook',
-                        stages: playbookAcceptanceStages(),
+                        key: automationKey,
+                        owner: 'automation',
+                        stages: automationAcceptanceStages(),
                     });
                 },
                 onRejected: () => {
-                    pump.promptTransactions.delete(playbookKey);
-                    if (pump.acceptingPlaybook?.key === playbookKey)
-                        pump.acceptingPlaybook = null;
+                    pump.promptTransactions.delete(automationKey);
+                    if (pump.acceptingAutomation?.key === automationKey)
+                        pump.acceptingAutomation = null;
                 },
                 shouldCleanupRejectedTurn: () => pump.promptTransactions.size === 0,
-            })).catch((err) => logPoll(`playbook prompt delivery failed: ${err}`));
+            })).catch((err) => logPoll(`automation prompt delivery failed: ${err}`));
         }
     }
     // ---- Something landed: consume ONLY negotiated canonical ingress -----------------
@@ -2636,7 +2636,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     });
     const handshakeInject = resolveHandshakeInject({
         deferInject,
-        acceptingTurn: Boolean(pump.acceptingTurn || pump.acceptingPlaybook),
+        acceptingTurn: Boolean(pump.acceptingTurn || pump.acceptingAutomation),
         deferred: state.deferredCanonicalCommands,
         incoming: roomCommands,
         deliveredIds,
@@ -3670,11 +3670,11 @@ function isPostSessionMessageToolName(toolName) {
         lower.endsWith('_post_session_message') ||
         lower.endsWith('/post_session_message');
 }
-function isRecordPlaybookRunToolName(toolName) {
+function isRecordAutomationRunToolName(toolName) {
     const lower = String(toolName ?? '').toLowerCase();
-    return lower === 'record_playbook_run' ||
-        lower.endsWith('_record_playbook_run') ||
-        lower.endsWith('/record_playbook_run');
+    return lower === 'record_automation_run' ||
+        lower.endsWith('_record_automation_run') ||
+        lower.endsWith('/record_automation_run');
 }
 /** Reserve the one model-owned answer post allowed for the current OpenCode turn. */
 export function claimAgentAnswerPost(callId) {
@@ -3781,9 +3781,9 @@ export function settleAgentPostResult(toolName, result, callId) {
     logPoll(`settleAgentPostResult: model answer committed devspec_message_id=${messageId}`);
     return true;
 }
-/** A reported playbook outcome is the deterministic terminal boundary for that prompt. */
-export function settlePlaybookRunResult(toolName, result, args) {
-    if (!isRecordPlaybookRunToolName(toolName))
+/** A reported automation outcome is the deterministic terminal boundary for that prompt. */
+export function settleAutomationRunResult(toolName, result, args) {
+    if (!isRecordAutomationRunToolName(toolName))
         return false;
     const outer = result && typeof result === 'object' && !Array.isArray(result)
         ? result
@@ -3793,7 +3793,7 @@ export function settlePlaybookRunResult(toolName, result, args) {
         parsed?.isError === true || parsed?.ok === false || parsed?.success === false || parsed?.error != null;
     const confirmed = parsed ?? (outer && !Array.isArray(outer.content) && typeof outer.raw !== 'string' ? outer : null);
     if (failed || !confirmed) {
-        logPoll('settlePlaybookRunResult: result was not confirmed; playbook activity remains open');
+        logPoll('settleAutomationRunResult: result was not confirmed; automation activity remains open');
         return false;
     }
     const state = readState();
@@ -3801,21 +3801,21 @@ export function settlePlaybookRunResult(toolName, result, args) {
         return false;
     const input = args && typeof args === 'object' ? args : null;
     const runId = typeof input?.run_id === 'string' ? input.run_id : null;
-    const activeRunIds = state.activePlaybookRunIds ?? [];
+    const activeRunIds = state.activeAutomationRunIds ?? [];
     if (!runId || !activeRunIds.includes(runId) || state.awaitingRemoteReply || state.currentCommandTurnId) {
-        logPoll(`settlePlaybookRunResult: ignoring unrelated or stale run_id=${runId ?? '(missing)'}`);
+        logPoll(`settleAutomationRunResult: ignoring unrelated or stale run_id=${runId ?? '(missing)'}`);
         return false;
     }
     const remainingRunIds = activeRunIds.filter((id) => id !== runId);
     if (remainingRunIds.length > 0) {
-        patchState({ activePlaybookRunIds: remainingRunIds });
-        logPoll(`settlePlaybookRunResult: recorded ${runId}; ${remainingRunIds.length} run(s) remain active`);
+        patchState({ activeAutomationRunIds: remainingRunIds });
+        logPoll(`settleAutomationRunResult: recorded ${runId}; ${remainingRunIds.length} run(s) remain active`);
         return true;
     }
     clearPromptTransactions(state.connectionId);
     clearInjectTurnState();
     patchState({
-        activePlaybookRunIds: [],
+        activeAutomationRunIds: [],
         busy: false,
         busySince: null,
         stallWarnedAt: null,
@@ -3823,7 +3823,7 @@ export function settlePlaybookRunResult(toolName, result, args) {
         stallActiveToolSlides: null,
         stallReasoningFingerprint: null,
     });
-    logPoll('settlePlaybookRunResult: recorded outcome closed local playbook activity');
+    logPoll('settleAutomationRunResult: recorded outcome closed local automation activity');
     return true;
 }
 /**

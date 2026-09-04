@@ -11,22 +11,22 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8')
 describe('priority-host authority terminology', () => {
   it('keeps the old assignment-shaped state name only as a compatibility read', () => {
     const source = read('src/remote-control.ts')
-    assert.match(source, /deliveredPlaybookDispatchIds/)
+    assert.match(source, /deliveredAutomationDispatchIds/)
     assert.doesNotMatch(source, /\bdeliveredDispatchIds\b/)
     assert.equal([...source.matchAll(/\bdeliveredAssignmentIds\b/g)].length, 1)
     assert.match(source, /One-way local-state compatibility/)
   })
 
-  it('describes sessionless playbooks without assignment or progress delivery prose', () => {
+  it('describes sessionless automations without assignment or progress delivery prose', () => {
     const overview = read('docs/remote-control/remote-control-overview.md')
     const command = read('commands/devspec.remote.md')
 
     assert.doesNotMatch(overview, /receives dispatches \/ assignments|Assignment \/ `report_progress`/)
-    assert.match(overview, /separately consented owner-scoped `playbook_run` wakes/)
+    assert.match(overview, /separately consented owner-scoped `automation_run` wakes/)
     assert.match(overview, /stamps immutable requester provenance/)
 
     assert.doesNotMatch(command, /\*\*Sessionless:\*\*.*`report_progress`/)
-    assert.match(command, /Separately accepted owner-scoped playbook runs/)
+    assert.match(command, /Separately accepted owner-scoped automation runs/)
     assert.match(command, /server's canonical authority stamp/)
   })
 })

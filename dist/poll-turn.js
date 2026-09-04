@@ -613,8 +613,8 @@ export function renderInjectedTurn(input) {
             ? `## Canonical requester-authorized commands — ACT ON THESE (${commands.length}, in order)`
             : '## Canonical requester-authorized command — ACT ON THIS'
         : commands.length > 1
-            ? `## Explicit playbook commands — ACT ON THESE (${commands.length}, in order)`
-            : '## Explicit playbook command — ACT ON THIS';
+            ? `## Explicit automation commands — ACT ON THESE (${commands.length}, in order)`
+            : '## Explicit automation command — ACT ON THIS';
     parts.push(addressee ? `${heading}\nAddressed to: **${addressee}**` : heading);
     commands.forEach((cmd, i) => {
         const body = typeof cmd?.content === 'string'

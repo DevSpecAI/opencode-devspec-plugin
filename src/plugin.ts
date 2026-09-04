@@ -23,7 +23,7 @@ import {
   resetAnswerPostLatchForUserTurn,
   scheduleWorkTrailPost,
   settleAgentPostResult,
-  settlePlaybookRunResult,
+  settleAutomationRunResult,
   shouldAutoAllowRemoteControlPermission,
 } from './remote-control.js'
 import { registerBundledCommands } from './register-commands.js'
@@ -524,7 +524,7 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
         if (opencodeSessionId && isBondedOpenCodeSession(opencodeSessionId)) {
           await runWithBondAsync(opencodeSessionId, async () => {
             settleAgentPostResult(input.tool, output, input.callID)
-            settlePlaybookRunResult(input.tool, output, input.args)
+            settleAutomationRunResult(input.tool, output, input.args)
           })
         }
         if ((isRegisterConnectionTool(input.tool) || isAttachConnectionTool(input.tool)) && opencodeSessionId) {

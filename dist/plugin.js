@@ -1,5 +1,5 @@
 import { createOpencodeClient as createOpencodeV2Client } from '@opencode-ai/sdk/v2';
-import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, resolveCurrentAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settlePlaybookRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
+import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, resolveCurrentAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settleAutomationRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
 import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
 import { CommitProvenance } from './commit-provenance.js';
@@ -473,7 +473,7 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
                 if (opencodeSessionId && isBondedOpenCodeSession(opencodeSessionId)) {
                     await runWithBondAsync(opencodeSessionId, async () => {
                         settleAgentPostResult(input.tool, output, input.callID);
-                        settlePlaybookRunResult(input.tool, output, input.args);
+                        settleAutomationRunResult(input.tool, output, input.args);
                     });
                 }
                 if ((isRegisterConnectionTool(input.tool) || isAttachConnectionTool(input.tool)) && opencodeSessionId) {

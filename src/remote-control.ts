@@ -263,7 +263,7 @@ interface ConnectionState {
   remoteIngressCursorV2?: string | null
   /** Independent older-page continuation from ingress.window.next_cursor. */
   remoteIngressCatchUpCursor?: string | null
-  /** Independent explicit playbook dispatch watermark. */
+  /** Independent explicit automation dispatch watermark. */
   remoteDispatchCursor?: string | null
   /** Host-selected model for subsequent remote promptAsync turns. */
   remoteControlModel?: OpenCodeModelStamp | null
@@ -312,14 +312,14 @@ interface ConnectionState {
   answerPostProcessId?: string | null
   /** A confirmed answer row already landed during the current OpenCode turn. */
   answerPostedThisTurn?: boolean
-  /** Playbook dispatch ids already injected into OpenCode. */
-  deliveredPlaybookDispatchIds?: string[]
-  /** Playbook dispatches held while another OpenCode prompt owns the bond. */
-  deferredPlaybookDispatches?: Array<Record<string, unknown>>
-  /** Dispatch cursor committed only after the deferred playbook prompt is accepted. */
-  deferredPlaybookDispatchCursor?: string | null
-  /** Accepted playbook runs whose recorded outcomes can settle the current prompt. */
-  activePlaybookRunIds?: string[]
+  /** Automation dispatch ids already injected into OpenCode. */
+  deliveredAutomationDispatchIds?: string[]
+  /** Automation dispatches held while another OpenCode prompt owns the bond. */
+  deferredAutomationDispatches?: Array<Record<string, unknown>>
+  /** Dispatch cursor committed only after the deferred automation prompt is accepted. */
+  deferredAutomationDispatchCursor?: string | null
+  /** Accepted automation runs whose recorded outcomes can settle the current prompt. */
+  activeAutomationRunIds?: string[]
   /**
    * Our own last-known assertion of heartbeat_connection's `busy` flag —
    * the SOLE signal that drives the "OpenCode is working…" indicator on the
@@ -2375,11 +2375,11 @@ interface PumpState {
    * clean poll, so only a SUSTAINED absence stops the pump (brief e691c68a).
    */
   consecutiveRecoverableEnds: number
-  deliveredPlaybookDispatchIds: Set<string>
+  deliveredAutomationDispatchIds: Set<string>
   /** Prompt transaction awaiting OpenCode acceptance; never schedule it twice. */
   acceptingTurn: { key: string; commandIds: string[] } | null
-  /** Explicit playbook prompt acceptance is independent of conversation ingress. */
-  acceptingPlaybook: { key: string; playbookDispatchIds: string[] } | null
+  /** Explicit automation prompt acceptance is independent of conversation ingress. */
+  acceptingAutomation: { key: string; automationDispatchIds: string[] } | null
   /** Pending/accepted prompt transactions sharing this bond's busy/correlation lifecycle. */
   promptTransactions: Map<string, 'pending' | 'accepted'>
   /** In-process only: failed idempotent bookkeeping for host-accepted prompts. */
@@ -2408,7 +2408,7 @@ function runAcceptanceStages(stages: AcceptanceBookkeepingStage[]): AcceptanceBo
       mustRetry = true
       logPoll(`accepted prompt bookkeeping stage ${stage.name} failed: ${err}`)
     }
-    // Later bookkeeping may depend on an earlier stage (playbook persistence
+    // Later bookkeeping may depend on an earlier stage (automation persistence
     // follows its in-memory id update), so retain the idempotent suffix from
     // the first failure even when a later attempt happened to succeed now.
     if (mustRetry) retrySuffix.push(stage)
@@ -2452,7 +2452,7 @@ function retryAcceptanceRecoveries(pump: PumpState): void {
 function finalizeAcceptedPrompt(input: {
   pump: PumpState
   key: string
-  owner: 'canonical' | 'playbook'
+  owner: 'canonical' | 'automation'
   stages: AcceptanceBookkeepingStage[]
   roomGeneration?: number
   devspecSessionId?: string | null
@@ -2474,8 +2474,8 @@ function finalizeAcceptedPrompt(input: {
     pump.promptTransactions.set(key, 'accepted')
     if (owner === 'canonical') {
       if (pump.acceptingTurn?.key === key) pump.acceptingTurn = null
-    } else if (pump.acceptingPlaybook?.key === key) {
-      pump.acceptingPlaybook = null
+    } else if (pump.acceptingAutomation?.key === key) {
+      pump.acceptingAutomation = null
     }
   }
   if (failed.length > 0) {
@@ -2502,7 +2502,7 @@ function pumpStateFor(
     cursorV2: string | null
     catchUpCursor: string | null
     dispatchCursor: string | null
-    playbookDispatchIds: string[]
+    automationDispatchIds: string[]
   },
 ): PumpState {
   let s = pumpStates.get(connectionId)
@@ -2519,11 +2519,11 @@ function pumpStateFor(
       consecutiveErrors: 0,
       roomGeneration: 0,
       consecutiveRecoverableEnds: 0,
-      // Seeded from disk so a plugin restart cannot re-inject a playbook run it
+      // Seeded from disk so a plugin restart cannot re-inject an automation run it
       // already handed to the model.
-      deliveredPlaybookDispatchIds: new Set(persisted.playbookDispatchIds),
+      deliveredAutomationDispatchIds: new Set(persisted.automationDispatchIds),
       acceptingTurn: null,
-      acceptingPlaybook: null,
+      acceptingAutomation: null,
       promptTransactions: new Map(),
       acceptanceRecoveries: new Map(),
     }
@@ -2533,24 +2533,24 @@ function pumpStateFor(
 }
 
 /**
- * One-way local-state compatibility: old OpenCode versions persisted playbook
+ * One-way local-state compatibility: old OpenCode versions persisted automation
  * dispatch ids under an assignment-shaped field. Read it only when the new
- * field is absent; all current writes use the playbook-specific field.
+ * field is absent; all current writes use the automation-specific field.
  */
-const LEGACY_PLAYBOOK_DISPATCH_IDS_FIELD = 'deliveredAssignmentIds'
+const LEGACY_AUTOMATION_DISPATCH_IDS_FIELD = 'deliveredAssignmentIds'
 
-function persistedPlaybookDispatchIds(state: ConnectionState): {
+function persistedAutomationDispatchIds(state: ConnectionState): {
   ids: string[]
   migratedFromLegacy: boolean
 } {
-  if (Array.isArray(state.deliveredPlaybookDispatchIds)) {
+  if (Array.isArray(state.deliveredAutomationDispatchIds)) {
     return {
-      ids: [...new Set(state.deliveredPlaybookDispatchIds.filter((id): id is string => typeof id === 'string'))].slice(-50),
+      ids: [...new Set(state.deliveredAutomationDispatchIds.filter((id): id is string => typeof id === 'string'))].slice(-50),
       migratedFromLegacy: false,
     }
   }
 
-  const legacy = (state as unknown as Record<string, unknown>)[LEGACY_PLAYBOOK_DISPATCH_IDS_FIELD]
+  const legacy = (state as unknown as Record<string, unknown>)[LEGACY_AUTOMATION_DISPATCH_IDS_FIELD]
   if (!Array.isArray(legacy)) return { ids: [], migratedFromLegacy: false }
   return {
     ids: [...new Set(legacy.filter((id): id is string => typeof id === 'string'))].slice(-50),
@@ -2655,31 +2655,31 @@ export interface PollOutcome {
 }
 
 /**
- * Wake text for a playbook_run dispatch. It is a separate owner-scoped typed
- * wake, not action-item delivery; a look-only playbook must retain its
+ * Wake text for an automation_run dispatch. It is a separate owner-scoped typed
+ * wake, not action-item delivery; a look-only automation must retain its
  * permission line.
  *
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
  */
-function playbookRunCommandText(d: Record<string, unknown>): string {
+function automationRunCommandText(d: Record<string, unknown>): string {
   const permission =
     d.permission === 'can_push'
       ? 'You MAY edit, commit and push.'
       : d.permission === 'can_commit'
         ? 'You MAY edit and commit locally, but MUST NOT push.'
-        : 'This playbook is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
+        : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.'
 
   const runId = d.run_id as string
-  const name = typeof d.playbook_name === 'string' ? d.playbook_name : 'playbook'
+  const name = typeof d.automation_name === 'string' ? d.automation_name : 'automation'
 
   return [
-    `▶️ Playbook run dispatched to this connection: "${name}" (run ${runId}).`,
+    `▶️ Automation run dispatched to this connection: "${name}" (run ${runId}).`,
     '',
     'What to do:',
-    `1. claim_playbook_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the playbook names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
+    `1. claim_automation_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
     '2. Do the work described below, in this repo.',
-    '3. record_playbook_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
+    '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
     `Permission: ${permission}`,
     '',
@@ -2756,18 +2756,18 @@ export async function pollAndDeliver(
   }
   authFailureLogged = false
 
-  const persistedPlaybookIds = persistedPlaybookDispatchIds(state)
-  if (persistedPlaybookIds.migratedFromLegacy) {
-    state = patchState({ deliveredPlaybookDispatchIds: persistedPlaybookIds.ids }) ?? {
+  const persistedAutomationIds = persistedAutomationDispatchIds(state)
+  if (persistedAutomationIds.migratedFromLegacy) {
+    state = patchState({ deliveredAutomationDispatchIds: persistedAutomationIds.ids }) ?? {
       ...state,
-      deliveredPlaybookDispatchIds: persistedPlaybookIds.ids,
+      deliveredAutomationDispatchIds: persistedAutomationIds.ids,
     }
   }
   const pump = pumpStateFor(state.connectionId, {
     cursorV2: state.remoteIngressCursorV2 ?? null,
     catchUpCursor: state.remoteIngressCatchUpCursor ?? null,
     dispatchCursor: state.remoteDispatchCursor ?? null,
-    playbookDispatchIds: persistedPlaybookIds.ids,
+    automationDispatchIds: persistedAutomationIds.ids,
   })
   retryAcceptanceRecoveries(pump)
   const acceptanceStage = (
@@ -2992,7 +2992,7 @@ export async function pollAndDeliver(
       answerPostCallId: null,
       answerPostProcessId: null,
       answerPostedThisTurn: false,
-      activePlaybookRunIds: [],
+      activeAutomationRunIds: [],
       activeTrailMessageId: null,
       pendingQuestion: null,
       pendingPermissions: [],
@@ -3003,8 +3003,8 @@ export async function pollAndDeliver(
       remoteDispatchCursor: null,
       deferredCanonicalCommands: [],
       deferredCanonicalTransaction: null,
-      deferredPlaybookDispatches: [],
-      deferredPlaybookDispatchCursor: null,
+      deferredAutomationDispatches: [],
+      deferredAutomationDispatchCursor: null,
     }
     // patchState — never writeState a stale full snapshot (answer-post claims race).
     state = patchState(adoptedRoomState) ?? { ...state, ...adoptedRoomState }
@@ -3052,13 +3052,13 @@ export async function pollAndDeliver(
         awaitingRemoteReply: state.awaitingRemoteReply,
         pendingQuestionRequestId: state.pendingQuestion?.requestId,
       })
-        if (deferInject || pump.acceptingTurn || pump.acceptingPlaybook) {
+        if (deferInject || pump.acceptingTurn || pump.acceptingAutomation) {
         // Do not accept echoed idle cursors while a command transaction is held.
         // poll_connection may show the command only once.
         return { delayMs: 1000, stop: false }
       }
       deferredFollowUpTransaction = freezeCanonicalTurn(structuredClone(persistedDeferred))
-    } else if ((state.deferredPlaybookDispatches?.length ?? 0) === 0) {
+    } else if ((state.deferredAutomationDispatches?.length ?? 0) === 0) {
       // Idle responses echo all independent cursors. They contain no turn to accept,
       // so applying them cannot skip work.
       if (typeof res?.cursor_v2 === 'string' && res.cursor_v2) pump.cursorV2 = res.cursor_v2
@@ -3075,96 +3075,96 @@ export async function pollAndDeliver(
     }
   }
 
-  // Explicit playbook dispatch is a separate owner-scoped workflow. Extract and
+  // Explicit automation dispatch is a separate owner-scoped workflow. Extract and
   // schedule it before canonical parsing so an unsupported conversation envelope
-  // cannot block a valid playbook. Unknown work-shaped dispatches remain inert.
+  // cannot block a valid automation. Unknown work-shaped dispatches remain inert.
   const offeredDispatches: any[] = Array.isArray(res?.dispatches) ? res.dispatches : []
-  const persistedPlaybookDispatches = state.deferredPlaybookDispatches ?? []
-  const playbookDispatchesById = new Map<string, any>()
-  for (const dispatch of [...persistedPlaybookDispatches, ...offeredDispatches]) {
+  const persistedAutomationDispatches = state.deferredAutomationDispatches ?? []
+  const automationDispatchesById = new Map<string, any>()
+  for (const dispatch of [...persistedAutomationDispatches, ...offeredDispatches]) {
     if (
       dispatch &&
-      dispatch.kind === 'playbook_run' &&
+      dispatch.kind === 'automation_run' &&
       typeof dispatch.id === 'string' &&
       typeof dispatch.run_id === 'string' &&
       dispatch.run_id.length > 0
     ) {
-      playbookDispatchesById.set(dispatch.id, dispatch)
+      automationDispatchesById.set(dispatch.id, dispatch)
     }
   }
-  const freshDispatches = [...playbookDispatchesById.values()].filter((dispatch) =>
-    dispatch && dispatch.kind === 'playbook_run' && typeof dispatch.id === 'string' &&
-    !pump.deliveredPlaybookDispatchIds.has(dispatch.id) &&
+  const freshDispatches = [...automationDispatchesById.values()].filter((dispatch) =>
+    dispatch && dispatch.kind === 'automation_run' && typeof dispatch.id === 'string' &&
+    !pump.deliveredAutomationDispatchIds.has(dispatch.id) &&
     !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')),
   )
-  const playbookDispatchCursor = state.deferredPlaybookDispatchCursor ??
+  const automationDispatchCursor = state.deferredAutomationDispatchCursor ??
     (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor ? res.dispatch_cursor : null)
-  const commitPlaybookCursor = (): boolean => {
-    if (playbookDispatchCursor) pump.dispatchCursor = playbookDispatchCursor
+  const commitAutomationCursor = (): boolean => {
+    if (automationDispatchCursor) pump.dispatchCursor = automationDispatchCursor
     return Boolean(patchState({ remoteDispatchCursor: pump.dispatchCursor }))
   }
   if (freshDispatches.length === 0) {
-    commitPlaybookCursor()
-    if (persistedPlaybookDispatches.length > 0) {
-      patchState({ deferredPlaybookDispatches: [], deferredPlaybookDispatchCursor: null })
+    commitAutomationCursor()
+    if (persistedAutomationDispatches.length > 0) {
+      patchState({ deferredAutomationDispatches: [], deferredAutomationDispatchCursor: null })
     }
   } else {
-    const playbookBlocked = Boolean(
-      state.busy || state.awaitingRemoteReply || pump.acceptingTurn || pump.acceptingPlaybook,
+    const automationBlocked = Boolean(
+      state.busy || state.awaitingRemoteReply || pump.acceptingTurn || pump.acceptingAutomation,
     )
-    if (playbookBlocked) {
+    if (automationBlocked) {
       patchState({
-        deferredPlaybookDispatches: structuredClone(freshDispatches),
-        deferredPlaybookDispatchCursor: playbookDispatchCursor,
+        deferredAutomationDispatches: structuredClone(freshDispatches),
+        deferredAutomationDispatchCursor: automationDispatchCursor,
       })
-      logPoll(`deferring ${freshDispatches.length} playbook dispatch(es) until the active OpenCode turn settles`)
+      logPoll(`deferring ${freshDispatches.length} automation dispatch(es) until the active OpenCode turn settles`)
       return { delayMs: 1000, stop: false }
     }
-    const playbookDispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
-    const playbookRunIds = freshDispatches
+    const automationDispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
+    const automationRunIds = freshDispatches
       .map((dispatch) => dispatch.run_id)
       .filter((runId): runId is string => typeof runId === 'string' && runId.length > 0)
-    const playbookKey = `playbook:${playbookDispatchIds.join(',')}`
-    const playbookAcceptanceStages = (): AcceptanceBookkeepingStage[] => [
-      acceptanceStage('playbook_active_runs', playbookKey, () => {
-        if (!patchState({ activePlaybookRunIds: playbookRunIds })) {
-          throw new Error('active playbook run ids were not persisted')
+    const automationKey = `automation:${automationDispatchIds.join(',')}`
+    const automationAcceptanceStages = (): AcceptanceBookkeepingStage[] => [
+      acceptanceStage('automation_active_runs', automationKey, () => {
+        if (!patchState({ activeAutomationRunIds: automationRunIds })) {
+          throw new Error('active automation run ids were not persisted')
         }
       }),
-      acceptanceStage('playbook_memory_ids', playbookKey, () => {
-        for (const id of playbookDispatchIds) pump.deliveredPlaybookDispatchIds.add(id)
+      acceptanceStage('automation_memory_ids', automationKey, () => {
+        for (const id of automationDispatchIds) pump.deliveredAutomationDispatchIds.add(id)
       }),
-      acceptanceStage('playbook_persisted_ids', playbookKey, () => {
+      acceptanceStage('automation_persisted_ids', automationKey, () => {
         if (!patchState({
-          deliveredPlaybookDispatchIds: [...pump.deliveredPlaybookDispatchIds].slice(-50),
-          deferredPlaybookDispatches: [],
-          deferredPlaybookDispatchCursor: null,
+          deliveredAutomationDispatchIds: [...pump.deliveredAutomationDispatchIds].slice(-50),
+          deferredAutomationDispatches: [],
+          deferredAutomationDispatchCursor: null,
         })) {
-          throw new Error('delivered playbook ids were not persisted')
+          throw new Error('delivered automation ids were not persisted')
         }
       }),
-      acceptanceStage('playbook_dispatch_cursor', playbookKey, () => {
-        if (!commitPlaybookCursor()) throw new Error('playbook dispatch cursor was not persisted')
+      acceptanceStage('automation_dispatch_cursor', automationKey, () => {
+        if (!commitAutomationCursor()) throw new Error('automation dispatch cursor was not persisted')
       }),
     ]
-    if (pump.promptTransactions.get(playbookKey) === 'accepted') {
-      logPoll(`suppressing in-process reoffer of host-accepted playbook ${playbookKey}`)
-    } else if (!pump.acceptingPlaybook) {
+    if (pump.promptTransactions.get(automationKey) === 'accepted') {
+      logPoll(`suppressing in-process reoffer of host-accepted automation ${automationKey}`)
+    } else if (!pump.acceptingAutomation) {
       patchState({
-        deferredPlaybookDispatches: structuredClone(freshDispatches),
-        deferredPlaybookDispatchCursor: playbookDispatchCursor,
+        deferredAutomationDispatches: structuredClone(freshDispatches),
+        deferredAutomationDispatchCursor: automationDispatchCursor,
       })
-      pump.acceptingPlaybook = { key: playbookKey, playbookDispatchIds }
-      pump.promptTransactions.set(playbookKey, 'pending')
-      const playbookCommands = freshDispatches.map((dispatch) => ({
+      pump.acceptingAutomation = { key: automationKey, automationDispatchIds }
+      pump.promptTransactions.set(automationKey, 'pending')
+      const automationCommands = freshDispatches.map((dispatch) => ({
         id: `dispatch:${dispatch.id}`,
         created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
         addressed_to: res.addressed_to,
         authority: { kind: 'owner', capabilities: ['full'] },
-        content: playbookRunCommandText(dispatch),
+        content: automationRunCommandText(dispatch),
         dispatch_model: dispatch.dispatch_model,
       }))
-      const text = renderInjectedTurn({ commands: playbookCommands, context: null })
+      const text = renderInjectedTurn({ commands: automationCommands, context: null })
       const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model)
       const model = modelExtract.model ?? state.remoteControlModel ?? undefined
       await setBusy(directory, true)
@@ -3181,17 +3181,17 @@ export async function pollAndDeliver(
         onAccepted: () => {
           finalizeAcceptedPrompt({
             pump,
-            key: playbookKey,
-            owner: 'playbook',
-            stages: playbookAcceptanceStages(),
+            key: automationKey,
+            owner: 'automation',
+            stages: automationAcceptanceStages(),
           })
         },
         onRejected: () => {
-          pump.promptTransactions.delete(playbookKey)
-          if (pump.acceptingPlaybook?.key === playbookKey) pump.acceptingPlaybook = null
+          pump.promptTransactions.delete(automationKey)
+          if (pump.acceptingAutomation?.key === automationKey) pump.acceptingAutomation = null
         },
         shouldCleanupRejectedTurn: () => pump.promptTransactions.size === 0,
-      })).catch((err) => logPoll(`playbook prompt delivery failed: ${err}`))
+      })).catch((err) => logPoll(`automation prompt delivery failed: ${err}`))
     }
   }
 
@@ -3347,7 +3347,7 @@ export async function pollAndDeliver(
   })
   const handshakeInject = resolveHandshakeInject({
     deferInject,
-    acceptingTurn: Boolean(pump.acceptingTurn || pump.acceptingPlaybook),
+    acceptingTurn: Boolean(pump.acceptingTurn || pump.acceptingAutomation),
     deferred: state.deferredCanonicalCommands,
     incoming: roomCommands,
     deliveredIds,
@@ -4563,11 +4563,11 @@ function isPostSessionMessageToolName(toolName: string): boolean {
     lower.endsWith('/post_session_message')
 }
 
-function isRecordPlaybookRunToolName(toolName: string): boolean {
+function isRecordAutomationRunToolName(toolName: string): boolean {
   const lower = String(toolName ?? '').toLowerCase()
-  return lower === 'record_playbook_run' ||
-    lower.endsWith('_record_playbook_run') ||
-    lower.endsWith('/record_playbook_run')
+  return lower === 'record_automation_run' ||
+    lower.endsWith('_record_automation_run') ||
+    lower.endsWith('/record_automation_run')
 }
 
 /** Reserve the one model-owned answer post allowed for the current OpenCode turn. */
@@ -4690,9 +4690,9 @@ export function settleAgentPostResult(toolName: string, result: unknown, callId:
   return true
 }
 
-/** A reported playbook outcome is the deterministic terminal boundary for that prompt. */
-export function settlePlaybookRunResult(toolName: string, result: unknown, args: unknown): boolean {
-  if (!isRecordPlaybookRunToolName(toolName)) return false
+/** A reported automation outcome is the deterministic terminal boundary for that prompt. */
+export function settleAutomationRunResult(toolName: string, result: unknown, args: unknown): boolean {
+  if (!isRecordAutomationRunToolName(toolName)) return false
   const outer = result && typeof result === 'object' && !Array.isArray(result)
     ? result as Record<string, unknown>
     : null
@@ -4703,28 +4703,28 @@ export function settlePlaybookRunResult(toolName: string, result: unknown, args:
     outer && !Array.isArray(outer.content) && typeof outer.raw !== 'string' ? outer : null
   )
   if (failed || !confirmed) {
-    logPoll('settlePlaybookRunResult: result was not confirmed; playbook activity remains open')
+    logPoll('settleAutomationRunResult: result was not confirmed; automation activity remains open')
     return false
   }
   const state = readState()
   if (!state) return false
   const input = args && typeof args === 'object' ? args as Record<string, unknown> : null
   const runId = typeof input?.run_id === 'string' ? input.run_id : null
-  const activeRunIds = state.activePlaybookRunIds ?? []
+  const activeRunIds = state.activeAutomationRunIds ?? []
   if (!runId || !activeRunIds.includes(runId) || state.awaitingRemoteReply || state.currentCommandTurnId) {
-    logPoll(`settlePlaybookRunResult: ignoring unrelated or stale run_id=${runId ?? '(missing)'}`)
+    logPoll(`settleAutomationRunResult: ignoring unrelated or stale run_id=${runId ?? '(missing)'}`)
     return false
   }
   const remainingRunIds = activeRunIds.filter((id) => id !== runId)
   if (remainingRunIds.length > 0) {
-    patchState({ activePlaybookRunIds: remainingRunIds })
-    logPoll(`settlePlaybookRunResult: recorded ${runId}; ${remainingRunIds.length} run(s) remain active`)
+    patchState({ activeAutomationRunIds: remainingRunIds })
+    logPoll(`settleAutomationRunResult: recorded ${runId}; ${remainingRunIds.length} run(s) remain active`)
     return true
   }
   clearPromptTransactions(state.connectionId)
   clearInjectTurnState()
   patchState({
-    activePlaybookRunIds: [],
+    activeAutomationRunIds: [],
     busy: false,
     busySince: null,
     stallWarnedAt: null,
@@ -4732,7 +4732,7 @@ export function settlePlaybookRunResult(toolName: string, result: unknown, args:
     stallActiveToolSlides: null,
     stallReasoningFingerprint: null,
   })
-  logPoll('settlePlaybookRunResult: recorded outcome closed local playbook activity')
+  logPoll('settleAutomationRunResult: recorded outcome closed local automation activity')
   return true
 }
 
