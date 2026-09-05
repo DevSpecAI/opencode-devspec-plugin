@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Authority is the served contract's, not this plugin's
+
+The remote command now tells the agent to read each knowledge write's `outcome` and, on
+`queued_for_review`, relay the `proposal_id` and the reason, saying a maintainer has to
+accept it before it applies. Who may commit which kind of write is decided by DevSpec and
+served at `devspec://product/implementation-contract` → `authority_contract`; the command
+points there rather than restating it.
+
 ### Playbooks are now Automations
 
 DevSpec has renamed Playbooks to Automations. This plugin now uses the renamed tools
