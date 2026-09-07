@@ -129,6 +129,20 @@ describe('active session plan projection v1', () => {
     assert.match(text, /`advance`.*atomically completes/s)
     assert.match(text, /intentional cross-plan.*`plan_id` and `expected_revision`/s)
     assert.match(text, /orphaned same-owner plan/)
-    assert.ok(text.length < 4_500, `instruction footprint grew unexpectedly: ${text.length} chars`)
+    // A BLOAT ceiling, not a budget to write up against. This was 4,500 against a
+    // measured 4,316 — 184 characters of headroom, so it fired on adding a needed
+    // sentence rather than on real bloat, and the way through it was to write a
+    // terser instruction than the model deserved. Owner direction, 2026-09-05
+    // (DevSpec item 45588384, corrected in Pi first): an instruction should be
+    // sensible, not as short as possible, and a hard test must not make it
+    // difficult or lossy to tell a model something it genuinely needs. The ceiling
+    // below still fails loudly on what actually costs — a pasted contract, a dumped
+    // verb map — and if you are near it, ask whether this file is restating the
+    // served contract instead of pointing at it, NOT whether to raise the number.
+    const INSTRUCTION_BLOAT_CEILING_CHARS = 12_000
+    assert.ok(
+      text.length < INSTRUCTION_BLOAT_CEILING_CHARS,
+      `instructions bloated: ${text.length} chars (ceiling ${INSTRUCTION_BLOAT_CEILING_CHARS})`,
+    )
   })
 })
