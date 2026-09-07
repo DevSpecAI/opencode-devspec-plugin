@@ -151,6 +151,35 @@ export const STALL_TIMEOUT_MS = (() => {
 })()
 
 /**
+ * How often the pump re-posts the "OpenCode is still waiting for permission"
+ * advisory while a permission ask is unresolved. The first advisory is posted
+ * the moment `permission.asked` fires (`postPermissionWaitNotice`); this
+ * value controls the follow-up cadence so a long human wait does not look
+ * like a silent stall on the DevSpec side. Item 26050f07 — d1576e7f waited
+ * 9m 20s for a human approval, with no intermediate signal. Override via
+ * DEVSPEC_OPENCODE_PERMISSION_NOTICE_REPEAT_MS (milliseconds).
+ */
+export const PERMISSION_WAIT_NOTICE_REPEAT_MS = (() => {
+  const raw = process.env.DEVSPEC_OPENCODE_PERMISSION_NOTICE_REPEAT_MS
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) && n > 0 ? n : 120_000
+})()
+
+/**
+ * Maximum time an unresolved permission ask may keep `busy:true` before the
+ * plugin auto-clears it. Without this, an abandoned prompt strands the
+ * connection: every owner command gets queued-then-deferred with
+ * `reason: active_turn` forever (item 26050f07 — Lucky Quail d1576e7f).
+ * Matches Claude's `MAX_TURN_MS` backstop shape. Override via
+ * DEVSPEC_OPENCODE_PERMISSION_AUTO_CLEAR_MS (milliseconds).
+ */
+export const PERMISSION_WAIT_AUTO_CLEAR_MS = (() => {
+  const raw = process.env.DEVSPEC_OPENCODE_PERMISSION_AUTO_CLEAR_MS
+  const n = raw ? Number(raw) : NaN
+  return Number.isFinite(n) && n > 0 ? n : 600_000
+})()
+
+/**
  * Client ceiling for ordinary (non-long-poll) MCP calls on the pump path.
  * `fetch` has no default timeout — a hung keepalive / heartbeat / notice ahead
  * of the next `poll_connection` freezes `last_seen` while the connection still
@@ -379,6 +408,12 @@ interface ConnectionState {
   /** Prevent stale message parts from resurrecting a permission after its reply. */
   permissionResolutionObserved?: boolean
   /**
+   * Epoch ms when the "still waiting for permission" advisory was last posted.
+   * Drives the repeat cadence in `checkPermissionWaitTimeout` so a long human
+   * wait gets periodic reminders, not a single stale notice. Item 26050f07.
+   */
+  permissionNoticeLastAt?: number | null
+  /**
    * This turn is the plugin's OWN protocol (a DevSpec connect handshake), so
    * it produces no room post — item 68cc567c.
    *
@@ -526,6 +561,7 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       permissionAskedAt: null,
       pendingPermissions: [],
       permissionResolutionObserved: false,
+      permissionNoticeLastAt: null,
     })
   } catch (err) {
     // Best-effort — a failed busy assertion must never crash the poll loop.
@@ -548,6 +584,141 @@ export async function setBusy(directory: string, busy: boolean): Promise<void> {
       })
     }
   }
+}
+
+/**
+ * Teardown heartbeat sent when the OpenCode plugin instance is being disposed.
+ *
+ * Mirrors Claude's `offlineAndExit('owner_gone', 1)` (`devspec-remote-poll.mjs`
+ * around line 2021) for the in-process pump: the host is going away, so before
+ * tearing down we tell the server `busy:false` + `end_reason: 'owner_gone'`.
+ *
+ * Without this, a host that dies mid-turn (terminal close on a permission
+ * prompt, OS kill, OOM, accidental Ctrl+C, hard crash) leaves the connection
+ * with `busy:true` and no live agent. Every subsequent owner command gets
+ * queued-then-deferred with `reason: active_turn` forever — there is no UI
+ * surface to recover. Item 26050f07 — d1576e7f (Lucky Quail, 2026-09-07).
+ *
+ * Best-effort: if the heartbeat fails (server unreachable, host already
+ * tearing down) we still complete the dispose — the worst case is the OLD
+ * behaviour (stale busy on the server), which the server-side `busySince`
+ * auto-recovery backstop now covers.
+ */
+export async function markOwnerGone(directory: string): Promise<void> {
+  const auth = resolveDevspecAuth(directory)
+  const state = readState()
+  if (!auth.ok || !auth.token || !auth.mcp_url) {
+    logPoll('markOwnerGone: no auth — skipping teardown heartbeat')
+    return
+  }
+  if (!state?.connectionId) {
+    logPoll('markOwnerGone: no connection_id in state — skipping teardown heartbeat')
+    return
+  }
+  const connectionId = state.connectionId
+  const wasBusy = state.busy === true
+  try {
+    await mcpToolsCall({
+      mcpUrl: auth.mcp_url,
+      token: auth.token,
+      name: 'heartbeat_connection',
+      arguments: {
+        connection_id: connectionId,
+        agent_name: AGENT_NAME,
+        status: 'offline',
+        busy: false,
+        end_reason: 'owner_gone',
+      },
+      timeoutMs: MCP_HEARTBEAT_TIMEOUT_MS,
+    })
+    logPoll(
+      `markOwnerGone: heartbeat sent (status:offline, busy:false, end_reason:owner_gone) for ${connectionId} ` +
+        `(was busy=${wasBusy})`,
+    )
+  } catch (err) {
+    logPoll(`markOwnerGone: heartbeat failed (${err}) — server may keep stale busy, busySince backstop will recover`)
+  }
+}
+
+/**
+ * Bound an unresolved permission ask so it cannot strand the connection forever.
+ *
+ * Two thresholds, both driven by `permissionAskedAt`:
+ *
+ *   1. After ~2 minutes (PERMISSION_WAIT_NOTICE_REPEAT_MS), post a follow-up
+ *      advisory so the human side can see the wait is still in flight. The
+ *      first advisory fires immediately on `permission.asked`; this keeps the
+ *      cadence up.
+ *
+ *   2. After ~10 minutes (PERMISSION_WAIT_AUTO_CLEAR_MS), clear `busy:false`
+ *      and post an "I gave up on that prompt" advisory. Mirrors Claude's
+ *      MAX_TURN_MS backstop: the agent is not coming back, so the next owner
+ *      command must be deliverable. Item 26050f07 — Lucky Quail d1576e7f
+ *      (CLI exited on a permission prompt at 19:56:09; commands deferred with
+ *      `reason: active_turn` forever after).
+ *
+ * Called from inside `checkBusyStall`'s permission-pending early-return so it
+ * runs every poll tick without adding a second scheduled loop.
+ */
+export async function checkPermissionWaitTimeout(directory: string): Promise<void> {
+  const state = readState()
+  if (!state?.busy || !state.permissionAskedPending || !state.permissionAskedAt) return
+
+  const askedAt = state.permissionAskedAt
+  const elapsed = Date.now() - askedAt
+  const elapsedMinutes = Math.round(elapsed / 60_000)
+  const auth = resolveDevspecAuth(directory)
+
+  // Auto-clear at the long-wait threshold. The permission wait has become the
+  // stall — same shape as Claude's MAX_TURN_MS backstop on a hung host.
+  if (elapsed >= PERMISSION_WAIT_AUTO_CLEAR_MS) {
+    logPoll(
+      `permission wait timeout: ${elapsedMinutes}m since first ask — auto-clearing busy so ` +
+        `the connection is no longer stranded (item 26050f07)`,
+    )
+    patchState({
+      permissionAskedPending: false,
+      permissionAskedAt: null,
+      pendingPermissions: [],
+      permissionResolutionObserved: true,
+      permissionNoticeLastAt: null,
+    })
+    await setBusy(directory, false)
+    if (auth.ok && state.sessionId) {
+      await postSessionNotice(
+        auth,
+        state,
+        `OpenCode was waiting on a permission prompt for over ${Math.round(PERMISSION_WAIT_AUTO_CLEAR_MS / 60_000)} minutes ` +
+          `with no response. The connection has been marked idle so you can send a new command — ` +
+          `and the abandoned prompt has been cleared from the OpenCode turn.`,
+      )
+    }
+    return
+  }
+
+  // Re-post the "still waiting" advisory on the repeat cadence. Skip if the
+  // first advisory just went out (askedAt == permissionNoticeLastAt means no
+  // post-`permission.asked` advisory has been posted yet — the immediate one
+  // handles that case).
+  const lastNotice = state.permissionNoticeLastAt ?? askedAt
+  if (Date.now() - lastNotice < PERMISSION_WAIT_NOTICE_REPEAT_MS) return
+
+  if (!auth.ok || !state.sessionId) return
+  const remainingMinutes = Math.max(
+    1,
+    Math.round((PERMISSION_WAIT_AUTO_CLEAR_MS - elapsed) / 60_000),
+  )
+  await postSessionNotice(
+    auth,
+    state,
+    `OpenCode is still waiting for permission (${elapsedMinutes}m so far). ` +
+      `Approve or deny the prompt in the OpenCode terminal to continue. ` +
+      `If nothing arrives within ${remainingMinutes}m the connection will be marked idle so a follow-up command can land.`,
+  )
+  patchState({ permissionNoticeLastAt: Date.now() })
+  logPoll(
+    `permission wait still pending at ${elapsedMinutes}m — follow-up advisory posted; auto-clear in ${remainingMinutes}m`,
+  )
 }
 
 export function assistantTextFromMessage(message: { parts?: unknown } | null | undefined): string {
@@ -1480,6 +1651,10 @@ export async function checkBusyStall(
       `stall check: ${state.pendingPermissions?.length ?? 1} permission request(s) pending — ` +
         `waiting for local approval, not stalling`,
     )
+    // The wait itself can become a stall (item 26050f07 — d1576e7f). Bound it
+    // here so an abandoned prompt can never strand the connection. The check
+    // itself is a no-op when nothing is over threshold.
+    await checkPermissionWaitTimeout(directory)
     return
   }
 
