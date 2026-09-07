@@ -9,6 +9,7 @@ import {
   handleSessionError,
   listOpenCodeBondSessions,
   logPoll,
+  markOwnerGone,
   markPermissionAsked,
   postPermissionWaitNotice,
   pollAndDeliver,
@@ -211,7 +212,10 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
   const pump = async () => {
     if (pumpRunning) return
     pumpRunning = true
-    logPoll('pump: started (long-poll multi-bond mode)')
+    logPoll(
+      `pump: starting (long-poll multi-bond mode) — stopped=${stopped} ` +
+        `activeBonds=${listOpenCodeBondSessions().length}`,
+    )
     try {
       while (!stopped) {
         const sessions = listOpenCodeBondSessions()
@@ -262,7 +266,9 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
       }
     } finally {
       pumpRunning = false
-      logPoll('pump: exited')
+      logPoll(
+        `pump: exited — stopped=${stopped} activeBonds=${listOpenCodeBondSessions().length}`,
+      )
     }
   }
 
@@ -301,15 +307,39 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
       )
     },
     /**
-     * Verified present on the Hooks type: `dispose?: () => Promise<void>`. Aborting the
+     * Verified present on the Hooks Type: `dispose?: () => Promise<void>`. Aborting the
      * in-flight hold here is what keeps a 25s held request from delaying host shutdown.
+     *
+     * Item 26050f07 — d1576e7f (Lucky Quail, 2026-09-07): the prior `dispose` did
+     * not tell the server we were going away, so when the host CLI exited mid-
+     * turn (terminal close on a permission prompt, OS kill, OOM, hard crash)
+     * the connection was left with `busy:true` and no live agent. Every
+     * subsequent owner command got queued-then-deferred with
+     * `reason: active_turn` indefinitely. The fix mirrors Claude's
+     * `offlineAndExit('owner_gone', 1)`: send one teardown heartbeat (busy:
+     * false, end_reason: 'owner_gone') BEFORE tearing down local state.
+     *
+     * Best-effort: a failed heartbeat falls back to the previous behaviour,
+     * which the busySince auto-recovery backstop now covers server-side.
      */
     dispose: async () => {
+      logPoll(
+        `dispose: starting — stopped=${stopped} pumpRunning=${pumpRunning} ` +
+          `activeBonds=${listOpenCodeBondSessions().length}`,
+      )
       stopped = true
       abort.abort()
+      try {
+        await markOwnerGone(directory)
+      } catch (err) {
+        logPoll(`dispose: markOwnerGone threw: ${err}`)
+      }
       provenance.clearAll()
       clearConnectionCapability()
-      logPoll('dispose: pump stopped, in-flight hold aborted, and process-local identity state cleared')
+      logPoll(
+        'dispose: pump stopped, in-flight hold aborted, owner_gone heartbeat sent, ' +
+          'process-local identity state cleared',
+      )
     },
     tool: {
       // OpenCode prefixes MCP tools with the server name (`devspec_`). Register
@@ -530,13 +560,16 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
         if ((isRegisterConnectionTool(input.tool) || isAttachConnectionTool(input.tool)) && opencodeSessionId) {
           logPoll(
             `bond handshake tool=${input.tool} opencodeSession=${opencodeSessionId} ` +
-              `active=${listOpenCodeBondSessions().length}`,
+              `active=${listOpenCodeBondSessions().length} stopped=${stopped} pumpRunning=${pumpRunning}`,
           )
           // Re-arm if the pump ever exited (dispose / empty). pumpRunning makes
           // this a no-op while the multi-bond loop is already alive.
           if (stopped) {
             stopped = false
-            logPoll('pump: re-arming after a fresh connect handshake')
+            logPoll(
+              `pump: re-arming after a fresh connect handshake — ` +
+                `activeBonds=${listOpenCodeBondSessions().length}`,
+            )
           }
           void pump()
         }
