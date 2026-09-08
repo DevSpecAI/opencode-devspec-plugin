@@ -8,7 +8,7 @@
 
 1. **Presence is the bond.** A successful `poll_connection` updates `last_seen`; `report_keepalive` alone does not. Anything that blocks polling for roughly 90 seconds can end a healthy connection with `idle_timeout`.
 2. **One OpenCode conversation equals one bond.** State is keyed by the OpenCode session id. Several conversations in one process may each attach to different DevSpec rooms.
-3. **The plugin owns answer egress.** Bonded models write their answer as the terminal assistant text of the OpenCode turn; the plugin mirrors it to DevSpec at turn settle via `post_session_message`. Models must NOT call `post_session_message` themselves — that path is mechanically rejected (item 4c639620). The plugin never inspects text to author, recover, or duplicate that answer. The slash command's `Answering` section reflects this.
+3. **The model owns the answer post.** In a bonded OpenCode turn, the model calls `post_session_message({ message })` exactly once; the plugin binds `connection_id`, `agent_name`, `turn_kind`, `phase: "answer"`, `complete_turn`, and the exact remote command correlation from the active bond. A second post in the same turn is rejected; a post from an unbonded OpenCode session is rejected. The plugin never inspects assistant text to author, recover, or duplicate that answer. The slash command's `Answering` section reflects this.
 4. **The plugin owns routing and lifecycle.** It overwrites model-supplied identity, target, phase, completion, model stamp, and command correlation with facts from the firing bond.
 5. **Unbonded sessions fail closed.** A child, sibling, or unrelated OpenCode conversation cannot post through another conversation's DevSpec attachment.
 6. **Remote prompts are serialized.** A second `promptAsync` command waits until the current answer settles so its exact command ids cannot replace the first turn's correlation. A pending OpenCode question is the exception because the next owner command goes to `question.reply`, not a new prompt.
@@ -33,20 +33,21 @@ OpenCode process
              session.promptAsync
              commit accepted ids and cursors
 
-  plugin-owned answer egress (settleAnswerEgress)
-    pick final assistant message from session.messages
-    tool.execute.before (model-owned post_session_message rejected here)
-      reserve one answer post for this OpenCode turn
+  model-owned answer egress (single writer per turn)
+    tool.execute.before
+      reserve exactly one answer post for this OpenCode turn
+      reject any second post in the same turn
+      reject posts from an unbonded OpenCode session
       resolve current connection and model
       overwrite routing and lifecycle fields
       bind exact remote command ids, or mark a local turn unbound
-    DevSpec MCP call
+    model calls post_session_message
     tool.execute.after
       require returned message_id
       settle local busy, trail, permission, and correlation state
 ```
 
-There is no detached inbox process, wait process, Stop-hook answer post, assistant-text fallback, or second full-answer writer.
+There is no detached inbox process, wait process, Stop-hook answer post, assistant-text fallback, or second full-answer writer. The plugin never reads assistant text to republish it.
 
 ## Message Flow
 
@@ -54,7 +55,7 @@ There is no detached inbox process, wait process, Stop-hook answer post, assista
 2. The plugin validates authority and scope against the negotiated remote-ingress contract.
 3. The plugin records the canonical turn id and final ordered command message id before scheduling `promptAsync`.
 4. The injected prompt tells OpenCode to act on the command and write its answer as the terminal assistant text of the turn.
-5. At turn settle, the plugin mirrors the final assistant text to DevSpec via `post_session_message` from `tool.execute.before`. The hook injects `connection_id`, `agent_name: "OpenCode"`, `turn_kind: "agent"`, `phase: "answer"`, and `complete_turn: true`. Models calling `post_session_message` themselves are rejected (4c639620) so the plugin is the only author.
+5. The injected prompt ends with a `Required answer delivery` block telling the model to call `post_session_message` exactly once with the complete answer body. The model's call goes through `tool.execute.before` and `tool.execute.after`: the `before` hook overwrites `connection_id`, `agent_name: "OpenCode"`, `turn_kind: "agent"`, `phase: "answer"`, and `complete_turn: true` from the active bond; the `after` hook requires a successful result carrying `message_id` to settle the turn. The plugin never reads assistant text — if the model omits the call, `session.idle` emits one bounded mechanical error against the exact command, not a republished guess at the answer.
 6. Remote answers receive `command_turn_id` and `command_message_id`. Local terminal answers in the same bonded conversation receive `command_turn_unbound: true`.
 7. Only a successful result carrying `message_id` settles the turn. Failed or malformed results leave it retryable.
 8. `session.idle` never reads assistant text. If a remote turn omitted the required post, it attempts one bounded mechanical error against the exact command. Failed error settlement preserves the command and correlation; confirmed settlement unclaims the command for retry.
