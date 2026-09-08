@@ -25,6 +25,7 @@ import {
   readState,
   rememberOpenCodeBond,
   resetBondsForTests,
+  recoverBondsFromStateFiles,
   runWithBondAsync,
   devspecSessionForBond,
   isBondedOpenCodeSession,
@@ -161,6 +162,70 @@ describe('wipeOpenCodeContextInPlace (8718be5a + a72a4e22)', () => {
     assert.equal(live?.sessionId, devspecSession)
 
     forgetOpenCodeBond(newOpenCode)
+  })
+
+  it('writes the new session id into the wiped state file so a later module reload recovers the bond on the right key (item 7a9b7b0f)', async () => {
+    const dir = tmpDir()
+    dirs.push(dir)
+    const devspecSession = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const oldOpenCode = 'ses_wipe_donor'
+    const newOpenCode = 'ses_wipe_recipient'
+
+    await runWithBondAsync(oldOpenCode, async () => {
+      writeState({
+        connectionId: 'conn-wipe-reload',
+        sessionId: devspecSession,
+        codename: 'Reloading Tern',
+      })
+    })
+    rememberOpenCodeBond(oldOpenCode, devspecSession)
+
+    await wipeOpenCodeContextInPlace({
+      client: { session: { create: async () => ({ data: { id: newOpenCode } }) } },
+      directory: dir,
+      opencodeSessionId: oldOpenCode,
+      selectOpenCodeSession: async () => {},
+    })
+
+    // The state file is keyed by `bondLocalId(opencodeSessionId)`, so its
+    // content's `opencodeSessionId` MUST equal the same id — otherwise
+    // `recoverBondsFromStateFiles` puts the bond back on a key that no file
+    // points at. This is the round-trip that 7a9b7b0f / 42831f3e caught:
+    // the wipe previously left content.opencodeSessionId = oldId while the
+    // file lived at hash(newId).
+    const stateFileDir = path.join(tmpHome, '.devspec', 'opencode-remote-control')
+    const expectedNewHash = (await import('node:crypto'))
+      .createHash('sha256')
+      .update(newOpenCode)
+      .digest('base64url')
+      .slice(0, 32)
+    const newFile = JSON.parse(
+      fs.readFileSync(path.join(stateFileDir, `${expectedNewHash}.json`), 'utf8'),
+    )
+    assert.equal(
+      newFile.opencodeSessionId,
+      newOpenCode,
+      'wiped state file content.opencodeSessionId must match the new id, so filename↔content alignment holds for recovery',
+    )
+
+    // A simulated plugin-module reload (in-memory map cleared) followed by the
+    // recovery scanner must restore the bond on `newOpenCode` — not on
+    // `oldOpenCode`, where the file no longer lives.
+    resetBondsForTests()
+    assert.equal(isBondedOpenCodeSession(newOpenCode), false, 'precondition: map cleared')
+    const recovered = recoverBondsFromStateFiles()
+    assert.ok(recovered.includes(newOpenCode), 'recovery must restore the bond on the new id')
+    assert.equal(
+      recovered.includes(oldOpenCode),
+      false,
+      'no donor file remains, so the old id must not appear in the recovered set',
+    )
+    assert.equal(isBondedOpenCodeSession(newOpenCode), true)
+    assert.equal(
+      devspecSessionForBond(newOpenCode),
+      devspecSession,
+      'recovered bond must still point at the original DevSpec room',
+    )
   })
 
   it('retains the visible bond when TUI navigation fails', async () => {
