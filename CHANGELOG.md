@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0
+
+### Survive plugin-module reload without stranding live bonds (item dd722e4c)
+
+Live evidence 2026-09-08: Brave Lizard (connection `206b89b4`) appeared offline on the Agents page even though its OpenCode process was still running — no `dispose:` and no `markOwnerGone` for that connection in the poll.log. The pump restarted with `activeBonds=0`, and the connection silently went stale after the 90s freshness window. Root cause: `openCodeBonds` is a module-level `Map<opencodeSessionId, Bond>`; when the plugin module is reloaded (config touch, TUI resize, anything that re-runs `DevSpecPlugin`) the new instance has an empty Map but the state files on disk still describe the live connection, and the pump has no way to recover the bond keys. Two-part fix: (1) `ConnectionState` now carries `opencodeSessionId` so a fresh module instance can recover the bond from the file's filename → hash → session-id mapping that the rest of the plugin already uses; (2) on pump start, `recoverBondsFromStateFiles(directory)` iterates every state file in `~/.devspec/opencode-remote-control/*.json` and re-attaches every recorded bond. Legacy state files written before this version (no `opencodeSessionId` field) are skipped with a no-op — they will be overwritten by the next register from a live OpenCode process, or expire server-side. New `test/plugin-reload-bonds.test.mjs` (5 cases) covers the no-op-on-empty-directory, single-bond reload, multi-bond reload, legacy-state-file skip, and the original Brave Lizard scenario.
+
 ## 0.9.0
 
 ### Host death no longer strands a busy connection (item 26050f07)

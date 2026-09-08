@@ -13,10 +13,11 @@ import {
   markPermissionAsked,
   postPermissionWaitNotice,
   pollAndDeliver,
+  readState,
+  recoverBondsFromStateFiles,
   recordConnectionEventFromTool,
   bondLocalId,
   isBondedOpenCodeSession,
-  readState,
   rejectPendingQuestion,
   runWithBondAsync,
   runWithBond,
@@ -211,6 +212,13 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
   const pump = async () => {
     if (pumpRunning) return
     pumpRunning = true
+    // Plugin-module reload wipes the in-memory `openCodeBonds` Map. Re-attach
+    // every live connection recorded on disk before the first poll — otherwise
+    // the pump would idle on `activeBonds=0`, never send a heartbeat, and the
+    // server would mark the connection offline after the freshness window.
+    // The state files now persist `opencodeSessionId` (item dd722e4c) so this
+    // scanner can recover the bond keys. Cheap: a directory read.
+    recoverBondsFromStateFiles(directory)
     logPoll(
       `pump: starting (long-poll multi-bond mode) — stopped=${stopped} ` +
         `activeBonds=${listOpenCodeBondSessions().length}`,
