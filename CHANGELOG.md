@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
+
+### Host death no longer strands a busy connection (item 26050f07)
+
+The plugin's `dispose` hook now sends `heartbeat_connection(status:'offline', busy:false, end_reason:'owner_gone')` before tearing down, mirroring Claude Code's `offlineAndExit('owner_gone', 1)`. A host CLI that exits mid-turn (terminal close on a permission prompt, OS kill, OOM, hard crash) no longer leaves `busy:true` on the server forever. New `checkPermissionWaitTimeout` bounds an unresolved permission ask: a "still waiting" advisory every ~2 minutes and `busy:false` auto-clear after ~10 minutes so an abandoned prompt can never strand the connection. Pump-state observability got explicit `stopped`/`pumpRunning`/`activeBonds` snapshots at every transition so the kind of disposes-without-matching-pump-starts that complicated the d1576e7f investigation never happen silently again. New `test/dispose-busy-cleanup.test.mjs` covers the wire-format and the permission-wait timeouts (7 cases).
+
+### Multiple chats/processes can bond concurrently (item 172df2a5)
+
+The plugin's in-process bond-collision rejection (the `connection … is already owned by …` check at `remote-control.ts:2246`) is gone. Mirroring Claude Code's "no client-side ownership check, server is authoritative" design: every OpenCode chat and every OpenCode process holds its own bond keyed on its own OpenCode session id, so nothing collides or starves another bond. The connect card and surrounding docs were updated to reflect that multi-chat and multi-process are both supported. New `test/multi-chat-bond.test.mjs` (5 cases) plus the pre-existing `bond-identity.test.mjs:312` test rewritten to assert the new behaviour.
+
+## 0.8.0
 
 ### Authority is the served contract's, not this plugin's
 

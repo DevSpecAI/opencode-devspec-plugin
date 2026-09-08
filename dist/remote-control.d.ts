@@ -15,6 +15,25 @@ export declare function logPoll(line: string): void;
  */
 export declare const STALL_TIMEOUT_MS: number;
 /**
+ * How often the pump re-posts the "OpenCode is still waiting for permission"
+ * advisory while a permission ask is unresolved. The first advisory is posted
+ * the moment `permission.asked` fires (`postPermissionWaitNotice`); this
+ * value controls the follow-up cadence so a long human wait does not look
+ * like a silent stall on the DevSpec side. Item 26050f07 — d1576e7f waited
+ * 9m 20s for a human approval, with no intermediate signal. Override via
+ * DEVSPEC_OPENCODE_PERMISSION_NOTICE_REPEAT_MS (milliseconds).
+ */
+export declare const PERMISSION_WAIT_NOTICE_REPEAT_MS: number;
+/**
+ * Maximum time an unresolved permission ask may keep `busy:true` before the
+ * plugin auto-clears it. Without this, an abandoned prompt strands the
+ * connection: every owner command gets queued-then-deferred with
+ * `reason: active_turn` forever (item 26050f07 — Lucky Quail d1576e7f).
+ * Matches Claude's `MAX_TURN_MS` backstop shape. Override via
+ * DEVSPEC_OPENCODE_PERMISSION_AUTO_CLEAR_MS (milliseconds).
+ */
+export declare const PERMISSION_WAIT_AUTO_CLEAR_MS: number;
+/**
  * Client ceiling for ordinary (non-long-poll) MCP calls on the pump path.
  * `fetch` has no default timeout — a hung keepalive / heartbeat / notice ahead
  * of the next `poll_connection` freezes `last_seen` while the connection still
@@ -198,6 +217,12 @@ interface ConnectionState {
     /** Prevent stale message parts from resurrecting a permission after its reply. */
     permissionResolutionObserved?: boolean;
     /**
+     * Epoch ms when the "still waiting for permission" advisory was last posted.
+     * Drives the repeat cadence in `checkPermissionWaitTimeout` so a long human
+     * wait gets periodic reminders, not a single stale notice. Item 26050f07.
+     */
+    permissionNoticeLastAt?: number | null;
+    /**
      * This turn is the plugin's OWN protocol (a DevSpec connect handshake), so
      * it produces no room post — item 68cc567c.
      *
@@ -275,6 +300,46 @@ interface ConnectionState {
  * each call site so the two mechanisms can never drift out of sync.
  */
 export declare function setBusy(directory: string, busy: boolean): Promise<void>;
+/**
+ * Teardown heartbeat sent when the OpenCode plugin instance is being disposed.
+ *
+ * Mirrors Claude's `offlineAndExit('owner_gone', 1)` (`devspec-remote-poll.mjs`
+ * around line 2021) for the in-process pump: the host is going away, so before
+ * tearing down we tell the server `busy:false` + `end_reason: 'owner_gone'`.
+ *
+ * Without this, a host that dies mid-turn (terminal close on a permission
+ * prompt, OS kill, OOM, accidental Ctrl+C, hard crash) leaves the connection
+ * with `busy:true` and no live agent. Every subsequent owner command gets
+ * queued-then-deferred with `reason: active_turn` forever — there is no UI
+ * surface to recover. Item 26050f07 — d1576e7f (Lucky Quail, 2026-09-07).
+ *
+ * Best-effort: if the heartbeat fails (server unreachable, host already
+ * tearing down) we still complete the dispose — the worst case is the OLD
+ * behaviour (stale busy on the server), which the server-side `busySince`
+ * auto-recovery backstop now covers.
+ */
+export declare function markOwnerGone(directory: string): Promise<void>;
+/**
+ * Bound an unresolved permission ask so it cannot strand the connection forever.
+ *
+ * Two thresholds, both driven by `permissionAskedAt`:
+ *
+ *   1. After ~2 minutes (PERMISSION_WAIT_NOTICE_REPEAT_MS), post a follow-up
+ *      advisory so the human side can see the wait is still in flight. The
+ *      first advisory fires immediately on `permission.asked`; this keeps the
+ *      cadence up.
+ *
+ *   2. After ~10 minutes (PERMISSION_WAIT_AUTO_CLEAR_MS), clear `busy:false`
+ *      and post an "I gave up on that prompt" advisory. Mirrors Claude's
+ *      MAX_TURN_MS backstop: the agent is not coming back, so the next owner
+ *      command must be deliverable. Item 26050f07 — Lucky Quail d1576e7f
+ *      (CLI exited on a permission prompt at 19:56:09; commands deferred with
+ *      `reason: active_turn` forever after).
+ *
+ * Called from inside `checkBusyStall`'s permission-pending early-return so it
+ * runs every poll tick without adding a second scheduled loop.
+ */
+export declare function checkPermissionWaitTimeout(directory: string): Promise<void>;
 export declare function assistantTextFromMessage(message: {
     parts?: unknown;
 } | null | undefined): string;
