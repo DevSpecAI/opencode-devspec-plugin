@@ -119,7 +119,7 @@ Use `patchState` for concurrent updates. Do not write a stale full snapshot over
 - **Permission wait:** keep active attempt and correlation until permission resolution or terminal session settlement.
 - **Presence starvation:** look for `pickup`, then a long poll gap, then `ended` with `idle_timeout`.
 - **Attachment change:** use server attachment truth and re-poll with null cursor plus `catch_up`; never consume a pre-adopt package as the new room's seed.
-- **Second bond starves first:** preserve the multi-bond registry and scope every state mutation with the firing OpenCode session id.
+- **Concurrent chats or processes:** every OpenCode chat and every OpenCode process holds its own bond keyed on its own OpenCode session id; nothing collides or starves another bond. Scope every state mutation with the firing OpenCode session id.
 
 ## Key Files
 

@@ -1902,7 +1902,10 @@ type Bond = {
  * single pin (Ivory Panda idle_timeout when Racing Dolphin attached,
  * 2026-08-07 — item 7a9b7b0f). Multi-bond gets simpler under this key, not
  * harder: two bonded sessions are two entries, not two candidate files
- * reconciled through one global.
+ * reconciled through one global. Multi-chat and multi-process are both supported:
+ * each OpenCode chat or process carries its own OpenCode session id, gets its own
+ * bond, and posts back into its own DevSpec session — there is no client-side
+ * ownership gate.
  */
 const openCodeBonds = new Map<string, Bond>()
 
@@ -2243,24 +2246,19 @@ function recordConnectionEventInBond(
   const connectionId = connectionIdHint ?? prior?.connectionId
   if (!connectionId) return
 
-  // An attach tool may be called from an unrelated OpenCode chat while the
-  // referenced connection is already driven by its original chat. Observing
-  // that result must not create a second local pump for the same server row:
-  // the two state files would race busy:true/busy:false and route commands into
-  // different terminal histories. The existing owner learns server-authoritative
-  // room changes from its next poll; this chat remains unbonded.
+  // Attach-path: the server is authoritative on which chat owns a connection.
+  // Any number of OpenCode chats or processes may run side by side; each
+  // registers its own bond via a unique OpenCode-session-derived local_id, so
+  // an attach here is always for THIS session's own row. We log the case so
+  // two distinct sessions seeing the same connection_id stays diagnosable, but
+  // we no longer gate on it — Claude Code has no client-side ownership check,
+  // and the server returns its own error if a real conflict ever surfaces.
   const connectionOwner = bondedSessionForConnection(connectionId)
   if (connectionOwner && connectionOwner !== opencodeSessionId) {
-    if (prior?.connectionId === connectionId) {
-      clearState()
-      forgetOpenCodeBond(opencodeSessionId)
-      clearConnectionCapability(opencodeSessionId)
-    }
     logPoll(
-      `attach observation ignored for opencodeSession=${opencodeSessionId}: ` +
-        `connection ${connectionId} is already owned by ${connectionOwner}`,
+      `attach observation: opencodeSession=${opencodeSessionId} sharing connection ` +
+        `${connectionId} with ${connectionOwner} — both bonds retained (multi-chat is supported).`,
     )
-    return
   }
 
   if (!prior) {
