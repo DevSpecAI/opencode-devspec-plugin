@@ -142,4 +142,38 @@ describe('recoverBondsFromStateFiles (item dd722e4c)', () => {
     assert.deepEqual(recovered, [TEST_BOND_A])
     assert.equal(isBondedOpenCodeSession(TEST_BOND_A), true)
   })
+
+  it('skips a state file whose content.opencodeSessionId hash does not match its filename', () => {
+    // Mirror the bug from 7a9b7b0f / 42831f3e: writeState wrote the file at
+    // hash(newId) but content.opencodeSessionId still carried oldId. After
+    // dd722e4c added the field and d2cc1cf made the wipe explicit, recovery
+    // demands filename↔content hash agreement.
+    const dir = path.join(os.homedir(), '.devspec', 'opencode-remote-control')
+    const filenameHash = 'bFUL54BDOnsh0QD2cOa9_A5cRFQI6CoA'
+    const filePath = path.join(dir, `${filenameHash}.json`)
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({
+        connectionId: 'conn-mismatched',
+        sessionId: 'sess-mismatched',
+        codename: 'Mismatched Osprey',
+        opencodeSessionId: 'ses_old_wipe_donor',
+        // No `lastDeliveredMessageId` so the sweep would also touch this if
+        // mtime were old enough — but mtime is fresh here, so only recovery
+        // rules apply, and the hash mismatch is the actual skip reason.
+      }),
+    )
+    try {
+      resetBondsForTests()
+      const recovered = recoverBondsFromStateFiles()
+      assert.equal(
+        recovered.includes(filenameHash),
+        false,
+        'mismatched file must not produce a recovered bond',
+      )
+      assert.equal(isBondedOpenCodeSession('ses_old_wipe_donor'), false)
+    } finally {
+      try { fs.unlinkSync(filePath) } catch { /* ignore */ }
+    }
+  })
 })

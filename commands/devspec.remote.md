@@ -53,9 +53,11 @@ The plugin does the rest in-process: polling, delivery, identity, and answer rou
 
 ## Answering
 
-For every substantive turn in an attached conversation, call `post_session_message` exactly once before the final OpenCode response, passing only the complete answer body as `message`. The plugin overwrites identity, routing, lifecycle, and command correlation. There is no mirror fallback.
+**The plugin owns answer egress.** Do NOT call `post_session_message` directly — the plugin mechanically rejects model-owned posts (item 4c639620) and the plugin's own mirror writes your final assistant message to DevSpec at turn settle. Writing `post_session_message` yourself either fails outright or double-posts; either way the user sees something other than your answer.
 
-The connect/status handshake itself must not call `post_session_message`; its confirmation stays in this terminal.
+For every substantive turn in an attached conversation, end your OpenCode response with the complete answer as plain text. The plugin posts it once at turn settle — no mirror fallback needed from your side.
+
+The connect/status handshake itself must not produce a DevSpec-postable answer; its confirmation stays in this terminal.
 
 - **If real work will happen before the answer**, write one short sentence first ("got it, I'll look at X") — it lands as the live trail while you work. If the answer is ready now, skip that: a trail and answer arriving together are just a slower answer.
 - **Sessionless:** there is no conversational answer path. Separately accepted owner-scoped automation runs report through `record_automation_run`; never invent a room.

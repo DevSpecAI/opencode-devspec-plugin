@@ -8,7 +8,7 @@
 
 1. **Presence is the bond.** A successful `poll_connection` updates `last_seen`; `report_keepalive` alone does not. Anything that blocks polling for roughly 90 seconds can end a healthy connection with `idle_timeout`.
 2. **One OpenCode conversation equals one bond.** State is keyed by the OpenCode session id. Several conversations in one process may each attach to different DevSpec rooms.
-3. **The agent owns answer content.** A bonded model calls `post_session_message` exactly once with the complete answer. The plugin never reads terminal assistant text to author, recover, or duplicate that answer.
+3. **The plugin owns answer egress.** Bonded models write their answer as the terminal assistant text of the OpenCode turn; the plugin mirrors it to DevSpec at turn settle via `post_session_message`. Models must NOT call `post_session_message` themselves — that path is mechanically rejected (item 4c639620). The plugin never inspects text to author, recover, or duplicate that answer. The slash command's `Answering` section reflects this.
 4. **The plugin owns routing and lifecycle.** It overwrites model-supplied identity, target, phase, completion, model stamp, and command correlation with facts from the firing bond.
 5. **Unbonded sessions fail closed.** A child, sibling, or unrelated OpenCode conversation cannot post through another conversation's DevSpec attachment.
 6. **Remote prompts are serialized.** A second `promptAsync` command waits until the current answer settles so its exact command ids cannot replace the first turn's correlation. A pending OpenCode question is the exception because the next owner command goes to `question.reply`, not a new prompt.
@@ -28,23 +28,22 @@ OpenCode process
           validate canonical ingress
           serialize prompt acceptance
           setBusy(true)
-          fire-and-forget deliverInjectedTurn
-            timed session.messages baseline
-            session.promptAsync
-            commit accepted ids and cursors
+           fire-and-forget deliverInjectedTurn
+             timed session.messages baseline
+             session.promptAsync
+             commit accepted ids and cursors
 
-  model-owned answer
-    post_session_message({ message })
-      tool.execute.before
-        require firing session bond
-        reserve one answer post for this OpenCode turn
-        resolve current connection and model
-        overwrite routing and lifecycle fields
-        bind exact remote command ids, or mark a local turn unbound
-      DevSpec MCP call
-      tool.execute.after
-        require returned message_id
-        settle local busy, trail, permission, and correlation state
+  plugin-owned answer egress (settleAnswerEgress)
+    pick final assistant message from session.messages
+    tool.execute.before (model-owned post_session_message rejected here)
+      reserve one answer post for this OpenCode turn
+      resolve current connection and model
+      overwrite routing and lifecycle fields
+      bind exact remote command ids, or mark a local turn unbound
+    DevSpec MCP call
+    tool.execute.after
+      require returned message_id
+      settle local busy, trail, permission, and correlation state
 ```
 
 There is no detached inbox process, wait process, Stop-hook answer post, assistant-text fallback, or second full-answer writer.
@@ -54,11 +53,21 @@ There is no detached inbox process, wait process, Stop-hook answer post, assista
 1. DevSpec supplies a canonical exact-target command through `poll_connection`.
 2. The plugin validates authority and scope against the negotiated remote-ingress contract.
 3. The plugin records the canonical turn id and final ordered command message id before scheduling `promptAsync`.
-4. The injected prompt tells OpenCode to act on the command and call `post_session_message` once before its final terminal response.
-5. The tool before-hook replaces any supplied routing with the bond's current `connection_id`, `agent_name: "OpenCode"`, `turn_kind: "agent"`, `phase: "answer"`, and `complete_turn: true`.
+4. The injected prompt tells OpenCode to act on the command and write its answer as the terminal assistant text of the turn.
+5. At turn settle, the plugin mirrors the final assistant text to DevSpec via `post_session_message` from `tool.execute.before`. The hook injects `connection_id`, `agent_name: "OpenCode"`, `turn_kind: "agent"`, `phase: "answer"`, and `complete_turn: true`. Models calling `post_session_message` themselves are rejected (4c639620) so the plugin is the only author.
 6. Remote answers receive `command_turn_id` and `command_message_id`. Local terminal answers in the same bonded conversation receive `command_turn_unbound: true`.
 7. Only a successful result carrying `message_id` settles the turn. Failed or malformed results leave it retryable.
 8. `session.idle` never reads assistant text. If a remote turn omitted the required post, it attempts one bounded mechanical error against the exact command. Failed error settlement preserves the command and correlation; confirmed settlement unclaims the command for retry.
+
+## Multi-Session Behavior
+
+- Multiple OpenCode chats in one process each get their own `(owner, local_id)` connection and bond — `register_connection` returns a fresh connection_id per chat. `attach_connection` reuses the connection; a wipe moves the bond to a fresh chat and the slash command's stale attach is suppressed.
+- Plugin module reloads (e.g., OpenCode hot reload) wipe the in-memory `openCodeBonds` Map. `recoverBondsFromStateFiles` restores bonds from `~/.devspec/opencode-remote-control/` on next pump start.
+- Each state file is keyed by `bondLocalId(opencodeSessionId)`. Its content's `opencodeSessionId` MUST equal that id, or recovery skips it. `writeState` defensively backfills `opencodeSessionId` from the current bond if a caller forgot to pass it.
+
+## Recovery
+
+`recoverBondsFromStateFiles` emits a per-file decision line (skipped_invalid_json, skipped_missing_opencodeSessionId, skipped_missing_connectionId, skipped_filename_hash_mismatch, skipped_read_error, recovered) and a summary line with totals. After recovery, files with `connectionId` set, `opencodeSessionId` missing or mismatched, no in-flight `currentCommandMessageId`, and mtime older than 60s are deleted (sweep). An active bond is never deleted mid-flight.
 
 ## Presence And Timing
 

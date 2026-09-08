@@ -1919,6 +1919,24 @@ type Bond = {
 const openCodeBonds = new Map<string, Bond>()
 
 /**
+ * Connections whose bond was just moved to a fresh OpenCode session by
+ * `wipeOpenCodeContextInPlace`. The slash command's `attach_connection` tool
+ * call lands here next, originating from the slash command's chat (the chat
+ * the user is no longer in). The attach handler consults this map and
+ * refuses to `rememberOpenCodeBond` the slash command's chat — instead it
+ * leaves the bond on the wipe target, which is where the user actually is.
+ *
+ * Cleared on the first attach that consumes the marker (success or failure).
+ * Multi-chat bonds (different connections, different opencodeSessionIds)
+ * never appear here, so the legacy "both bonds retained" behaviour is
+ * untouched.
+ */
+const pendingStaleAttachByConnection = new Map<
+  string,
+  { wipeTargetOpenCodeSessionId: string; slashCommandOpenCodeSessionId: string }
+>()
+
+/**
  * The OpenCode session whose bond the current async context is operating on.
  *
  * This is now the ONLY carrier of bond identity — there is no process-global
@@ -2080,43 +2098,135 @@ export function recoverBondsFromStateFiles(directory?: string): string[] {
   try {
     entries = fs.readdirSync(dir)
   } catch {
+    logPoll('recoverBondsFromStateFiles: directory missing — activeBonds will be 0')
     return []
   }
   const recovered: string[] = []
+  let scanned = 0
+  let skippedInvalidJson = 0
+  let skippedNoOpencodeSessionId = 0
+  let skippedNoConnectionId = 0
+  let skippedMismatchedHash = 0
+  let skippedReadError = 0
   for (const entry of entries) {
     if (!entry.endsWith('.json')) continue
+    scanned++
     const filePath = path.join(dir, entry)
+    const filenameHash = entry.slice(0, -'.json'.length)
     let raw: string
     try {
       raw = fs.readFileSync(filePath, 'utf8')
     } catch {
+      skippedReadError++
+      logPoll(`recovery: file=${entry} reason=read_error → skipped`)
       continue
     }
     let state: Partial<ConnectionState> | null
     try {
       state = JSON.parse(raw) as Partial<ConnectionState>
     } catch {
-      logPoll(`recoverBondsFromStateFiles: skipping ${filePath} (invalid JSON)`)
+      skippedInvalidJson++
+      logPoll(`recovery: file=${entry} reason=invalid_json → skipped`)
       continue
     }
     if (!state || typeof state.opencodeSessionId !== 'string' || state.opencodeSessionId === '') {
-      // Older state files from before dd722e4c don't carry the OpenCode session
-      // id, so they cannot be recovered this way. They will be overwritten on
-      // the next register/attach from the same OpenCode process if it's still
-      // alive; otherwise they expire server-side via the freshness window.
+      skippedNoOpencodeSessionId++
+      logPoll(
+        `recovery: file=${entry} connectionId=${state?.connectionId ?? '(none)'} ` +
+          `opencodeSessionId=(missing) → skipped_reason=missing_opencodeSessionId`,
+      )
       continue
     }
-    if (!state.connectionId) continue
+    if (!state.connectionId) {
+      skippedNoConnectionId++
+      logPoll(
+        `recovery: file=${entry} opencodeSessionId=${state.opencodeSessionId} ` +
+          `connectionId=(missing) → skipped_reason=missing_connectionId`,
+      )
+      continue
+    }
+    const expectedHash = crypto.createHash('sha256').update(state.opencodeSessionId).digest('base64url').slice(0, 32)
+    if (expectedHash !== filenameHash) {
+      skippedMismatchedHash++
+      logPoll(
+        `recovery: file=${entry} opencodeSessionId=${state.opencodeSessionId} ` +
+          `filenameHash=${filenameHash} contentHash=${expectedHash} → skipped_reason=filename_hash_mismatch`,
+      )
+      continue
+    }
     const sessionId = typeof state.sessionId === 'string' ? state.sessionId : null
     rememberOpenCodeBond(state.opencodeSessionId, sessionId)
     recovered.push(state.opencodeSessionId)
-  }
-  if (recovered.length > 0) {
     logPoll(
-      `recoverBondsFromStateFiles: restored ${recovered.length} bond(s) from ${dir} ` +
-        `(${recovered.join(', ')})`,
+      `recovery: file=${entry} opencodeSessionId=${state.opencodeSessionId} ` +
+        `connectionId=${state.connectionId} → recovered`,
     )
   }
+
+  // Phase 6 sweep: delete files that look abandoned — connectionId set but
+  // opencodeSessionId missing/mismatched (writer-integrity bug survivors),
+  // no in-flight command, and old enough that a concurrent write can't be
+  // racing us. The 60s window is wider than any plausible per-turn write,
+  // so an active bond is never deleted mid-flight.
+  let swept = 0
+  if (recovered.length > 0 || skippedReadError + skippedInvalidJson === 0) {
+    const now = Date.now()
+    const MIN_AGE_MS = 60_000
+    for (const entry of entries) {
+      if (!entry.endsWith('.json')) continue
+      const filePath = path.join(dir, entry)
+      let stat
+      try {
+        stat = fs.statSync(filePath)
+      } catch {
+        continue
+      }
+      if (now - stat.mtimeMs < MIN_AGE_MS) continue
+      let raw: string
+      try {
+        raw = fs.readFileSync(filePath, 'utf8')
+      } catch {
+        continue
+      }
+      let s: Partial<ConnectionState> | null
+      try {
+        s = JSON.parse(raw) as Partial<ConnectionState>
+      } catch {
+        continue
+      }
+      if (!s || typeof s.connectionId !== 'string' || !s.connectionId) continue
+      const opencodeSessionId = s.opencodeSessionId
+      if (typeof opencodeSessionId === 'string' && opencodeSessionId !== '') {
+        const expectedHash = crypto
+          .createHash('sha256')
+          .update(opencodeSessionId)
+          .digest('base64url')
+          .slice(0, 32)
+        if (expectedHash === entry.slice(0, -'.json'.length)) continue
+      }
+      if (typeof s.currentCommandMessageId === 'string' && s.currentCommandMessageId) continue
+      try {
+        fs.unlinkSync(filePath)
+        swept++
+        logPoll(
+          `recovery: swept stale file=${entry} connectionId=${s.connectionId} ` +
+            `opencodeSessionId=${s.opencodeSessionId ?? '(missing)'} (mtime ${Math.round((now - stat.mtimeMs) / 1000)}s ago)`,
+        )
+      } catch (err) {
+        logPoll(`recovery: failed to sweep ${entry}: ${err}`)
+      }
+    }
+  }
+
+  logPoll(
+    `recovery: scanned=${scanned} recovered=${recovered.length} ` +
+      `skipped_invalid_json=${skippedInvalidJson} ` +
+      `skipped_missing_opencodeSessionId=${skippedNoOpencodeSessionId} ` +
+      `skipped_missing_connectionId=${skippedNoConnectionId} ` +
+      `skipped_filename_hash_mismatch=${skippedMismatchedHash} ` +
+      `skipped_read_error=${skippedReadError} ` +
+      `swept=${swept}`,
+  )
   return recovered
 }
 
@@ -2148,6 +2258,18 @@ export function writeState(state: ConnectionState): void {
     // exists to stop.
     logPoll('writeState called with no bond in scope — refused')
     return
+  }
+  // Defensive backfill: every state file lives at hash(opencodeSessionId). If a
+  // caller hands us a state object missing the field, recoverBondsFromStateFiles
+  // will skip the file (recovery now requires filename↔content hash agreement
+  // — see 7a9b7b0f stack). Set it from the bond we're writing under and log,
+  // so a future audit can grep `writeState: opencodeSessionId backfilled` and
+  // find the writer that needs cleanup.
+  if (typeof state.opencodeSessionId !== 'string' || state.opencodeSessionId === '') {
+    logPoll(
+      `writeState: opencodeSessionId backfilled from current bond for file=${stateFileForBond(bond)} — caller did not pass it`,
+    )
+    state.opencodeSessionId = bond
   }
   fs.writeFileSync(stateFileForBond(bond), JSON.stringify(state, null, 2), { mode: 0o600 })
 }
@@ -2357,7 +2479,28 @@ function recordConnectionEventInBond(
         : Date.now(),
     })
   }
+  // The slash command's `attach_connection` tool call lands here with
+  // `opencodeSessionId` set to the slash command's chat — the chat the user
+  // is no longer in, because `wipeOpenCodeContextInPlace` already moved the
+  // bond to the wipe target and navigated the TUI. If we honour the legacy
+  // unconditional rememberOpenCodeBond on this stale origin session, the
+  // model that processes the user's commands ends up on the chat the user
+  // walked away from. Skip the remember and leave the bond on the wipe
+  // target; consume the marker so subsequent real attaches don't trip the
+  // same gate.
+  const staleMarker = pendingStaleAttachByConnection.get(connectionId)
+  if (staleMarker && opencodeSessionId === staleMarker.slashCommandOpenCodeSessionId) {
+    logPoll(
+      `attach: refusing to re-bond stale origin opencodeSession=${opencodeSessionId} ` +
+        `after wipe moved bond to ${staleMarker.wipeTargetOpenCodeSessionId}`,
+    )
+    pendingStaleAttachByConnection.delete(connectionId)
+    return
+  }
   if (opencodeSessionId) rememberOpenCodeBond(opencodeSessionId, sessionId)
+  // Once a legitimate attach lands (or the marker times out via a future
+  // wipe), the marker is no longer relevant — leave it for now, a subsequent
+  // wipe will overwrite it.
 }
 
 /**
@@ -4107,6 +4250,17 @@ export async function wipeOpenCodeContextInPlace(input: {
   forgetOpenCodeBond(opencodeSessionId)
   rememberOpenCodeBond(newId, preservedDevspecSessionId)
   moveConnectionCapability(opencodeSessionId, newId)
+  // The slash command's attach tool call will land here next, originating from
+  // `opencodeSessionId` (the old chat). Without this marker, the attach handler
+  // would re-add the bond on the old chat — the one the user is no longer
+  // looking at — and the agent would silently go deaf. The attach handler
+  // reads this map and refuses to put the bond back on the stale origin.
+  if (before?.connectionId) {
+    pendingStaleAttachByConnection.set(before.connectionId, {
+      wipeTargetOpenCodeSessionId: newId,
+      slashCommandOpenCodeSessionId: opencodeSessionId,
+    })
+  }
 
   runWithBond(newId, () => {
     if (carried) {
