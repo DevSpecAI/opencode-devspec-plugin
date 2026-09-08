@@ -142,9 +142,8 @@ function permissionRequestId(props: Record<string, unknown> | undefined): string
  * MULTI-BOND (item 7a9b7b0f): one OpenCode process may host several chat sessions,
  * each `/devspec.remote`-bonded to a different DevSpec room. The pump iterates
  * every active OpenCode session in `listOpenCodeBondSessions()` — a second attach
- * ADDS a bond; it must never overwrite a single pin (that idle_timeouted Ivory
- * Panda when Racing Dolphin joined, 2026-08-07). Ending one bond removes only
- * that entry; the pump keeps running for the others.
+ * ADDS a bond; each chat keeps its own row and posts back into its own session.
+ * Ending one bond removes only that entry; the pump keeps running for the others.
  *
  * Still no separate poller process or inbox file, unlike Claude Code's design — see
  * remote-control.ts for why.
