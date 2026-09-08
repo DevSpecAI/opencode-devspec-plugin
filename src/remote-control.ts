@@ -272,6 +272,15 @@ interface ConnectionState {
   sessionId: string | null
   codename: string | null
   /**
+   * The OpenCode chat session id this state file belongs to. Required for the
+   * pump to recover its bond after a plugin-module reload (item dd722e4c) —
+   * the on-disk state file is keyed by `bondLocalId(opencodeSessionId)` which
+   * we cannot reverse, so without persisting the source id alongside the file
+   * a fresh module instance cannot reconnect its bonds. Written once on
+   * register/attach and never mutated.
+   */
+  opencodeSessionId: string
+  /**
    * Last assistant present before an injected owner command. Work-trail and
    * stall checks scope session history after this baseline; answer delivery
    * never reads assistant text.
@@ -2051,6 +2060,67 @@ export function resetBondsForTests(): void {
 }
 
 /**
+ * Re-attach every live connection recorded on disk into the in-memory
+ * `openCodeBonds` map. The on-disk state files are keyed by
+ * `bondLocalId(opencodeSessionId)` which we cannot reverse, so the fix for
+ * item dd722e4c is to ALSO persist the OpenCode session id inside the state
+ * file (`opencodeSessionId` on `ConnectionState`). With that, this scanner
+ * recovers the in-memory map after a plugin-module reload — otherwise the pump
+ * sees `activeBonds=0`, idles forever, never heartbeats, and the server marks
+ * the connection offline.
+ *
+ * Returns the list of `opencodeSessionId`s recovered. Defensive: a no-op when
+ * the directory is missing or contains no readable state files. Errors on
+ * individual files are logged and skipped so one corrupt file cannot brick
+ * recovery for the rest.
+ */
+export function recoverBondsFromStateFiles(directory?: string): string[] {
+  const dir = directory ?? path.join(os.homedir(), '.devspec', 'opencode-remote-control')
+  let entries: string[]
+  try {
+    entries = fs.readdirSync(dir)
+  } catch {
+    return []
+  }
+  const recovered: string[] = []
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue
+    const filePath = path.join(dir, entry)
+    let raw: string
+    try {
+      raw = fs.readFileSync(filePath, 'utf8')
+    } catch {
+      continue
+    }
+    let state: Partial<ConnectionState> | null
+    try {
+      state = JSON.parse(raw) as Partial<ConnectionState>
+    } catch {
+      logPoll(`recoverBondsFromStateFiles: skipping ${filePath} (invalid JSON)`)
+      continue
+    }
+    if (!state || typeof state.opencodeSessionId !== 'string' || state.opencodeSessionId === '') {
+      // Older state files from before dd722e4c don't carry the OpenCode session
+      // id, so they cannot be recovered this way. They will be overwritten on
+      // the next register/attach from the same OpenCode process if it's still
+      // alive; otherwise they expire server-side via the freshness window.
+      continue
+    }
+    if (!state.connectionId) continue
+    const sessionId = typeof state.sessionId === 'string' ? state.sessionId : null
+    rememberOpenCodeBond(state.opencodeSessionId, sessionId)
+    recovered.push(state.opencodeSessionId)
+  }
+  if (recovered.length > 0) {
+    logPoll(
+      `recoverBondsFromStateFiles: restored ${recovered.length} bond(s) from ${dir} ` +
+        `(${recovered.join(', ')})`,
+    )
+  }
+  return recovered
+}
+
+/**
  * The current bond's state, or null when there is no bond in scope.
  *
  * Reading outside `runWithBond` returns null rather than guessing. That is the
@@ -2185,6 +2255,7 @@ function recordConnectionEventInBond(
   const argsObj = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
 
   if (isRegister) {
+    if (!opencodeSessionId) return
     // This lands in THIS OpenCode session's own file, both now and after a
     // later attach: the key is the session id and it never changes, so there is
     // no second location for a snapshot to migrate into.
@@ -2205,15 +2276,19 @@ function recordConnectionEventInBond(
         connectionId,
         sessionId: null,
         codename: typeof result?.codename === 'string' ? result.codename : null,
+        opencodeSessionId: opencodeSessionId,
         connectHandshakePending: true,
         connectHandshakeStartedAt: Date.now(),
       })
     }
+    // Persist the OpenCode session id inside the state file itself. The on-disk
+    // file is keyed by `bondLocalId(opencodeSessionId)` which we cannot reverse,
+    // so without this the pump cannot reconnect its bonds after a plugin-module
+    // reload (item dd722e4c). Cheap because it's set once on register.
+    patchState({ opencodeSessionId: opencodeSessionId })
     // Sessionless bond. The key does not change when this session later
     // attaches — only the recorded devspecSessionId does.
-    if (opencodeSessionId) {
-      rememberOpenCodeBond(opencodeSessionId, devspecSessionForBond(opencodeSessionId) ?? null)
-    }
+    rememberOpenCodeBond(opencodeSessionId, devspecSessionForBond(opencodeSessionId) ?? null)
     return
   }
 
@@ -2266,6 +2341,7 @@ function recordConnectionEventInBond(
       connectionId,
       sessionId,
       codename: null,
+      opencodeSessionId: opencodeSessionId,
       connectHandshakePending: true,
       connectHandshakeStartedAt: Date.now(),
     })
@@ -2357,11 +2433,13 @@ export async function ensureConnection(
           ...existing,
           connectionId,
           codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
+          opencodeSessionId: existing.opencodeSessionId ?? opencodeSessionId,
         }
       : {
           connectionId,
           sessionId: null,
           codename: result?.codename ?? null,
+          opencodeSessionId: opencodeSessionId,
         }
     writeState(state)
     rememberOpenCodeBond(opencodeSessionId, state.sessionId ?? null)
