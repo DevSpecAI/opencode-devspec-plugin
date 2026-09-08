@@ -4112,6 +4112,15 @@ export async function wipeOpenCodeContextInPlace(input: {
     if (carried) {
       writeState({
         ...carried,
+        // The file is keyed on `bondLocalId(newId)`, so its `opencodeSessionId`
+        // must equal `newId` for `recoverBondsFromStateFiles` to put the bond
+        // back on the right key after a plugin-module reload. `...carried`
+        // carries the old id from the donor session, which leaves the file
+        // content and its filename in disagreement and survives across reloads
+        // as a stale row keyed at `bondLocalId(oldId)` — observed live in
+        // `~/.devspec/opencode-remote-control/` (item 7a9b7b0f, filed
+        // 42831f3e).
+        opencodeSessionId: newId,
         sessionId: preservedDevspecSessionId ?? carried.sessionId ?? null,
         // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery
         // cursors (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room
