@@ -53,9 +53,7 @@ The plugin does the rest in-process: polling, delivery, identity, and answer rou
 
 ## Answering
 
-**The plugin owns answer egress.** Do NOT call `post_session_message` directly — the plugin mechanically rejects model-owned posts (item 4c639620) and the plugin's own mirror writes your final assistant message to DevSpec at turn settle. Writing `post_session_message` yourself either fails outright or double-posts; either way the user sees something other than your answer.
-
-For every substantive turn in an attached conversation, end your OpenCode response with the complete answer as plain text. The plugin posts it once at turn settle — no mirror fallback needed from your side.
+**The model owns the answer post.** In a bonded OpenCode turn, call `post_session_message` exactly once before your final response and pass the complete answer body as `message`. The plugin binds `connection_id`, `agent_name`, `turn_kind`, `phase: "answer"`, `complete_turn`, and the exact remote command correlation from the active bond — you do not pass any of them. A second post in the same turn is rejected; a post from an unbonded OpenCode session is rejected. There is no assistant-text mirror fallback (since 0.8.0 — older copies of this file still say the opposite; they are superseded).
 
 The connect/status handshake itself must not produce a DevSpec-postable answer; its confirmation stays in this terminal.
 
