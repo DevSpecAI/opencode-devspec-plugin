@@ -4825,13 +4825,17 @@ export function scheduleWorkTrailPost(
   sessionId: string,
 ): void {
   const key = trailGuardKey(sessionId)
-  void postWorkTrail(client, directory, sessionId)
+  void postWorkTrail(client, directory, sessionId).catch((err) => {
+    logPoll(`postWorkTrail (schedule) unhandled: ${err}`)
+  })
   // Whatever arrives during the gap still reaches the room: schedule one trailing
   // publish so the last update before a quiet stretch is never the one dropped.
   if (trailTrailingTimers.has(key)) return
   const timer = setTimeout(() => {
     trailTrailingTimers.delete(key)
-    void postWorkTrail(client, directory, sessionId)
+    void postWorkTrail(client, directory, sessionId).catch((err) => {
+      logPoll(`postWorkTrail (trailing) unhandled: ${err}`)
+    })
   }, TRAIL_POST_MIN_GAP_MS)
   if (typeof timer === 'object' && timer && 'unref' in timer) {
     ;(timer as NodeJS.Timeout).unref()
@@ -4857,9 +4861,21 @@ export async function postWorkTrail(
   const run = async () => {
     const auth = resolveDevspecAuth(directory)
     const state = readState()
-    if (!auth.ok || !auth.token || !auth.mcp_url) return
-    if (!state?.sessionId || !state.connectionId) return
-    if (!state.busy && !state.awaitingRemoteReply) return
+    if (!auth.ok || !auth.token || !auth.mcp_url) {
+      logPoll(`postWorkTrail: no auth (${auth.error ?? 'token/url missing'})`)
+      return
+    }
+    if (!state?.sessionId || !state.connectionId) {
+      logPoll(
+        `postWorkTrail: no session/connection ` +
+          `(sessionId=${state?.sessionId ?? 'none'} connectionId=${state?.connectionId ?? 'none'})`,
+      )
+      return
+    }
+    if (!state.busy && !state.awaitingRemoteReply) {
+      logPoll(`postWorkTrail: not busy/awaiting (busy=${state.busy} awaiting=${state.awaitingRemoteReply})`)
+      return
+    }
 
     const key = trailGuardKey(sessionId)
     const guard = trailGuards.get(key) ?? { inFlight: false, pending: false }
@@ -4888,9 +4904,15 @@ export async function postWorkTrail(
 
     // The inject baseline scopes everything after the pre-inject assistant to
     // this remote turn's work. Without one, only the newest turn.
-    const rawTrail = serializeTurnTrail(messages, {
-      afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
-    })
+    let rawTrail: string
+    try {
+      rawTrail = serializeTurnTrail(messages, {
+        afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
+      })
+    } catch (err) {
+      logPoll(`postWorkTrail: serializeTurnTrail threw: ${err}`)
+      return
+    }
     // Turn-start seed (item 05a88ed5): only substitute the placeholder when
     // there is genuinely nothing to show yet. Real content always wins, so a
     // seed call racing behind a message.updated-triggered post never clobbers
@@ -4909,6 +4931,11 @@ export async function postWorkTrail(
         seed,
       })
     ) {
+      logPoll(
+        `postWorkTrail: shouldPostTrail=false ` +
+          `(empty=${!trail.trim()} hash_unchanged=${trailHash === (state.lastTrailHash ?? null)} ` +
+          `force=${force} seed=${seed})`,
+      )
       return
     }
 
@@ -4942,7 +4969,9 @@ export async function postWorkTrail(
       guard.pending = false
       trailGuards.set(key, guard)
       if (stillPending) {
-        void postWorkTrail(client, directory, sessionId)
+        void postWorkTrail(client, directory, sessionId).catch((err) => {
+          logPoll(`postWorkTrail (pending flush) unhandled: ${err}`)
+        })
       }
     }
   }
