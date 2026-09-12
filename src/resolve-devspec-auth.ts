@@ -39,7 +39,13 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const DEFAULT_PROD_URL = 'https://devspec.ai/api/mcp'
+/**
+ * DevSpec's machine-facing API host. The MCP endpoint lives on
+ * `api.devspec.ai` (staging: `api.devspecstaging.com`); the web app is on
+ * `app.devspec.ai` and the marketing site on `devspec.ai`. Only a default —
+ * `DEVSPEC_MCP_URL` and the opencode.json server `url` override it.
+ */
+const DEFAULT_PROD_URL = 'https://api.devspec.ai/api/mcp'
 
 /**
  * OpenCode reads its config as JSONC — `opencode.jsonc` is the documented

@@ -17,7 +17,7 @@ const ENV_KEYS = ['DEVSPEC_MCP_TOKEN', 'DEVSPEC_TOKEN', 'DEVSPEC_MCP_URL', 'HOME
 let savedEnv
 let tmp
 
-function configBlock(token, url = 'https://staging.devspec.ai/api/mcp') {
+function configBlock(token, url = 'https://api.devspecstaging.com/api/mcp') {
   return JSON.stringify({
     mcp: { devspec: { type: 'remote', url, headers: { Authorization: `Bearer ${token}` } } },
   })
@@ -114,7 +114,7 @@ describe('resolveDevspecAuth — JSONC syntax tolerance', () => {
         // line comment before the block
         "mcp": {
           "devspec": {
-            "url": "https://staging.devspec.ai/api/mcp", /* inline block comment */
+            "url": "https://api.devspecstaging.com/api/mcp", /* inline block comment */
             "headers": { "Authorization": "Bearer tok-jsonc-syntax", },
           },
         },
@@ -125,7 +125,7 @@ describe('resolveDevspecAuth — JSONC syntax tolerance', () => {
     assert.equal(auth.token, 'tok-jsonc-syntax')
     // The naive-regex trap: stripping `//` without string awareness would eat
     // the URL scheme's slashes. The URL must survive intact.
-    assert.equal(auth.mcp_url, 'https://staging.devspec.ai/api/mcp')
+    assert.equal(auth.mcp_url, 'https://api.devspecstaging.com/api/mcp')
   })
 })
 
