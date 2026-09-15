@@ -3056,6 +3056,41 @@ export interface PollOutcome {
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
  */
+const AUTOMATION_RUN_WAKE_KEYS = [
+  'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'trigger_kind', 'owner',
+  'permission', 'queued_at', 'delivery_connection_id', 'requester',
+] as const
+
+export function isAutomationRunWake(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const dispatch = value as Record<string, unknown>
+  const keys = Object.keys(dispatch)
+  if (keys.length !== AUTOMATION_RUN_WAKE_KEYS.length || AUTOMATION_RUN_WAKE_KEYS.some((key) => !Object.hasOwn(dispatch, key))) {
+    return false
+  }
+  const owner = dispatch.owner as Record<string, unknown> | null
+  const pressed = dispatch.trigger_kind === 'pressed'
+  const requester = dispatch.requester
+  const requesterOk = pressed
+    ? Boolean(
+        requester && typeof requester === 'object' && !Array.isArray(requester) &&
+        typeof (requester as { user_id?: unknown }).user_id === 'string',
+      )
+    : requester === null
+  if (!owner || typeof owner !== 'object' || Array.isArray(owner)) return false
+  return dispatch.kind === 'automation_run' &&
+    typeof dispatch.id === 'string' && dispatch.id.length > 0 &&
+    typeof dispatch.run_id === 'string' && dispatch.run_id.length > 0 &&
+    typeof dispatch.automation_id === 'string' && dispatch.automation_id.length > 0 &&
+    typeof dispatch.automation_name === 'string' && dispatch.automation_name.length > 0 &&
+    (dispatch.trigger_kind === 'scheduled' || dispatch.trigger_kind === 'event' || dispatch.trigger_kind === 'pressed') &&
+    typeof owner.user_id === 'string' && typeof owner.display_name === 'string' && owner.display_name.length > 0 &&
+    (dispatch.permission === 'look_only' || dispatch.permission === 'can_commit' || dispatch.permission === 'can_push') &&
+    typeof dispatch.queued_at === 'string' && dispatch.queued_at.length > 0 &&
+    typeof dispatch.delivery_connection_id === 'string' && dispatch.delivery_connection_id.length > 0 &&
+    requesterOk
+}
+
 function automationRunCommandText(d: Record<string, unknown>): string {
   const permission =
     d.permission === 'can_push'
@@ -3066,21 +3101,25 @@ function automationRunCommandText(d: Record<string, unknown>): string {
 
   const runId = d.run_id as string
   const name = typeof d.automation_name === 'string' ? d.automation_name : 'automation'
+  const started =
+    d.trigger_kind === 'pressed'
+      ? 'Someone pressed Run.'
+      : d.trigger_kind === 'scheduled'
+        ? 'This run started on a schedule.'
+        : 'This run started because of an event.'
+  const ownerName = (d.owner as { display_name?: string } | undefined)?.display_name || 'the owner'
 
   return [
     `▶️ Automation run dispatched to this connection: "${name}" (run ${runId}).`,
+    started,
+    `Owner: ${ownerName}`,
     '',
     'What to do:',
     `1. claim_automation_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
-    '2. Do the work described below, in this repo.',
+    '2. Follow the instruction returned by that claim, in this repo.',
     '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
     '',
     `Permission: ${permission}`,
-    '',
-    'The instruction:',
-    typeof d.instruction === 'string' && d.instruction.trim()
-      ? d.instruction
-      : '(claim the run to read it)',
   ].join('\n')
 }
 
@@ -3476,20 +3515,13 @@ export async function pollAndDeliver(
   const persistedAutomationDispatches = state.deferredAutomationDispatches ?? []
   const automationDispatchesById = new Map<string, any>()
   for (const dispatch of [...persistedAutomationDispatches, ...offeredDispatches]) {
-    if (
-      dispatch &&
-      dispatch.kind === 'automation_run' &&
-      typeof dispatch.id === 'string' &&
-      typeof dispatch.run_id === 'string' &&
-      dispatch.run_id.length > 0
-    ) {
-      automationDispatchesById.set(dispatch.id, dispatch)
+    if (isAutomationRunWake(dispatch)) {
+      automationDispatchesById.set(String(dispatch.id), dispatch)
     }
   }
   const freshDispatches = [...automationDispatchesById.values()].filter((dispatch) =>
-    dispatch && dispatch.kind === 'automation_run' && typeof dispatch.id === 'string' &&
-    !pump.deliveredAutomationDispatchIds.has(dispatch.id) &&
-    !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')),
+    isAutomationRunWake(dispatch) &&
+    !pump.deliveredAutomationDispatchIds.has(String(dispatch.id)),
   )
   const automationDispatchCursor = state.deferredAutomationDispatchCursor ??
     (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor ? res.dispatch_cursor : null)

@@ -41,6 +41,26 @@ const opencodeSessionId = `canonical-poll-${process.pid}-${Math.random()}`
 const planId = '12121212-1212-4212-8212-121212121212'
 const planStepId = '13131313-1313-4313-8313-131313131313'
 const connection = { connection_id: connectionId, agent_name: 'OpenCode', codename: 'Otter', label: 'OpenCode · Otter' }
+
+function automationWake(over = {}) {
+  const id = over.id ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'
+  return {
+    kind: 'automation_run',
+    automation_id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1',
+    automation_name: 'Review',
+    trigger_kind: 'pressed',
+    owner: { user_id: ownerId, display_name: 'Owner' },
+    permission: 'look_only',
+    queued_at: '2026-08-20T12:00:00.000Z',
+    delivery_connection_id: connectionId,
+    requester: { user_id: ownerId },
+    ...over,
+    id,
+    run_id: over.run_id ?? id,
+    kind: 'automation_run',
+  }
+}
+
 const point = (sequence, message_id) => ({ sequence, created_at: `2026-08-20T12:00:0${sequence}.000Z`, message_id })
 const command = (message_id, sequence, provenance, body, primary) => ({
   message_id,
@@ -605,7 +625,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
       const dispatchId = `play-fault-${index + 1}`
       const response = changed({
         dispatch_cursor: `dispatch-${stage}`,
-        dispatches: [{ id: dispatchId, kind: 'automation_run', run_id: `run-${index + 1}`, instruction: stage }],
+        dispatches: [automationWake({ id: dispatchId, run_id: `run-${index + 1}` })],
       })
       pollResults.push(response)
       let faulted = false
@@ -718,7 +738,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     malformed.schema_version = 99
     pollResults.push(changed({
       ingress: malformed,
-      dispatches: [{ id: 'play-malformed', kind: 'automation_run', run_id: 'run-malformed', instruction: 'Independent.' }],
+      dispatches: [automationWake({ id: 'play-malformed', run_id: 'run-malformed' })],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 1)
@@ -731,7 +751,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
 
   it('consumes a malformed automation dispatch without injecting or stranding lifecycle state', async () => {
     pollResults.push(changed({
-      dispatches: [{ id: 'play-without-run-id', kind: 'automation_run', instruction: 'Must remain inert.' }],
+      dispatches: [{ id: 'play-without-run-id', kind: 'automation_run' }],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 0)
@@ -745,7 +765,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     const cmd = command(message1, 1, provenance1, 'canonical fails', true)
     pollResults.push(changed({
       ingress: ingress([cmd]),
-      dispatches: [{ id: 'play-simultaneous', kind: 'automation_run', run_id: 'run-simultaneous', instruction: 'Automation succeeds.' }],
+      dispatches: [automationWake({ id: 'play-simultaneous', run_id: 'run-simultaneous' })],
     }))
     promptImpl = async (args) => args.body.parts[0].text.includes('claim_automation_run')
       ? { data: true }
@@ -784,7 +804,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     const cmd = command(message1, 1, provenance1, 'canonical succeeds', true)
     pollResults.push(changed({
       ingress: ingress([cmd]),
-      dispatches: [{ id: 'play-rejects', kind: 'automation_run', run_id: 'run-rejects', instruction: 'Rejected automation.' }],
+      dispatches: [automationWake({ id: 'play-rejects', run_id: 'run-rejects' })],
     }))
     promptImpl = async (args) => args.body.parts[0].text.includes('claim_automation_run')
       ? { error: { message: 'automation queue failed' } }
@@ -836,7 +856,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
 
     pollResults.push(changed({
       ingress: ingress([]),
-      dispatches: [{ id: 'play-after-command', kind: 'automation_run', run_id: 'run-after-command', instruction: 'Run later.' }],
+      dispatches: [automationWake({ id: 'play-after-command', run_id: 'run-after-command' })],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 1)
@@ -879,7 +899,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
   it('delivers only explicit automation_run dispatches through automation text and advances dispatch_cursor after acceptance', async () => {
     pollResults.push(changed({
       dispatches: [
-        { id: 'play-1', kind: 'automation_run', run_id: 'run-1', automation_name: 'Review', permission: 'look_only', instruction: 'Inspect only.' },
+        automationWake({ id: 'play-1', run_id: 'run-1' }),
         { id: 'assignment-1', kind: 'assignment', instruction: 'must remain inert' },
       ],
     }))
@@ -906,8 +926,8 @@ describe('pollAndDeliver canonical transaction integration', () => {
     forgetPumpState(connectionId)
     pollResults.push(changed({
       dispatches: [
-        { id: 'play-legacy', kind: 'automation_run', run_id: 'run-legacy', instruction: 'Must stay deduped.' },
-        { id: 'play-new', kind: 'automation_run', run_id: 'run-new', instruction: 'Run once.' },
+        automationWake({ id: 'play-legacy', run_id: 'run-legacy' }),
+        automationWake({ id: 'play-new', run_id: 'run-new' }),
         { id: 'assignment-shaped', kind: 'assignment', instruction: 'Must remain inert.' },
       ],
     }))
@@ -940,7 +960,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
     }))
     forgetPumpState(connectionId)
     pollResults.push(changed({
-      dispatches: [{ id: 'play-stale-legacy', kind: 'automation_run', run_id: 'run-stale', instruction: 'New field wins.' }],
+      dispatches: [automationWake({ id: 'play-stale-legacy', run_id: 'run-stale' })],
     }))
     await tick(); await settle()
     assert.equal(promptCalls.length, 2)

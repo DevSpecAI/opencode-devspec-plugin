@@ -1,5 +1,5 @@
 import { createOpencodeClient as createOpencodeV2Client } from '@opencode-ai/sdk/v2';
-import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markOwnerGone, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, resolveCurrentAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settleAutomationRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
+import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markOwnerGone, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recoverBondsFromStateFiles, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, resolveCurrentAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settleAutomationRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
 import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
 import { CommitProvenance } from './commit-provenance.js';
@@ -153,6 +153,13 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
         if (pumpRunning)
             return;
         pumpRunning = true;
+        // Plugin-module reload wipes the in-memory `openCodeBonds` Map. Re-attach
+        // every live connection recorded on disk before the first poll — otherwise
+        // the pump would idle on `activeBonds=0`, never send a heartbeat, and the
+        // server would mark the connection offline after the freshness window.
+        // The state files now persist `opencodeSessionId` (item dd722e4c) so this
+        // scanner can recover the bond keys. Cheap: a directory read.
+        recoverBondsFromStateFiles(directory);
         logPoll(`pump: starting (long-poll multi-bond mode) — stopped=${stopped} ` +
             `activeBonds=${listOpenCodeBondSessions().length}`);
         try {

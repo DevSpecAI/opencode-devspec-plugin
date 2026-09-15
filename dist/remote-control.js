@@ -1376,6 +1376,20 @@ export async function handleSessionError(directory, event) {
  */
 const openCodeBonds = new Map();
 /**
+ * Connections whose bond was just moved to a fresh OpenCode session by
+ * `wipeOpenCodeContextInPlace`. The slash command's `attach_connection` tool
+ * call lands here next, originating from the slash command's chat (the chat
+ * the user is no longer in). The attach handler consults this map and
+ * refuses to `rememberOpenCodeBond` the slash command's chat — instead it
+ * leaves the bond on the wipe target, which is where the user actually is.
+ *
+ * Cleared on the first attach that consumes the marker (success or failure).
+ * Multi-chat bonds (different connections, different opencodeSessionIds)
+ * never appear here, so the legacy "both bonds retained" behaviour is
+ * untouched.
+ */
+const pendingStaleAttachByConnection = new Map();
+/**
  * The OpenCode session whose bond the current async context is operating on.
  *
  * This is now the ONLY carrier of bond identity — there is no process-global
@@ -1497,6 +1511,157 @@ export function resetBondsForTests() {
     openCodeBonds.clear();
 }
 /**
+ * Re-attach every live connection recorded on disk into the in-memory
+ * `openCodeBonds` map. The on-disk state files are keyed by
+ * `bondLocalId(opencodeSessionId)` which we cannot reverse, so the fix for
+ * item dd722e4c is to ALSO persist the OpenCode session id inside the state
+ * file (`opencodeSessionId` on `ConnectionState`). With that, this scanner
+ * recovers the in-memory map after a plugin-module reload — otherwise the pump
+ * sees `activeBonds=0`, idles forever, never heartbeats, and the server marks
+ * the connection offline.
+ *
+ * Returns the list of `opencodeSessionId`s recovered. Defensive: a no-op when
+ * the directory is missing or contains no readable state files. Errors on
+ * individual files are logged and skipped so one corrupt file cannot brick
+ * recovery for the rest.
+ */
+export function recoverBondsFromStateFiles(directory) {
+    const dir = directory ?? path.join(os.homedir(), '.devspec', 'opencode-remote-control');
+    let entries;
+    try {
+        entries = fs.readdirSync(dir);
+    }
+    catch {
+        logPoll('recoverBondsFromStateFiles: directory missing — activeBonds will be 0');
+        return [];
+    }
+    const recovered = [];
+    let scanned = 0;
+    let skippedInvalidJson = 0;
+    let skippedNoOpencodeSessionId = 0;
+    let skippedNoConnectionId = 0;
+    let skippedMismatchedHash = 0;
+    let skippedReadError = 0;
+    for (const entry of entries) {
+        if (!entry.endsWith('.json'))
+            continue;
+        scanned++;
+        const filePath = path.join(dir, entry);
+        const filenameHash = entry.slice(0, -'.json'.length);
+        let raw;
+        try {
+            raw = fs.readFileSync(filePath, 'utf8');
+        }
+        catch {
+            skippedReadError++;
+            logPoll(`recovery: file=${entry} reason=read_error → skipped`);
+            continue;
+        }
+        let state;
+        try {
+            state = JSON.parse(raw);
+        }
+        catch {
+            skippedInvalidJson++;
+            logPoll(`recovery: file=${entry} reason=invalid_json → skipped`);
+            continue;
+        }
+        if (!state || typeof state.opencodeSessionId !== 'string' || state.opencodeSessionId === '') {
+            skippedNoOpencodeSessionId++;
+            logPoll(`recovery: file=${entry} connectionId=${state?.connectionId ?? '(none)'} ` +
+                `opencodeSessionId=(missing) → skipped_reason=missing_opencodeSessionId`);
+            continue;
+        }
+        if (!state.connectionId) {
+            skippedNoConnectionId++;
+            logPoll(`recovery: file=${entry} opencodeSessionId=${state.opencodeSessionId} ` +
+                `connectionId=(missing) → skipped_reason=missing_connectionId`);
+            continue;
+        }
+        const expectedHash = crypto.createHash('sha256').update(state.opencodeSessionId).digest('base64url').slice(0, 32);
+        if (expectedHash !== filenameHash) {
+            skippedMismatchedHash++;
+            logPoll(`recovery: file=${entry} opencodeSessionId=${state.opencodeSessionId} ` +
+                `filenameHash=${filenameHash} contentHash=${expectedHash} → skipped_reason=filename_hash_mismatch`);
+            continue;
+        }
+        const sessionId = typeof state.sessionId === 'string' ? state.sessionId : null;
+        rememberOpenCodeBond(state.opencodeSessionId, sessionId);
+        recovered.push(state.opencodeSessionId);
+        logPoll(`recovery: file=${entry} opencodeSessionId=${state.opencodeSessionId} ` +
+            `connectionId=${state.connectionId} → recovered`);
+    }
+    // Phase 6 sweep: delete files that look abandoned — connectionId set but
+    // opencodeSessionId missing/mismatched (writer-integrity bug survivors),
+    // no in-flight command, and old enough that a concurrent write can't be
+    // racing us. The 60s window is wider than any plausible per-turn write,
+    // so an active bond is never deleted mid-flight.
+    let swept = 0;
+    if (recovered.length > 0 || skippedReadError + skippedInvalidJson === 0) {
+        const now = Date.now();
+        const MIN_AGE_MS = 60_000;
+        for (const entry of entries) {
+            if (!entry.endsWith('.json'))
+                continue;
+            const filePath = path.join(dir, entry);
+            let stat;
+            try {
+                stat = fs.statSync(filePath);
+            }
+            catch {
+                continue;
+            }
+            if (now - stat.mtimeMs < MIN_AGE_MS)
+                continue;
+            let raw;
+            try {
+                raw = fs.readFileSync(filePath, 'utf8');
+            }
+            catch {
+                continue;
+            }
+            let s;
+            try {
+                s = JSON.parse(raw);
+            }
+            catch {
+                continue;
+            }
+            if (!s || typeof s.connectionId !== 'string' || !s.connectionId)
+                continue;
+            const opencodeSessionId = s.opencodeSessionId;
+            if (typeof opencodeSessionId === 'string' && opencodeSessionId !== '') {
+                const expectedHash = crypto
+                    .createHash('sha256')
+                    .update(opencodeSessionId)
+                    .digest('base64url')
+                    .slice(0, 32);
+                if (expectedHash === entry.slice(0, -'.json'.length))
+                    continue;
+            }
+            if (typeof s.currentCommandMessageId === 'string' && s.currentCommandMessageId)
+                continue;
+            try {
+                fs.unlinkSync(filePath);
+                swept++;
+                logPoll(`recovery: swept stale file=${entry} connectionId=${s.connectionId} ` +
+                    `opencodeSessionId=${s.opencodeSessionId ?? '(missing)'} (mtime ${Math.round((now - stat.mtimeMs) / 1000)}s ago)`);
+            }
+            catch (err) {
+                logPoll(`recovery: failed to sweep ${entry}: ${err}`);
+            }
+        }
+    }
+    logPoll(`recovery: scanned=${scanned} recovered=${recovered.length} ` +
+        `skipped_invalid_json=${skippedInvalidJson} ` +
+        `skipped_missing_opencodeSessionId=${skippedNoOpencodeSessionId} ` +
+        `skipped_missing_connectionId=${skippedNoConnectionId} ` +
+        `skipped_filename_hash_mismatch=${skippedMismatchedHash} ` +
+        `skipped_read_error=${skippedReadError} ` +
+        `swept=${swept}`);
+    return recovered;
+}
+/**
  * The current bond's state, or null when there is no bond in scope.
  *
  * Reading outside `runWithBond` returns null rather than guessing. That is the
@@ -1524,6 +1689,16 @@ export function writeState(state) {
         // exists to stop.
         logPoll('writeState called with no bond in scope — refused');
         return;
+    }
+    // Defensive backfill: every state file lives at hash(opencodeSessionId). If a
+    // caller hands us a state object missing the field, recoverBondsFromStateFiles
+    // will skip the file (recovery now requires filename↔content hash agreement
+    // — see 7a9b7b0f stack). Set it from the bond we're writing under and log,
+    // so a future audit can grep `writeState: opencodeSessionId backfilled` and
+    // find the writer that needs cleanup.
+    if (typeof state.opencodeSessionId !== 'string' || state.opencodeSessionId === '') {
+        logPoll(`writeState: opencodeSessionId backfilled from current bond for file=${stateFileForBond(bond)} — caller did not pass it`);
+        state.opencodeSessionId = bond;
     }
     fs.writeFileSync(stateFileForBond(bond), JSON.stringify(state, null, 2), { mode: 0o600 });
 }
@@ -1616,6 +1791,8 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
     }
     const argsObj = (args && typeof args === 'object' ? args : {});
     if (isRegister) {
+        if (!opencodeSessionId)
+            return;
         // This lands in THIS OpenCode session's own file, both now and after a
         // later attach: the key is the session id and it never changes, so there is
         // no second location for a snapshot to migrate into.
@@ -1638,15 +1815,19 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
                 connectionId,
                 sessionId: null,
                 codename: typeof result?.codename === 'string' ? result.codename : null,
+                opencodeSessionId: opencodeSessionId,
                 connectHandshakePending: true,
                 connectHandshakeStartedAt: Date.now(),
             });
         }
+        // Persist the OpenCode session id inside the state file itself. The on-disk
+        // file is keyed by `bondLocalId(opencodeSessionId)` which we cannot reverse,
+        // so without this the pump cannot reconnect its bonds after a plugin-module
+        // reload (item dd722e4c). Cheap because it's set once on register.
+        patchState({ opencodeSessionId: opencodeSessionId });
         // Sessionless bond. The key does not change when this session later
         // attaches — only the recorded devspecSessionId does.
-        if (opencodeSessionId) {
-            rememberOpenCodeBond(opencodeSessionId, devspecSessionForBond(opencodeSessionId) ?? null);
-        }
+        rememberOpenCodeBond(opencodeSessionId, devspecSessionForBond(opencodeSessionId) ?? null);
         return;
     }
     // Attach: connection_id/session_id may come back on the result, or only be
@@ -1692,6 +1873,7 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
             connectionId,
             sessionId,
             codename: null,
+            opencodeSessionId: opencodeSessionId,
             connectHandshakePending: true,
             connectHandshakeStartedAt: Date.now(),
         });
@@ -1708,8 +1890,27 @@ function recordConnectionEventInBond(isRegister, args, hookOutput, opencodeSessi
                 : Date.now(),
         });
     }
+    // The slash command's `attach_connection` tool call lands here with
+    // `opencodeSessionId` set to the slash command's chat — the chat the user
+    // is no longer in, because `wipeOpenCodeContextInPlace` already moved the
+    // bond to the wipe target and navigated the TUI. If we honour the legacy
+    // unconditional rememberOpenCodeBond on this stale origin session, the
+    // model that processes the user's commands ends up on the chat the user
+    // walked away from. Skip the remember and leave the bond on the wipe
+    // target; consume the marker so subsequent real attaches don't trip the
+    // same gate.
+    const staleMarker = pendingStaleAttachByConnection.get(connectionId);
+    if (staleMarker && opencodeSessionId === staleMarker.slashCommandOpenCodeSessionId) {
+        logPoll(`attach: refusing to re-bond stale origin opencodeSession=${opencodeSessionId} ` +
+            `after wipe moved bond to ${staleMarker.wipeTargetOpenCodeSessionId}`);
+        pendingStaleAttachByConnection.delete(connectionId);
+        return;
+    }
     if (opencodeSessionId)
         rememberOpenCodeBond(opencodeSessionId, sessionId);
+    // Once a legitimate attach lands (or the marker times out via a future
+    // wipe), the marker is no longer relevant — leave it for now, a subsequent
+    // wipe will overwrite it.
 }
 /**
  * Register (or resume) THIS OpenCode session as a DevSpec connection.
@@ -1778,11 +1979,13 @@ export async function ensureConnection(directory, opencodeSessionId) {
                 ...existing,
                 connectionId,
                 codename: typeof result?.codename === 'string' ? result.codename : existing.codename,
+                opencodeSessionId: existing.opencodeSessionId ?? opencodeSessionId,
             }
             : {
                 connectionId,
                 sessionId: null,
                 codename: result?.codename ?? null,
+                opencodeSessionId: opencodeSessionId,
             };
         writeState(state);
         rememberOpenCodeBond(opencodeSessionId, state.sessionId ?? null);
@@ -2136,6 +2339,39 @@ export function logConnectionEndedStory(input) {
  * Always pass provider on claim (hard match against preferred_provider). Omitting
  * it fails even when this agent is the named one — same habit as claim_work_item.
  */
+const AUTOMATION_RUN_WAKE_KEYS = [
+    'id', 'kind', 'run_id', 'automation_id', 'automation_name', 'trigger_kind', 'owner',
+    'permission', 'queued_at', 'delivery_connection_id', 'requester',
+];
+export function isAutomationRunWake(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value))
+        return false;
+    const dispatch = value;
+    const keys = Object.keys(dispatch);
+    if (keys.length !== AUTOMATION_RUN_WAKE_KEYS.length || AUTOMATION_RUN_WAKE_KEYS.some((key) => !Object.hasOwn(dispatch, key))) {
+        return false;
+    }
+    const owner = dispatch.owner;
+    const pressed = dispatch.trigger_kind === 'pressed';
+    const requester = dispatch.requester;
+    const requesterOk = pressed
+        ? Boolean(requester && typeof requester === 'object' && !Array.isArray(requester) &&
+            typeof requester.user_id === 'string')
+        : requester === null;
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner))
+        return false;
+    return dispatch.kind === 'automation_run' &&
+        typeof dispatch.id === 'string' && dispatch.id.length > 0 &&
+        typeof dispatch.run_id === 'string' && dispatch.run_id.length > 0 &&
+        typeof dispatch.automation_id === 'string' && dispatch.automation_id.length > 0 &&
+        typeof dispatch.automation_name === 'string' && dispatch.automation_name.length > 0 &&
+        (dispatch.trigger_kind === 'scheduled' || dispatch.trigger_kind === 'event' || dispatch.trigger_kind === 'pressed') &&
+        typeof owner.user_id === 'string' && typeof owner.display_name === 'string' && owner.display_name.length > 0 &&
+        (dispatch.permission === 'look_only' || dispatch.permission === 'can_commit' || dispatch.permission === 'can_push') &&
+        typeof dispatch.queued_at === 'string' && dispatch.queued_at.length > 0 &&
+        typeof dispatch.delivery_connection_id === 'string' && dispatch.delivery_connection_id.length > 0 &&
+        requesterOk;
+}
 function automationRunCommandText(d) {
     const permission = d.permission === 'can_push'
         ? 'You MAY edit, commit and push.'
@@ -2144,20 +2380,23 @@ function automationRunCommandText(d) {
             : 'This automation is LOOK ONLY — investigate and report, do not edit, commit or push anything.';
     const runId = d.run_id;
     const name = typeof d.automation_name === 'string' ? d.automation_name : 'automation';
+    const started = d.trigger_kind === 'pressed'
+        ? 'Someone pressed Run.'
+        : d.trigger_kind === 'scheduled'
+            ? 'This run started on a schedule.'
+            : 'This run started because of an event.';
+    const ownerName = d.owner?.display_name || 'the owner';
     return [
         `▶️ Automation run dispatched to this connection: "${name}" (run ${runId}).`,
+        started,
+        `Owner: ${ownerName}`,
         '',
         'What to do:',
         `1. claim_automation_run({ run_id: "${runId}", provider: "opencode" }) — always pass provider (and model if the automation names one). If claimed:false the run was already taken by another of your agents, which is normal; stop there.`,
-        '2. Do the work described below, in this repo.',
+        '2. Follow the instruction returned by that claim, in this repo.',
         '3. record_automation_run — report status, a verdict for EACH acceptance criterion WITH evidence, and whatever the run produced as artifacts.',
         '',
         `Permission: ${permission}`,
-        '',
-        'The instruction:',
-        typeof d.instruction === 'string' && d.instruction.trim()
-            ? d.instruction
-            : '(claim the run to read it)',
     ].join('\n');
 }
 /**
@@ -2526,17 +2765,12 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
     const persistedAutomationDispatches = state.deferredAutomationDispatches ?? [];
     const automationDispatchesById = new Map();
     for (const dispatch of [...persistedAutomationDispatches, ...offeredDispatches]) {
-        if (dispatch &&
-            dispatch.kind === 'automation_run' &&
-            typeof dispatch.id === 'string' &&
-            typeof dispatch.run_id === 'string' &&
-            dispatch.run_id.length > 0) {
-            automationDispatchesById.set(dispatch.id, dispatch);
+        if (isAutomationRunWake(dispatch)) {
+            automationDispatchesById.set(String(dispatch.id), dispatch);
         }
     }
-    const freshDispatches = [...automationDispatchesById.values()].filter((dispatch) => dispatch && dispatch.kind === 'automation_run' && typeof dispatch.id === 'string' &&
-        !pump.deliveredAutomationDispatchIds.has(dispatch.id) &&
-        !['completed', 'released'].includes(String(dispatch.state ?? dispatch.status ?? 'pending')));
+    const freshDispatches = [...automationDispatchesById.values()].filter((dispatch) => isAutomationRunWake(dispatch) &&
+        !pump.deliveredAutomationDispatchIds.has(String(dispatch.id)));
     const automationDispatchCursor = state.deferredAutomationDispatchCursor ??
         (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor ? res.dispatch_cursor : null);
     const commitAutomationCursor = () => {
@@ -3235,10 +3469,30 @@ export async function wipeOpenCodeContextInPlace(input) {
     forgetOpenCodeBond(opencodeSessionId);
     rememberOpenCodeBond(newId, preservedDevspecSessionId);
     moveConnectionCapability(opencodeSessionId, newId);
+    // The slash command's attach tool call will land here next, originating from
+    // `opencodeSessionId` (the old chat). Without this marker, the attach handler
+    // would re-add the bond on the old chat — the one the user is no longer
+    // looking at — and the agent would silently go deaf. The attach handler
+    // reads this map and refuses to put the bond back on the stale origin.
+    if (before?.connectionId) {
+        pendingStaleAttachByConnection.set(before.connectionId, {
+            wipeTargetOpenCodeSessionId: newId,
+            slashCommandOpenCodeSessionId: opencodeSessionId,
+        });
+    }
     runWithBond(newId, () => {
         if (carried) {
             writeState({
                 ...carried,
+                // The file is keyed on `bondLocalId(newId)`, so its `opencodeSessionId`
+                // must equal `newId` for `recoverBondsFromStateFiles` to put the bond
+                // back on the right key after a plugin-module reload. `...carried`
+                // carries the old id from the donor session, which leaves the file
+                // content and its filename in disagreement and survives across reloads
+                // as a stale row keyed at `bondLocalId(oldId)` — observed live in
+                // `~/.devspec/opencode-remote-control/` (item 7a9b7b0f, filed
+                // 42831f3e).
+                opencodeSessionId: newId,
                 sessionId: preservedDevspecSessionId ?? carried.sessionId ?? null,
                 // Clear OpenCode-message-scoped cursors only. Keep DevSpec delivery
                 // cursors (`lastDeliveredMessageId`, `deliveredMessageIds`) so the room
@@ -3675,14 +3929,18 @@ function trailGuardKey(sessionId) {
 /** Debounced/throttled trail publish for `message.updated`. */
 export function scheduleWorkTrailPost(client, directory, sessionId) {
     const key = trailGuardKey(sessionId);
-    void postWorkTrail(client, directory, sessionId);
+    void postWorkTrail(client, directory, sessionId).catch((err) => {
+        logPoll(`postWorkTrail (schedule) unhandled: ${err}`);
+    });
     // Whatever arrives during the gap still reaches the room: schedule one trailing
     // publish so the last update before a quiet stretch is never the one dropped.
     if (trailTrailingTimers.has(key))
         return;
     const timer = setTimeout(() => {
         trailTrailingTimers.delete(key);
-        void postWorkTrail(client, directory, sessionId);
+        void postWorkTrail(client, directory, sessionId).catch((err) => {
+            logPoll(`postWorkTrail (trailing) unhandled: ${err}`);
+        });
     }, TRAIL_POST_MIN_GAP_MS);
     if (typeof timer === 'object' && timer && 'unref' in timer) {
         ;
@@ -3703,12 +3961,19 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
     const run = async () => {
         const auth = resolveDevspecAuth(directory);
         const state = readState();
-        if (!auth.ok || !auth.token || !auth.mcp_url)
+        if (!auth.ok || !auth.token || !auth.mcp_url) {
+            logPoll(`postWorkTrail: no auth (${auth.error ?? 'token/url missing'})`);
             return;
-        if (!state?.sessionId || !state.connectionId)
+        }
+        if (!state?.sessionId || !state.connectionId) {
+            logPoll(`postWorkTrail: no session/connection ` +
+                `(sessionId=${state?.sessionId ?? 'none'} connectionId=${state?.connectionId ?? 'none'})`);
             return;
-        if (!state.busy && !state.awaitingRemoteReply)
+        }
+        if (!state.busy && !state.awaitingRemoteReply) {
+            logPoll(`postWorkTrail: not busy/awaiting (busy=${state.busy} awaiting=${state.awaitingRemoteReply})`);
             return;
+        }
         const key = trailGuardKey(sessionId);
         const guard = trailGuards.get(key) ?? { inFlight: false, pending: false };
         if (guard.inFlight) {
@@ -3731,9 +3996,16 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
         }
         // The inject baseline scopes everything after the pre-inject assistant to
         // this remote turn's work. Without one, only the newest turn.
-        const rawTrail = serializeTurnTrail(messages, {
-            afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
-        });
+        let rawTrail;
+        try {
+            rawTrail = serializeTurnTrail(messages, {
+                afterMessageId: state.replyAfterOpenCodeMessageId ?? null,
+            });
+        }
+        catch (err) {
+            logPoll(`postWorkTrail: serializeTurnTrail threw: ${err}`);
+            return;
+        }
         // Turn-start seed (item 05a88ed5): only substitute the placeholder when
         // there is genuinely nothing to show yet. Real content always wins, so a
         // seed call racing behind a message.updated-triggered post never clobbers
@@ -3750,6 +4022,9 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             force,
             seed,
         })) {
+            logPoll(`postWorkTrail: shouldPostTrail=false ` +
+                `(empty=${!trail.trim()} hash_unchanged=${trailHash === (state.lastTrailHash ?? null)} ` +
+                `force=${force} seed=${seed})`);
             return;
         }
         guard.inFlight = true;
@@ -3784,7 +4059,9 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             guard.pending = false;
             trailGuards.set(key, guard);
             if (stillPending) {
-                void postWorkTrail(client, directory, sessionId);
+                void postWorkTrail(client, directory, sessionId).catch((err) => {
+                    logPoll(`postWorkTrail (pending flush) unhandled: ${err}`);
+                });
             }
         }
     };

@@ -75,6 +75,15 @@ interface ConnectionState {
     sessionId: string | null;
     codename: string | null;
     /**
+     * The OpenCode chat session id this state file belongs to. Required for the
+     * pump to recover its bond after a plugin-module reload (item dd722e4c) —
+     * the on-disk state file is keyed by `bondLocalId(opencodeSessionId)` which
+     * we cannot reverse, so without persisting the source id alongside the file
+     * a fresh module instance cannot reconnect its bonds. Written once on
+     * register/attach and never mutated.
+     */
+    opencodeSessionId: string;
+    /**
      * Last assistant present before an injected owner command. Work-trail and
      * stall checks scope session history after this baseline; answer delivery
      * never reads assistant text.
@@ -599,6 +608,22 @@ export declare function bondLocalId(opencodeSessionId: string): string;
 /** Test helper — drop every bond between cases. */
 export declare function resetBondsForTests(): void;
 /**
+ * Re-attach every live connection recorded on disk into the in-memory
+ * `openCodeBonds` map. The on-disk state files are keyed by
+ * `bondLocalId(opencodeSessionId)` which we cannot reverse, so the fix for
+ * item dd722e4c is to ALSO persist the OpenCode session id inside the state
+ * file (`opencodeSessionId` on `ConnectionState`). With that, this scanner
+ * recovers the in-memory map after a plugin-module reload — otherwise the pump
+ * sees `activeBonds=0`, idles forever, never heartbeats, and the server marks
+ * the connection offline.
+ *
+ * Returns the list of `opencodeSessionId`s recovered. Defensive: a no-op when
+ * the directory is missing or contains no readable state files. Errors on
+ * individual files are logged and skipped so one corrupt file cannot brick
+ * recovery for the rest.
+ */
+export declare function recoverBondsFromStateFiles(directory?: string): string[];
+/**
  * The current bond's state, or null when there is no bond in scope.
  *
  * Reading outside `runWithBond` returns null rather than guessing. That is the
@@ -730,6 +755,7 @@ export interface PollOutcome {
     /** Terminal reason, when stop is true. */
     reason?: string;
 }
+export declare function isAutomationRunWake(value: unknown): value is Record<string, unknown>;
 export declare function pollAndDeliver(client: Parameters<Plugin>[0]['client'], directory: string, sessionId: string, opts?: {
     signal?: AbortSignal;
     /** Authenticated v2 client; the legacy plugin client has no question API. */
