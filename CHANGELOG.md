@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.2
+
+### Knowledge: the closest match is read, not automatically replaced; open questions are on Review
+
+- Before writing a memory the skill still searches and reads the closest match in full, but no longer tells the agent to supersede it. A similar record may be the same decision, a change to it, a different one, or a disagreement; the agent records, supersedes, links or asks the owner as the comparison warrants.
+- The skill names where open questions about records live — the project's Review queue — and the tools to preview a ruling, link related records and read an item's history. Who may rule stays the served contract's decision.
+
 ## 0.10.1
 
 ### A proposed change is accepted on the Review page
