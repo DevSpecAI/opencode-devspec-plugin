@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.1
+
+### A proposed change is accepted on the Review page
+
+When a write comes back `queued_for_review`, the skill now says a maintainer accepts it on the project's Review page, under Proposed changes. It used to send people to a "Review tab", which no longer exists.
+
+The DevSpec instructions also stop naming `search_index` as a DevSpec MCP tool. It is not one, so an agent told to call it first could not; they now name tools the server has.
+
 ## 0.10.0
 
 ### Survive plugin-module reload without stranding live bonds (item dd722e4c)

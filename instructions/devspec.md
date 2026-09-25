@@ -3,7 +3,7 @@
 This project is connected to DevSpec over MCP. DevSpec indexes the codebase and provides shared project records; use it proactively, not just when asked.
 
 1. **Enter work through the canonical contract.** Before planning, action-item mutation, or implementation, read `devspec://product/implementation-contract` and apply its `work_entry_contract`. It is the sole authority for tracking choice, request authority, action-item lifecycle, claims, and completion; do not replace it with copied local prose.
-2. **Check DevSpec first.** Before broad code search, query the DevSpec MCP tools (`search_index`, `get_action_items`, `get_project_summary`, `search_memories`) — the project is already indexed.
+2. **Check DevSpec first.** Before broad code search, query the DevSpec MCP tools (`get_project_summary`, `search_action_items`, `search_memories`, `search_resources`) — what the project already knows is there.
 3. **Keep shared memory fresh.** DevSpec memory (`record_memory`, `search_memories`, `supersede_memory`, `retract_memory`) is the team's shared source of truth. Search first, read the closest match in full, and supersede rather than duplicating durable decisions, conventions, architecture, or risks. The state of work in flight (approved-but-unbuilt, awaiting a pick, blocked on someone) belongs on an action item, not in memory.
 4. **Respect project standards.** Read applicable conventions and decisions in full before relying on or contradicting them.
 5. **Do not force conflicts.** Never force past a `possible_conflict` rejection without explicit human direction.
