@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.3
+
+### A test catches a DevSpec tool name the server no longer has
+
+A new test reads DevSpec's live tool list from a devspecv2 checkout beside this repo and fails if anything in this plugin names a DevSpec tool the server does not have. A tool renamed or retired on the server is then caught here, before an agent is told to call it in someone's session. With no checkout beside it the test skips; `DEVSPEC_V2_ROOT` names one. Nothing about how the plugin behaves has changed.
+
 ## 0.10.2
 
 ### Knowledge: the closest match is read, not automatically replaced; open questions are on Review
