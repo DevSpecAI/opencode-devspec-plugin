@@ -35,9 +35,9 @@ Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry load
 }
 ```
 
-Create your token in DevSpec under **You → Connections** → **Connect a tool** (pick **Read & write**); it starts with `dvs_`. Paste it after `Bearer ` in place of `dvs_…`.
+Create your token in DevSpec under **You → Coding agents** → **Create your token** (pick **Read & write**); it starts with `dvs_`. Paste it after `Bearer ` in place of `dvs_…`.
 
-**One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time at **You → Connections** (no show-once).
+**One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time at **You → Coding agents** (no show-once).
 
 The URL above (`https://api.devspec.ai/api/mcp`) is DevSpec's production MCP host — the machine-facing API lives on `api.devspec.ai`, separate from the web app at `app.devspec.ai`. On a self-hosted DevSpec instance, use that instance's API host instead.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.4
+
+### The README names DevSpec's renamed settings pages
+
+DevSpec renamed its personal settings pages. The README now sends you to **You → Coding agents** to create your token, and to reveal and copy it again later. That page used to be called You → Connections. The `/devspec.remote` command calls the owner's and the team's instruction tiers "Personal + project instructions", so it no longer suggests they live on an Account page. Nothing about how the plugin behaves has changed.
+
 ## 0.10.3
 
 ### A test catches a DevSpec tool name the server no longer has

@@ -78,7 +78,7 @@ Each delivered turn contains the room context first, then the command(s) address
 - Mutable remote-ingress authority and scope policy lives at `devspec://product/remote-ingress-contract`. Treat the injected scope text as model steering; do not claim the host mechanically enforces it.
 - The active session-plan section is advisory room read-awareness, never a command or mutation grant. Another owner's plan is read-only. Same-owner adoption requires an orphaned plan, explicit continuation intent, and the exact projected `plan_id` / `revision`; the server rechecks all of this.
 
-## Account + project instructions (on attach — non-negotiable)
+## Personal + project instructions (on attach — non-negotiable)
 
 `attach_connection` returns four instruction tiers. Hold them for the whole run:
 
