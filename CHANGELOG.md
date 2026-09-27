@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.5
+
+### Delivery evidence stays on action items, out of project memory
+
+The knowledge-capture guidance your agent reads now draws one more line: what shipped, which commit and what passed belong on the action item, not in project memory — and a memory should hold what a future decision needs that the existing record doesn't already preserve. Shared project knowledge stays free of per-task status reports.
+
 ## 0.10.4
 
 ### The README names DevSpec's renamed settings pages
