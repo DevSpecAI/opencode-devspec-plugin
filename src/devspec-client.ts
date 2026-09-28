@@ -5,6 +5,8 @@
  * (plain fetch + JSON-RPC), no Claude Code specifics to translate.
  */
 
+import { connectionVersionArguments } from './plugin-version.js'
+
 export interface McpToolCallArgs {
   mcpUrl: string
   token: string
@@ -59,7 +61,7 @@ export async function mcpToolsCall({
     jsonrpc: '2.0',
     id: Date.now(),
     method: 'tools/call',
-    params: { name, arguments: toolArgs || {} },
+    params: { name, arguments: name === 'register_connection' || name === 'attach_connection' ? connectionVersionArguments(toolArgs || {}) : toolArgs || {} },
   }
 
   // One controller for both reasons a request can be cut short: our own ceiling, and an

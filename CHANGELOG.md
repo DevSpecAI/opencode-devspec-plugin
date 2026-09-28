@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.6
+
+Connection registration and attachment now report the loaded DevSpec plugin version, including raw MCP calls made by the model. The host version is reported only after a successful read through OpenCode's native health API; missing or conflicting information stays unknown. Version metadata does not change connection identity or permissions. Restart existing OpenCode processes to load the new reporter.
+
 ## 0.10.5
 
 ### Delivery evidence stays on action items, out of project memory

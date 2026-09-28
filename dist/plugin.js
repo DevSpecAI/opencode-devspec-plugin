@@ -3,6 +3,7 @@ import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handl
 import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
 import { CommitProvenance } from './commit-provenance.js';
+import { connectionVersionArguments, observeHostVersion } from './plugin-version.js';
 import { captureConnectionCapability, clearConnectionCapability, createManagePlanTool, negotiateConnectionCapability, } from './manage-plan-tool.js';
 import { serializeTurnTrail } from './work-trail.js';
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
@@ -128,6 +129,13 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
             },
         })
         : null;
+    // Best-effort optional metadata, using the already authenticated native SDK.
+    // It never delays startup, prompts, or connection work and has a hard deadline.
+    if (tuiClient?.global?.health) {
+        void Promise.resolve().then(() => tuiClient.global.health({ signal: AbortSignal.timeout(1500) }))
+            .then(result => { observeHostVersion(result.data?.version); })
+            .catch(() => { });
+    }
     // There is deliberately NO fallback session id here (item 2a5d212b). An event
     // that carries no sessionID cannot be attributed to a bond, and "the last
     // session that ran a connect handshake" was never a correct answer to "which
@@ -409,6 +417,16 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
          */
         'tool.execute.before': async (input, output) => {
             provenance.before(input.tool, input.sessionID, output.args, input.callID);
+            // Raw MCP calls made by the model do not go through mcpToolsCall. Supply
+            // the same artifact facts here rather than asking the model to know them.
+            if (isRegisterConnectionTool(input.tool) || isAttachConnectionTool(input.tool)) {
+                if (!output.args || typeof output.args !== 'object')
+                    output.args = {};
+                const args = output.args;
+                delete args.plugin_version;
+                delete args.host_version;
+                Object.assign(args, connectionVersionArguments({}));
+            }
             if (isPostSessionMessageTool(input.tool)) {
                 const bonded = typeof input.sessionID === 'string' && isBondedOpenCodeSession(input.sessionID);
                 if (!bonded || typeof input.sessionID !== 'string') {

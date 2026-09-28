@@ -36,6 +36,13 @@ import {
 } from '../dist/remote-control.js'
 
 const TEST_BOND = 'ses_dispose_busy_cleanup'
+const priorToken = process.env.DEVSPEC_MCP_TOKEN
+const priorUrl = process.env.DEVSPEC_MCP_URL
+before(() => {
+  // This fixture stubs fetch; it must not depend on a developer's real login.
+  process.env.DEVSPEC_MCP_TOKEN = 'dvs_fixture_not_a_real_credential'
+  process.env.DEVSPEC_MCP_URL = 'https://fixture.example.test/api/mcp'
+})
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-dispose-busy-home-'))
 
 const dirs = []
@@ -49,6 +56,10 @@ const CONN = '11111111-1111-1111-1111-111111111111'
 const DEVSPEC_SESSION = '22222222-2222-2222-2222-222222222222'
 
 after(() => {
+  if (priorToken === undefined) delete process.env.DEVSPEC_MCP_TOKEN
+  else process.env.DEVSPEC_MCP_TOKEN = priorToken
+  if (priorUrl === undefined) delete process.env.DEVSPEC_MCP_URL
+  else process.env.DEVSPEC_MCP_URL = priorUrl
   for (const d of dirs) {
     try { fs.rmSync(d, { recursive: true, force: true }) } catch { /* ignore */ }
   }

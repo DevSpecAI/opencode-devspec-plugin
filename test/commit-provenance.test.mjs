@@ -530,6 +530,7 @@ describe('plugin hooks remain independent of remote bonds and egress', () => {
     hooks['tool.execute.after']({ tool, sessionID, callID, args }, output)
 
   it('a fresh remote registration still works and does not widen or block shell', async () => {
+    const startedAt = Date.now()
     const sessionID = 'fresh-remote-session'
     const connectionID = '22222222-2222-2222-2222-222222222222'
     const devspecSessionID = '33333333-3333-3333-3333-333333333333'
@@ -559,12 +560,17 @@ describe('plugin hooks remain independent of remote bonds and egress', () => {
         session_id: devspecSessionID,
       }),
     )
-    assert.deepEqual(runWithBond(sessionID, () => readState()), {
+    const connected = runWithBond(sessionID, () => readState())
+    assert.deepEqual(connected, {
       connectionId: connectionID,
       sessionId: devspecSessionID,
       codename: 'Fresh Otter',
+      opencodeSessionId: sessionID,
       connectHandshakePending: true,
+      connectHandshakeStartedAt: connected.connectHandshakeStartedAt,
     })
+    assert.equal(typeof connected.connectHandshakeStartedAt, 'number')
+    assert.ok(connected.connectHandshakeStartedAt >= startedAt && connected.connectHandshakeStartedAt <= Date.now())
     await assert.doesNotReject(() => before('bash', sessionID, { command: 'git status' }))
     await assert.doesNotReject(() => before('edit', sessionID, { filePath: 'a.ts' }))
   })
