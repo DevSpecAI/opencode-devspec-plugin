@@ -1,4 +1,8 @@
-# opencode-devspec-plugin
+# DevSpec for OpenCode
+
+**Build on your team’s best thinking.**
+
+DevSpec helps your team and AI agents turn ideas and experience into better software.
 
 DevSpec integration for [OpenCode](https://opencode.ai) — connects OpenCode to your DevSpec project over MCP, teaches it DevSpec's conventions (briefs, action items, memory), and ports the same `devspec.*` commands and remote-control support that already ship for Claude Code and Cursor.
 
