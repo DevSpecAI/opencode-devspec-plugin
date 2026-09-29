@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.7
+
+Plugin initialization starts optional shared-launcher setup without delaying OpenCode. The package includes the generated launcher and a separate OpenCode-owned launch adapter, keeping credentials out of the shared payload while preserving fleet/visible-terminal behaviour. Launcher setup validates Node.js 20+ instead of treating an embedded OpenCode/Bun executable as Node. Setup failures do not disable the plugin; restart the installed plugin to load this integration.
+
 ## 0.10.6
 
 Connection registration and attachment now report the loaded DevSpec plugin version, including raw MCP calls made by the model. The host version is reported only after a successful read through OpenCode's native health API; missing or conflicting information stays unknown. Version metadata does not change connection identity or permissions. Restart existing OpenCode processes to load the new reporter.

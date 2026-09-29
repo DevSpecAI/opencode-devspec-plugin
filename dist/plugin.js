@@ -6,6 +6,7 @@ import { CommitProvenance } from './commit-provenance.js';
 import { connectionVersionArguments, observeHostVersion } from './plugin-version.js';
 import { captureConnectionCapability, clearConnectionCapability, createManagePlanTool, negotiateConnectionCapability, } from './manage-plan-tool.js';
 import { serializeTurnTrail } from './work-trail.js';
+import { setupSharedLauncher } from './launcher.js';
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
 // OPENCODE_SERVER_PASSWORD as early as this module loads — same rule as rocket
 // cold-launch — so the door is never unsecured and the warning stays gone.
@@ -114,6 +115,7 @@ function permissionRequestId(props) {
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
 export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
+    void setupSharedLauncher(directory);
     // Commit provenance is process-local. A restart forgets claims, which only
     // disables stamping — it never blocks edits or execution.
     const provenance = new CommitProvenance({ directory });
