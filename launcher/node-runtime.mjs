@@ -43,6 +43,16 @@ export function npmNodeShimEntry(shim, { read = file => fs.readFileSync(file, 'u
   } catch { return null }
 }
 
+/** Desktop services do not inherit an interactive shell's NVM/fnm PATH. Keep
+ * the verified Node installation (and its npm-installed agent commands) usable
+ * for discovery and for child scripts with an /usr/bin/env node shebang. */
+export function runtimePath({ execPath = process.execPath, env = process.env, platform = process.platform } = {}) {
+  const path = platform === 'win32' ? nativePath.win32 : nativePath.posix
+  const directory = path.dirname(execPath), separator = platform === 'win32' ? ';' : ':'
+  const same = value => platform === 'win32' ? value.toLowerCase() === directory.toLowerCase() : value === directory
+  return [directory, ...String(env.PATH ?? env.Path ?? '').split(separator).filter(value => value && !same(value))].join(separator)
+}
+
 export function resolveNodeRuntime(options = {}) {
   const run = options.run ?? ((exe, args) => execFileSync(exe, args, { encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 }))
   const exists = options.exists ?? (file => { try { fs.accessSync(file, process.platform === 'win32' ? fs.constants.F_OK : fs.constants.X_OK); return fs.statSync(file).isFile() } catch { return false } })

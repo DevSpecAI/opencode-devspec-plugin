@@ -16,7 +16,7 @@ import { integrationPlan, configureIntegration, removeIntegration, windowsUserSi
 import { LAUNCHER_PORT, createLauncherServer } from './launcher-server.mjs'
 import { verifyHandoffToken } from './handoff-verify.mjs'
 import { migrateLegacyState } from './legacy-state.mjs'
-import { resolveNodeRuntime } from './node-runtime.mjs'
+import { resolveNodeRuntime, runtimePath } from './node-runtime.mjs'
 import { installationId as getInstallationId, launcherHome } from './account-bindings.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -118,6 +118,7 @@ export async function configureLauncher(home) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  process.env.PATH = runtimePath()
   const args = [...argv]
   const homeIndex = args.indexOf('--home')
   let home = defaultHome()

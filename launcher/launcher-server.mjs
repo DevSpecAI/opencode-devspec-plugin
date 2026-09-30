@@ -70,7 +70,7 @@ export function createLauncherServer({ home, version, identity, verify, execute,
       catch { reply(403, { ok: false, error: 'invalid_encrypted_request' }); return }
       inFlight++
       try {
-        const receipt = await executeLaunchOnce({ home, token, publicKey: device.publicKey, execute, rootKey, verify })
+        const receipt = await executeLaunchOnce({ home, token, publicKey: device.publicKey, execute: request => execute({ ...request, reportErrorsInBrowser: false }), rootKey, verify })
         reply(receipt.status, receipt.result)
       } finally { inFlight-- }
     } catch { reply(500, { ok: false, error: 'launcher_error' }) }

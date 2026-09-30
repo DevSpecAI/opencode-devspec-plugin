@@ -972,7 +972,7 @@ export function resolveAppBaseUrl(opts = {}) {
  * page defaults to Cursor and tells a Pi user to go and fix something in an editor they may not
  * have installed — the same wrong-default class already fixed on the interstitial.
  */
-function openErrorPage(slug, reason, tool = 'cursor') {
+function launchErrorBrowserPage(slug, reason, tool = 'cursor') {
   // Human pages live on the app host (app.*), not the API host (api.*). Prefer
   // DEVSPEC_APP_URL; otherwise resolveAppBaseUrl mirrors the machine's MCP
   // staging/prod pair (item 2ed52078 / af6a1d20).
@@ -1133,7 +1133,9 @@ export async function executeSingleHandoff({
   requireSignedToken = true,
   unsigned = false,
   settle = false,
+  reportErrorsInBrowser = true,
 }) {
+  const openErrorPage = reportErrorsInBrowser ? launchErrorBrowserPage : () => {}
   if (requireSignedToken && unsigned) {
     await appendHandlerLog('rejected unsigned handoff')
     return { ok: false, error: 'unsigned_not_allowed', slug }
@@ -1263,6 +1265,7 @@ export async function executeHandoff({
   sessionId = null,
   requireSignedToken = true,
   unsigned = false,
+  reportErrorsInBrowser = true,
 }) {
   if (!isLaunchOwner(DEVSPEC_DIR, requesterId)) return { ok: false, error: 'account_not_paired' }
   if (recipe && typeof recipe === 'object') {
@@ -1312,6 +1315,7 @@ export async function executeHandoff({
         requireSignedToken,
         unsigned,
         settle: spawnTool === 'opencode',
+        reportErrorsInBrowser,
       })
       if (result.ok) {
         spawned += 1
@@ -1364,6 +1368,7 @@ export async function executeHandoff({
     resumeChatId,
     requireSignedToken,
     unsigned,
+    reportErrorsInBrowser,
   })
 }
 

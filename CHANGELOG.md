@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.8
+
+Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and avoid duplicate loopback error tabs. Update the package and restart OpenCode to run its shared update check.
+
 ## 0.10.7
 
 Plugin initialization starts optional shared-launcher setup without delaying OpenCode. The package includes the generated launcher and a separate OpenCode-owned launch adapter, keeping credentials out of the shared payload while preserving fleet/visible-terminal behaviour. Launcher setup validates Node.js 20+ instead of treating an embedded OpenCode/Bun executable as Node. Setup failures do not disable the plugin; restart the installed plugin to load this integration.
