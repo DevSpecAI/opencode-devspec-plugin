@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.10
+
+- Remove the bundled launcher, launch adapter and automatic plugin-initialization setup. OpenCode's own plugin lifecycle, authentication and remote-control commands remain intact.
+- Stop publishing launcher assets in this package. Browser launching is a separate optional application, not an extra service installed by this plugin.
+
 ## 0.10.8
 
 Bundle launcher 0.3.1 to find npm-installed Pi from desktop services and avoid duplicate loopback error tabs. Update the package and restart OpenCode to run its shared update check.

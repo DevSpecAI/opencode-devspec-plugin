@@ -1,5 +1,7 @@
 # DevSpec for OpenCode
 
+**The launcher is optional.** Start OpenCode normally and use this plugin's connection commands, or copy a command from DevSpec. This package does not bundle the separate DevSpec Launcher, install or update it, or register a background service or URL handler. Browser-launch convenience is provided by the separately installed app; see Coding agents settings in DevSpec for availability and setup.
+
 **Build on your team’s best thinking.**
 
 DevSpec helps your team and AI agents turn ideas and experience into better software.

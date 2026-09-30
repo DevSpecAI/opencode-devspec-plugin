@@ -1,14 +1,12 @@
 {
   "name": "opencode-devspec-plugin",
-  "version": "0.10.9",
+  "version": "0.10.10",
   "description": "DevSpec integration plugin for OpenCode (opencode.ai) — MCP connection, project conventions, ported commands, and remote control.",
   "type": "module",
   "main": "dist/plugin.js",
   "types": "dist/plugin.d.ts",
   "files": [
     "dist",
-    "launcher",
-    "launcher-adapter",
     "commands",
     "instructions",
     "README.md",
@@ -19,7 +17,7 @@
     "prepack": "npm run build",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --import ./test/launcher-test-env.mjs --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "keywords": [
     "opencode",

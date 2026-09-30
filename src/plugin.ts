@@ -42,7 +42,6 @@ import {
   negotiateConnectionCapability,
 } from './manage-plan-tool.js'
 import { serializeTurnTrail } from './work-trail.js'
-import { setupSharedLauncher } from './launcher.js'
 
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
 // OPENCODE_SERVER_PASSWORD as early as this module loads — same rule as rocket
@@ -167,7 +166,6 @@ function permissionRequestId(props: Record<string, unknown> | undefined): string
  * regardless of how the model got there (the command, or ad hoc reasoning).
  */
 export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) => {
-  void setupSharedLauncher(directory)
   // Commit provenance is process-local. A restart forgets claims, which only
   // disables stamping — it never blocks edits or execution.
   const provenance = new CommitProvenance({ directory })

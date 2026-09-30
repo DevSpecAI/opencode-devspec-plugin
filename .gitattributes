@@ -1,3 +1,0 @@
-# Preserve generated launcher bytes and manifest hashes across platforms.
-launcher/** -text
-launcher/*.cmd whitespace=cr-at-eol
