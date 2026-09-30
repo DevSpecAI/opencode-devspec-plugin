@@ -45,7 +45,7 @@ export function createLauncherServer({ home, version, identity, verify, execute,
         if (challenge && !/^[a-f0-9]{64}$/.test(challenge)) { reply(400, { ok: false, error: 'invalid_challenge' }); return }
         const certificates = [...pairedCertificates(home, rootKey).values()].flat().slice(0, 64)
         const health = { ok: true, service: 'devspec-launcher', protocol: 1, version, identity, installationId: instance,
-          capabilities: ['encrypted-launch-v1', 'account-bound-launch', 'fleet-v1'],
+          capabilities: ['encrypted-launch-v1', 'account-bound-launch', 'fleet-v1', 'claude-code-launch-v1'],
           status: fs.existsSync(path.join(home, 'disabled.json')) ? 'disabled' : certificates.length ? 'ready' : 'requires_connection',
           publicKey: device.publicKey, certificates, challenge }
         reply(200, { ...health, ...(challenge ? { signature: signHealth(health, device.privateKey) } : {}) }); return

@@ -13,6 +13,7 @@ import { verifyHandoffToken } from './handoff-verify.mjs'
 import { readHostAdapter } from './host-adapters.mjs'
 import { isLaunchOwner } from './account-bindings.mjs'
 import {
+  FLEET_RECIPE_TOOLS,
   expandFleetRecipe,
   recipeFromHandoffPayload,
   resolveFleetSpawnPrompt,
@@ -469,6 +470,64 @@ export async function resolvePiExecutable() {
     if (candidate && (await pathExists(candidate))) return candidate
   }
   return null
+}
+
+/** Resolve Claude's native installer or npm shim without confusing it with `agent`. */
+export async function resolveClaudeExecutable() {
+  const windows = process.platform === 'win32'
+  try {
+    const { stdout } = await execFileAsync(windows ? 'where' : 'which', ['claude'], { timeout: 5000 })
+    const paths = String(stdout).split(/\r?\n/).map(value => value.trim()).filter(Boolean)
+    for (const candidate of paths) {
+      if (windows && !/\.(exe|cmd|bat|ps1)$/i.test(candidate)) continue
+      if (await pathExists(candidate)) return candidate
+    }
+  } catch { /* Desktop services may have a smaller PATH than the user's terminal. */ }
+  const home = os.homedir()
+  const candidates = windows
+    ? [path.join(home, '.local', 'bin', 'claude.exe'), path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'npm', 'claude.cmd')]
+    : [path.join(home, '.local', 'bin', 'claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude', path.join(home, '.npm-global', 'bin', 'claude')]
+  for (const candidate of candidates) if (await pathExists(candidate)) return candidate
+  return null
+}
+
+/** Start a visible terminal; the prompt stays in a file, never in terminal shell syntax. */
+export async function openInClaude({ folderPath, promptText, claudeBin, model }) {
+  await ensureDevspecDir()
+  const launchesDir = path.join(DEVSPEC_DIR, 'launches')
+  await fs.mkdir(launchesDir, { recursive: true, mode: 0o700 })
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const promptFile = path.join(launchesDir, `${stamp}.prompt.txt`)
+  await fs.writeFile(promptFile, promptText?.trim() ? `${promptText.trim()}\n` : '', { mode: 0o600 })
+  // Always use this verified release, never a stale sibling plugin's launcher.
+  const launcher = fileURLToPath(new URL('./launch-claude-session.mjs', import.meta.url))
+  const args = [launcher, '--folder', folderPath, '--prompt-file', promptFile, '--claude', claudeBin]
+  if (model?.trim()) args.push('--model', model.trim())
+  const start = (bin, argv) => new Promise((resolve, reject) => {
+    const child = spawn(bin, argv, { cwd: folderPath, detached: true, stdio: 'ignore', windowsHide: true })
+    child.once('error', reject)
+    child.once('spawn', () => { child.unref(); resolve() })
+  })
+  if (process.platform === 'win32') {
+    const bat = path.join(launchesDir, `${stamp}.claude-launch.cmd`)
+    await fs.writeFile(bat, buildWindowsCliLaunchBat(process.execPath, args, folderPath), 'utf8')
+    await start('cmd.exe', windowsCursorCliStartArgs(bat, 'DevSpec Claude Code'))
+    return
+  }
+  const cmd = `cd ${shellSingleQuote(folderPath)} && ${[process.execPath, ...args].map(shellSingleQuote).join(' ')}`
+  if (process.platform === 'darwin') {
+    await start('osascript', ['-e', `tell application "Terminal" to do script ${JSON.stringify(cmd)}`])
+    return
+  }
+  for (const [bin, argv] of [
+    ['x-terminal-emulator', ['-e', 'bash', '-lc', cmd]],
+    ['gnome-terminal', ['--', 'bash', '-lc', cmd]],
+    ['konsole', ['-e', 'bash', '-lc', cmd]],
+    ['xfce4-terminal', ['-e', `bash -lc ${shellSingleQuote(cmd)}`]],
+  ]) {
+    try { await start(bin, argv); return } catch { /* Try the next installed terminal. */ }
+  }
+  throw new Error('No terminal emulator found to launch Claude Code')
 }
 
 /**
@@ -1071,10 +1130,7 @@ export function parseHandoffUrl(raw) {
       promptText: verified.data.prompt ?? null,
       itemTitle: verified.data.title ?? null,
       surface: verified.data.surface === 'cli' ? 'cli' : 'ide',
-      tool:
-        verified.data.tool === 'opencode' || verified.data.tool === 'pi'
-          ? verified.data.tool
-          : 'cursor',
+      tool: verified.data.tool,
       model: verified.data.model ?? null,
       thinking: verified.data.thinking ?? null,
       resumeChatId:
@@ -1089,7 +1145,8 @@ export function parseHandoffUrl(raw) {
   const repo = url.searchParams.get('repo')
   if (!repo) return { error: 'missing_repo' }
   const surfaceRaw = url.searchParams.get('surface')
-  const toolRaw = url.searchParams.get('tool')
+  const toolRaw = url.searchParams.get('tool') ?? 'cursor'
+  if (!FLEET_RECIPE_TOOLS.includes(toolRaw)) return { error: 'unsupported_tool' }
   const modelRaw = url.searchParams.get('model')
   const thinkingRaw = url.searchParams.get('thinking')
   const resumeChatRaw = url.searchParams.get('resumeChatId')
@@ -1102,7 +1159,7 @@ export function parseHandoffUrl(raw) {
       ? decodeURIComponent(url.searchParams.get('title'))
       : null,
     surface: surfaceRaw === 'cli' ? 'cli' : 'ide',
-    tool: toolRaw === 'opencode' || toolRaw === 'pi' ? toolRaw : 'cursor',
+    tool: toolRaw,
     model: modelRaw ? decodeURIComponent(modelRaw) : null,
     thinking: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinkingRaw)
       ? thinkingRaw
@@ -1141,11 +1198,32 @@ export async function executeSingleHandoff({
     return { ok: false, error: 'unsigned_not_allowed', slug }
   }
 
+  if (!FLEET_RECIPE_TOOLS.includes(tool)) {
+    openErrorPage(slug, 'unsupported_tool', tool)
+    return { ok: false, error: 'unsupported_tool', slug }
+  }
   const folderPath = await resolveRepoFolder(slug)
   if (!folderPath) {
     await appendHandlerLog(`missing mapping for ${slug}`)
     openErrorPage(slug, 'missing_mapping', tool)
     return { ok: false, error: 'missing_mapping', slug }
+  }
+
+  if (tool === 'claude-code') {
+    const claudeBin = await resolveClaudeExecutable()
+    if (!claudeBin) {
+      openErrorPage(slug, 'claude_missing', tool)
+      return { ok: false, error: 'claude_missing', slug }
+    }
+    try {
+      await openInClaude({ folderPath, promptText, claudeBin, model })
+      await appendHandlerLog(`opened Claude Code ${slug} → ${folderPath}`)
+      return { ok: true }
+    } catch (error) {
+      await appendHandlerLog(`Claude Code open failed: ${error.message}`)
+      openErrorPage(slug, 'agent_launch_failed', tool)
+      return { ok: false, error: 'agent_launch_failed', slug }
+    }
   }
 
   if (tool === 'pi') {
@@ -1398,7 +1476,7 @@ export async function handleProtocolUrl(raw, opts = {}) {
     promptText: parsed.promptText,
     itemTitle: parsed.itemTitle,
     surface: parsed.surface === 'cli' ? 'cli' : 'ide',
-    tool: parsed.tool === 'opencode' || parsed.tool === 'pi' ? parsed.tool : 'cursor',
+    tool: parsed.tool ?? 'cursor',
     model: parsed.model ?? null,
     thinking: parsed.thinking ?? null,
     resumeChatId: parsed.resumeChatId ?? null,

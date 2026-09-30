@@ -3,7 +3,7 @@
  * (brief ba6bd58e / item 32b51eea). Keep validation rules in sync.
  */
 
-export const FLEET_RECIPE_TOOLS = ['cursor', 'opencode', 'pi']
+export const FLEET_RECIPE_TOOLS = ['cursor', 'opencode', 'pi', 'claude-code']
 
 export const FLEET_RECIPE_MAX_PER_TOOL = 8
 export const FLEET_RECIPE_MAX_TOTAL = 24
@@ -55,7 +55,7 @@ export function fleetRemotePromptForTool(tool, sessionId) {
     return `/devspec.remote --session ${short}`
   }
 
-  if (t === 'opencode' || t === 'pi') {
+  if (t === 'opencode' || t === 'pi' || t === 'claude-code') {
     return '/devspec.remote'
   }
   return FLEET_DEFAULT_REMOTE_PROMPT

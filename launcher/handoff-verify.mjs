@@ -6,7 +6,8 @@ let cachedPublicKey
 function loadPublicKey() {
   return cachedPublicKey ??= createPublicKey(fs.readFileSync(fileURLToPath(new URL('./handoff-public-key.pem', import.meta.url))))
 }
-const tools = new Set(['cursor', 'opencode', 'pi'])
+import { FLEET_RECIPE_TOOLS } from './fleet-recipe.mjs'
+const tools = new Set(FLEET_RECIPE_TOOLS)
 const thinking = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const bounded = (value, length) => typeof value === 'string' && value.length <= length && !value.includes('\0')
 
