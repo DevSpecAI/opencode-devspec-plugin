@@ -120,8 +120,8 @@ export {
  * unlike register_connection/get_session_transcript/post_session_message,
  * which do) — so a stuck "OpenCode is working…" indicator, or a duplicate
  * duplicate answer post, was completely undiagnosable from either side without
- * this. Colocated with launch-opencode-session.mjs's own launcher.log
- * (same directory, different file) in the other repo.
+ * this. The log belongs to this plugin's remote-control state directory;
+ * it does not depend on the optional standalone DevSpec Launcher.
  */
 function pollLogFile(): string {
   return path.join(os.homedir(), '.devspec', 'opencode-remote-control', 'poll.log')

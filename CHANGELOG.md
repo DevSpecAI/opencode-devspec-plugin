@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.11
+
+- Remove obsolete launcher-adapter references from the plugin's authentication and diagnostic comments, including generated output. These remain plugin-owned responsibilities; runtime behavior is unchanged.
+- Update the installed package and restart OpenCode to load this version. The optional DevSpec Launcher remains separately installed.
+
 ## 0.10.10
 
 - Remove the bundled launcher, launch adapter and automatic plugin-initialization setup. OpenCode's own plugin lifecycle, authentication and remote-control commands remain intact.

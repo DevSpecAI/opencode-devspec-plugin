@@ -13,11 +13,10 @@ export type ServeAuth = {
  * Resolve the local OpenCode HTTP basic-auth password for this process.
  *
  * Prefer a non-empty `OPENCODE_SERVER_PASSWORD` already in the environment
- * (power users / rocket launchers). Otherwise mint a strong one-time secret
- * for this process only. Never upload this to DevSpec — it only locks the
- * laptop-local HTTP door OpenCode opens for TUI ↔ server.
- *
- * Same rule as cursor-devspec-plugin `launch-opencode-session.mjs` rocket path.
+ * (for example, from the user's own OpenCode configuration). Otherwise mint
+ * a strong one-time secret for this process only. Never upload this to DevSpec —
+ * it protects OpenCode's local TUI ↔ server connection. These credentials belong
+ * to the host/plugin, not to the optional standalone DevSpec Launcher.
  */
 export function resolveServeAuth(env: NodeJS.ProcessEnv = process.env): ServeAuth {
   const usernameRaw = String(env.OPENCODE_SERVER_USERNAME || '').trim()
