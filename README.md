@@ -1,6 +1,6 @@
 # DevSpec for OpenCode
 
-**The launcher is optional.** Start OpenCode normally and use this plugin's connection commands, or copy a command from DevSpec. This package does not bundle the separate DevSpec Launcher, install or update it, or register a background service or URL handler. Browser-launch convenience is provided by the separately installed app; see Coding agents settings in DevSpec for availability and setup.
+**The launcher is optional.** Start OpenCode normally and use this plugin's connection commands, or copy a command from DevSpec. This package does not bundle the separate DevSpec Launcher, install or update it, or register a background service or URL handler. Browser-launch convenience is provided by the separately installed app; see your [Agents settings](https://app.devspec.ai/settings/agents) in DevSpec for availability and setup.
 
 **Build on your team’s best thinking.**
 
@@ -41,9 +41,9 @@ Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry load
 }
 ```
 
-Create your token in DevSpec under **You → Coding agents** → **Create your token** (pick **Read & write**); it starts with `dvs_`. Paste it after `Bearer ` in place of `dvs_…`.
+Create your token on DevSpec's [Agents settings page](https://app.devspec.ai/settings/agents): choose **Create your token** and pick **Read & write**. It starts with `dvs_`. Paste it after `Bearer ` in place of `dvs_…`.
 
-**One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time at **You → Coding agents** (no show-once).
+**One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time on the [Agents settings page](https://app.devspec.ai/settings/agents) (no show-once).
 
 The URL above (`https://api.devspec.ai/api/mcp`) is DevSpec's production MCP host — the machine-facing API lives on `api.devspec.ai`, separate from the web app at `app.devspec.ai`. On a self-hosted DevSpec instance, use that instance's API host instead.
 
@@ -63,7 +63,7 @@ Start OpenCode in a second DevSpec-tracked repo without copying the MCP JSON int
 - **Shared session plans** — substantial multi-phase work can use the on-demand `manage_plan` path selected by the served implementation contract; routine turns carry no plan boilerplate. Attached remote sessions receive a strict current active-plan snapshot with room-wide read awareness.
 - **Remote control** — attach this OpenCode session to a DevSpec session for phone/web control, delivered via OpenCode's own session-message API rather than a file-based workaround.
 
-## Developing this plugin (coding agents)
+## Developing this plugin
 
 Working on remote-control / presence / poll code in this repo? From the plugin root run:
 

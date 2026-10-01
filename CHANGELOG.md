@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.12
+
+### The README links straight to DevSpec's Agents settings page
+
+DevSpec renamed its Coding agents settings page to **Agents**, at `/settings/agents`; the old address redirects. The README now gives a link to [that page](https://app.devspec.ai/settings/agents) wherever it used to say **You → Coding agents**: to create your token, to reveal and copy it again later, and to set up the optional DevSpec Launcher. Nothing about how the plugin behaves has changed.
+
 ## 0.10.11
 
 - Remove obsolete launcher-adapter references from the plugin's authentication and diagnostic comments, including generated output. These remain plugin-owned responsibilities; runtime behavior is unchanged.
