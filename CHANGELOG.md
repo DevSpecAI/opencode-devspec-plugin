@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.0
+
+### DevSpec lists OpenCode's model tools only
+
+DevSpec now shows a model only the DevSpec tools it should call. The connection plumbing the plugin calls itself (polling, keep-alives, pickup and completion reports) no longer appears in OpenCode's tool list. `/devspec.remote` and `/devspec.remote-stop` still have the model call three plumbing tools, `register_connection`, `attach_connection` and `detach_connection`, so the DevSpec MCP address declares them: `https://api.devspec.ai/api/mcp?model_tools=register_connection,attach_connection,detach_connection`. **Change the `url` of the `devspec` entry in `~/.config/opencode/opencode.jsonc` to that address** (on staging or a self-hosted host, keep the same `?model_tools=…`), update the plugin, and restart OpenCode.
+
 ## 0.10.12
 
 ### The README links straight to DevSpec's Agents settings page

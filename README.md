@@ -30,7 +30,7 @@ Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry load
   "mcp": {
     "devspec": {
       "type": "remote",
-      "url": "https://api.devspec.ai/api/mcp",
+      "url": "https://api.devspec.ai/api/mcp?model_tools=register_connection,attach_connection,detach_connection",
       "headers": {
         "Authorization": "Bearer dvs_…"
       }
@@ -45,7 +45,7 @@ Create your token on DevSpec's [Agents settings page](https://app.devspec.ai/set
 
 **One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time on the [Agents settings page](https://app.devspec.ai/settings/agents) (no show-once).
 
-The URL above (`https://api.devspec.ai/api/mcp`) is DevSpec's production MCP host — the machine-facing API lives on `api.devspec.ai`, separate from the web app at `app.devspec.ai`. On a self-hosted DevSpec instance, use that instance's API host instead.
+The URL above is DevSpec's production MCP host — the machine-facing API lives on `api.devspec.ai`, separate from the web app at `app.devspec.ai`. On a self-hosted DevSpec instance, use that instance's API host instead. The URL's `model_tools` names the connection plumbing OpenCode's model calls itself in `/devspec.remote` and `/devspec.remote-stop` (register, attach and detach): DevSpec lists only model tools plus those, so keep it on whichever host you use.
 
 > **Node.js 18+** is only needed for remote control and working a batch of items (isolated work branches, connection lifecycle) — plain MCP tool access works without it.
 
