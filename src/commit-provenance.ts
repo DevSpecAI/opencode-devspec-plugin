@@ -47,7 +47,9 @@ export type SimpleGitCommit = {
   insertOffset: number
 }
 
-export type LocalReferenceOutcome = 'absent' | 'malformed' | 'ambiguous' | 'well_formed'
+// The served contract's local outcomes (4.13.0): a commit may name several
+// items (decision ee4102eb, item 96f3dfb7), which is multi_reference, not ambiguous.
+export type LocalReferenceOutcome = 'absent' | 'malformed' | 'well_formed' | 'multi_reference'
 
 export type ProvenanceDecision =
   | { action: 'allow' }
@@ -443,7 +445,7 @@ export function referencesIn(message: string): string[] {
 
 export function localReferenceOutcome(message: string): LocalReferenceOutcome {
   const refs = referencesIn(message)
-  if (refs.length > 1) return 'ambiguous'
+  if (refs.length > 1) return 'multi_reference'
   if (refs.length === 1) return 'well_formed'
   if (/\[devspec:/i.test(message)) return 'malformed'
   return 'absent'
@@ -511,7 +513,7 @@ function recoveryText(claims: string[]): string {
   if (claims.length > 1) {
     return [
       `DevSpec: this commit has no [devspec:<id>] reference and ${claims.length} claims are active, so nothing was added automatically.`,
-      `Put exactly one of ${claims.map((id) => `[devspec:${id}]`).join(' or ')} in the message and retry.`,
+      `Add the reference for each item this commit delivers (${claims.map((id) => `[devspec:${id}]`).join(', ')}) to the message and retry.`,
       `Authority: ${CONTRACT_URI}. Nothing else is blocked.`,
     ].join(' ')
   }
@@ -532,7 +534,7 @@ export function decideCommit(input: {
   if (!commit) return { action: 'allow' }
 
   const outcome = localReferenceOutcome(commit.message)
-  if (outcome === 'well_formed' || outcome === 'ambiguous') return { action: 'allow' }
+  if (outcome === 'well_formed' || outcome === 'multi_reference') return { action: 'allow' }
   if (!input.hasJurisdiction) return { action: 'allow' }
 
   if (outcome === 'absent' && input.claims.length === 1 && commit.appendable) {

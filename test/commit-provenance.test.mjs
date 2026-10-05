@@ -232,8 +232,13 @@ describe('reference outcomes are local shape only', () => {
     assert.equal(localReferenceOutcome('bad [devspec:not-an-id]'), 'malformed')
     assert.equal(
       localReferenceOutcome(`[devspec:${ITEM}] and [devspec:${OTHER}]`),
-      'ambiguous',
+      'multi_reference',
     )
+  })
+
+  it('lets a commit naming several items through (contract 4.13.0, item 96f3dfb7)', () => {
+    const decision = decideCommit({ command: `git commit -m "ship [devspec:${ITEM}] [devspec:${OTHER}]"`, claims: [ITEM], hasJurisdiction: true })
+    assert.equal(decision.action, 'allow')
   })
 
   it('does not treat a short code as a second reference when it is the prefix of the full uuid', () => {

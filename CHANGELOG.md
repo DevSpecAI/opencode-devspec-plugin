@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.2
+
+### A commit may name several items
+A commit message carrying more than one `[devspec:<id>]` reference is now reported as `multi_reference`, matching DevSpec's contract, instead of `ambiguous`; it was already allowed and still is. With several claims and no reference, the hint now asks for a reference for each item the commit delivers.
+
 ## 0.11.1
 
 ### An @mention reaches a person
