@@ -60,6 +60,7 @@ The connect/status handshake itself must not produce a DevSpec-postable answer; 
 - **If real work will happen before the answer**, write one short sentence first ("got it, I'll look at X") — it lands as the live trail while you work. If the answer is ready now, skip that: a trail and answer arriving together are just a slower answer.
 - **Sessionless:** there is no conversational answer path. Separately accepted owner-scoped automation runs report through `record_automation_run`; never invent a room.
 - Ground the answer in what you **verified** with tools, not in the injected room text alone.
+- **Reaching a person:** writing @ and their name in your answer (`@Brandon`, or `@Brandon Smith`) notifies them, if they are in the room or on the project. Mention someone only when they need to see it.
 
 ## Act on authorized commands
 

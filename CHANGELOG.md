@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1
+
+### An @mention reaches a person
+
+`/devspec.remote` and the always-on DevSpec instructions now tell OpenCode that writing @ and a person's name in an answer in a DevSpec room notifies that person, if they are in the room or on the project. Update the plugin and restart OpenCode.
+
 ## 0.11.0
 
 ### DevSpec lists OpenCode's model tools only
