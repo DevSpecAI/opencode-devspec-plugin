@@ -11,6 +11,8 @@ import {
   forgetOpenCodeBond,
   forgetPumpState,
   isBondedOpenCodeSession,
+  noteRuntimeModel,
+  parseConfiguredModel,
   patchState,
   pollAndDeliver,
   readState,
@@ -1167,5 +1169,44 @@ describe('pollAndDeliver canonical transaction integration', () => {
     assert.equal(abortCalls, 1, 'conversational slash must not enter control path')
     assert.equal(promptCalls.length, 1)
     assert.match(promptCalls[0].body.parts[0].text, /\/abort/)
+  })
+})
+
+describe('the model OpenCode is running reaches the Agents page (item 4e199e92)', () => {
+  const firstPoll = () => calls.find((call) => call.name === 'poll_connection' && !call.arguments.control_ack)
+
+  it('reports the configured model on the first poll of a connection nobody switched', async () => {
+    const client = clientDouble()
+    client.config.get = async () => ({ data: { model: 'anthropic/claude-sonnet-x' } })
+    await tick(client)
+    assert.deepEqual(firstPoll().arguments.agent_stats.model, { provider: 'anthropic', id: 'claude-sonnet-x' })
+  })
+
+  it('prefers the model of the last reply already in the session over the configured default', async () => {
+    const client = clientDouble()
+    client.session.messages = async () => ({ data: [{ info: { role: 'assistant', providerID: 'openai', modelID: 'gpt-x' }, parts: [] }] })
+    client.config.get = async () => ({ data: { model: 'anthropic/claude-sonnet-x' } })
+    await tick(client)
+    assert.deepEqual(firstPoll().arguments.agent_stats.model, { provider: 'openai', id: 'gpt-x' })
+  })
+
+  it('reports the model a reply actually ran once it is recorded', async () => {
+    runWithBond(opencodeSessionId, () => noteRuntimeModel({ providerID: 'moonshot', modelID: 'kimi-k3' }))
+    const client = clientDouble()
+    client.config.get = async () => ({ data: { model: 'anthropic/claude-sonnet-x' } })
+    await tick(client)
+    assert.deepEqual(firstPoll().arguments.agent_stats.model, { provider: 'moonshot', id: 'kimi-k3' })
+  })
+
+  it('sends no model when OpenCode has none to report', async () => {
+    await tick()
+    assert.equal(firstPoll().arguments.agent_stats, undefined)
+  })
+
+  it('reads a configured model whose id contains slashes', () => {
+    assert.deepEqual(parseConfiguredModel('openrouter/meta-llama/llama-5'), { providerID: 'openrouter', modelID: 'meta-llama/llama-5' })
+    assert.equal(parseConfiguredModel('no-slash'), undefined)
+    assert.equal(parseConfiguredModel('/x'), undefined)
+    assert.equal(parseConfiguredModel(undefined), undefined)
   })
 })

@@ -21,7 +21,9 @@ import {
   rejectPendingQuestion,
   runWithBondAsync,
   runWithBond,
+  noteRuntimeModel,
   resolveCurrentAssistantModel,
+  resolveOpenCodeAssistantModel,
   resetAnswerPostLatchForUserTurn,
   scheduleWorkTrailPost,
   settleAgentPostResult,
@@ -425,6 +427,11 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
         // The live work trail publishes mechanical progress only. Full answer text
         // is written exactly once by the model through post_session_message.
         scheduleWorkTrailPost(client, directory, sessionId)
+        // The model this reply actually ran, for the Agents page (item 4e199e92).
+        if (eventInfo?.role === 'assistant') {
+          const ran = resolveOpenCodeAssistantModel({ info: eventInfo }).model
+          if (ran) await inBond(async () => noteRuntimeModel(ran))
+        }
       } else if (event.type === 'session.error') {
         // Confirmed live: MiniMax connect failures emit session.error. Clear
         // busy and surface the payload into DevSpec — previously only the

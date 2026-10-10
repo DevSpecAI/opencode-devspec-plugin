@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.3
+
+### Your agent's model shows on the Agents page
+OpenCode now tells DevSpec which model it is running, so its card on the Agents page shows the model even when it is not in a session. Before, it only did so after you switched the model from DevSpec. It reports the model its latest reply ran, or before the first reply, the model already in use in the conversation or your configured default. Update the plugin and restart OpenCode.
+
 ## 0.11.2
 
 ### A commit may name several items
