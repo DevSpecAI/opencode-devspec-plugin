@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.4
+
+### No more instructions about DevSpec's retired conflict flags
+DevSpec no longer raises `possible_conflict` or offers `preview_conflict_resolution`, but the always-on DevSpec instructions still had a rule about forcing past a `possible_conflict` refusal, and `/devspec.remote` still named the preview tool. The rule is gone. `/devspec.remote` now says a memory or document flagged as possibly out of date is answered by fixing the record, or by saying it is still accurate, and that one item replacing another goes through `preview_supersession` and then `supersede_action_item`. Whether either commits or is queued stays the served contract's decision. The commit check no longer looks for a `possible_conflict` field the server never sends. Update the plugin and restart OpenCode.
+
 ## 0.11.3
 
 ### Your agent's model shows on the Agents page

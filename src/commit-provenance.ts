@@ -125,7 +125,7 @@ function isPresentFailure(value: unknown): boolean {
 function hasFailure(result: JsonRecord): boolean {
   if (result.success === false || result.ok === false || result.claim_success === false) return true
   if (isPresentFailure(result.error) || isPresentFailure(result.errors)) return true
-  if (isPresentFailure(result.possible_conflict) || isPresentFailure(result.conflict)) return true
+  if (isPresentFailure(result.conflict)) return true
   const status = typeof result.status === 'string' ? result.status.toLowerCase() : ''
   return ['error', 'failed', 'failure', 'conflict', 'conflicted', 'rejected', 'denied'].includes(status)
 }
