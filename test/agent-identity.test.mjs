@@ -15,7 +15,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
-import { AGENT_NAME } from '../dist/agent-identity.js'
+import { AGENT_NAME, PLUGIN_ID } from '../dist/agent-identity.js'
 
 /** This repo's plugin. Changing this line is changing which plugin this is. */
 const OWN_NAME = 'OpenCode'
@@ -36,6 +36,10 @@ function sourceFiles() {
 describe('AGENT_NAME', () => {
   it('is this plugin, not another one', () => {
     assert.equal(AGENT_NAME, OWN_NAME)
+  })
+
+  it("identifies to DevSpec as DevSpec's provider id for OpenCode", () => {
+    assert.equal(PLUGIN_ID, 'opencode')
   })
 
   it('is a non-empty, untrimmed-clean string', () => {

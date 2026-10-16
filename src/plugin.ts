@@ -36,7 +36,7 @@ import {
   ensureServeAuthEnv,
 } from './serve-auth.js'
 import { CommitProvenance } from './commit-provenance.js'
-import { connectionVersionArguments, observeHostVersion } from './plugin-version.js'
+import { connectionVersionArguments, identifyDevspecMcpServers, observeHostVersion } from './plugin-version.js'
 import {
   captureConnectionCapability,
   clearConnectionCapability,
@@ -123,7 +123,8 @@ function permissionRequestId(props: Record<string, unknown> | undefined): string
  * The DevSpec MCP connection itself is configured separately, via the `mcp`
  * block in the same `opencode.json` — this plugin does not register MCP
  * servers programmatically, it only adds hooks/behavior on top of the
- * connection OpenCode already has.
+ * connection OpenCode already has. The one thing it adds to that entry, at load
+ * and in memory only, is the `x-devspec-plugin` header (see the `config` hook).
  *
  * Note on the `event` hook below: OpenCode does NOT expose a standalone
  * `session.idle` hook function. Session-lifecycle notifications (idle,
@@ -367,6 +368,8 @@ export const DevSpecPlugin: Plugin = async ({ client, directory, serverUrl }) =>
     },
     config: async (cfg) => {
       registerBundledCommands(cfg)
+      // OpenCode's own DevSpec MCP calls say which plugin they come from too.
+      identifyDevspecMcpServers(cfg)
     },
     event: async ({ event }) => {
       // Never hijack bonds from background session.* noise — only tool.execute.after

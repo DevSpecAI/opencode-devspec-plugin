@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.0
+
+### OpenCode tells DevSpec it has the DevSpec plugin
+Every request OpenCode makes to DevSpec now says the DevSpec plugin is installed, and which version, as `x-devspec-plugin: opencode/0.12.0`. That covers OpenCode's own DevSpec MCP connection and the plugin's remote control, session plans and work trail. DevSpec uses it to recognise agents that have the plugin installed; it changes nothing you can do today. The plugin adds the header to your `mcp.devspec` entry while OpenCode loads, from the installed package's own version, so there is nothing to add to `opencode.jsonc` and nothing to update later. Update the plugin and restart OpenCode.
+
 ## 0.11.4
 
 ### No more instructions about DevSpec's retired conflict flags

@@ -5,7 +5,7 @@
  * (plain fetch + JSON-RPC), no Claude Code specifics to translate.
  */
 
-import { connectionVersionArguments } from './plugin-version.js'
+import { connectionVersionArguments, pluginHeaders } from './plugin-version.js'
 
 export interface McpToolCallArgs {
   mcpUrl: string
@@ -92,6 +92,9 @@ export async function mcpToolsCall({
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json, text/event-stream',
+        // Every in-process DevSpec call (register, poll, heartbeat, answer egress,
+        // manage_plan, trail) comes through here (item ae865d3e).
+        ...pluginHeaders(),
         ...(connectionCapability
           ? { 'x-devspec-connection-capability': connectionCapability }
           : {}),
