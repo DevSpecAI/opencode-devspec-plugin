@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.1
+
+### Documents are standing guides, references and runbooks
+`/devspec.remote` no longer tells your agent to record an ADR as a DevSpec document, or that "architecture" is a memory type. It now says a document is standing long-form material, with the tool descriptions setting out what that can be; a plan is a brief with tasks, a handoff or status goes on the task, and a decision, including an architecture choice, is a memory. Update the plugin and restart OpenCode.
+
 ## 0.12.0
 
 ### OpenCode tells DevSpec it has the DevSpec plugin
