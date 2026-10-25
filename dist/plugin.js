@@ -1,9 +1,9 @@
 import { createOpencodeClient as createOpencodeV2Client } from '@opencode-ai/sdk/v2';
-import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markOwnerGone, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recoverBondsFromStateFiles, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, resolveCurrentAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settleAutomationRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
+import { clearPermissionAsked, clearPendingQuestion, claimAgentAnswerPost, handleSessionIdle, handleQuestionAsked, handleSessionError, listOpenCodeBondSessions, logPoll, markOwnerGone, markPermissionAsked, postPermissionWaitNotice, pollAndDeliver, recoverBondsFromStateFiles, recordConnectionEventFromTool, bondLocalId, isBondedOpenCodeSession, rejectPendingQuestion, runWithBondAsync, noteRuntimeModel, resolveCurrentAssistantModel, resolveOpenCodeAssistantModel, resetAnswerPostLatchForUserTurn, scheduleWorkTrailPost, settleAgentPostResult, settleAutomationRunResult, shouldAutoAllowRemoteControlPermission, } from './remote-control.js';
 import { registerBundledCommands } from './register-commands.js';
 import { applyServeAuthToPluginClient, ensureServeAuthEnv, } from './serve-auth.js';
 import { CommitProvenance } from './commit-provenance.js';
-import { connectionVersionArguments, observeHostVersion } from './plugin-version.js';
+import { connectionVersionArguments, identifyDevspecMcpServers, observeHostVersion } from './plugin-version.js';
 import { captureConnectionCapability, clearConnectionCapability, createManagePlanTool, negotiateConnectionCapability, } from './manage-plan-tool.js';
 import { serializeTurnTrail } from './work-trail.js';
 // Interactive TUI starts open a localhost HTTP door. Mint (or reuse) a process-local
@@ -69,7 +69,8 @@ function permissionRequestId(props) {
  * The DevSpec MCP connection itself is configured separately, via the `mcp`
  * block in the same `opencode.json` — this plugin does not register MCP
  * servers programmatically, it only adds hooks/behavior on top of the
- * connection OpenCode already has.
+ * connection OpenCode already has. The one thing it adds to that entry, at load
+ * and in memory only, is the `x-devspec-plugin` header (see the `config` hook).
  *
  * Note on the `event` hook below: OpenCode does NOT expose a standalone
  * `session.idle` hook function. Session-lifecycle notifications (idle,
@@ -300,6 +301,8 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
         },
         config: async (cfg) => {
             registerBundledCommands(cfg);
+            // OpenCode's own DevSpec MCP calls say which plugin they come from too.
+            identifyDevspecMcpServers(cfg);
         },
         event: async ({ event }) => {
             // Never hijack bonds from background session.* noise — only tool.execute.after
@@ -356,6 +359,12 @@ export const DevSpecPlugin = async ({ client, directory, serverUrl }) => {
                 // The live work trail publishes mechanical progress only. Full answer text
                 // is written exactly once by the model through post_session_message.
                 scheduleWorkTrailPost(client, directory, sessionId);
+                // The model this reply actually ran, for the Agents page (item 4e199e92).
+                if (eventInfo?.role === 'assistant') {
+                    const ran = resolveOpenCodeAssistantModel({ info: eventInfo }).model;
+                    if (ran)
+                        await inBond(async () => noteRuntimeModel(ran));
+                }
             }
             else if (event.type === 'session.error') {
                 // Confirmed live: MiniMax connect failures emit session.error. Clear

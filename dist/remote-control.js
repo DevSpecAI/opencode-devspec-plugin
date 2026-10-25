@@ -583,7 +583,7 @@ export function modelStoryData(model) {
     };
 }
 function remoteControlAgentStats(state) {
-    const model = state?.remoteControlModel;
+    const model = state?.runtimeModel ?? state?.remoteControlModel;
     if (!model?.providerID || !model.modelID)
         return undefined;
     return {
@@ -595,6 +595,50 @@ function remoteControlAgentStats(state) {
         session: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, turns: 0 },
         at: new Date().toISOString(),
     };
+}
+function sameModel(a, b) {
+    return !!a && !!b && a.providerID === b.providerID && a.modelID === b.modelID;
+}
+/**
+ * Record the model OpenCode just ran (item 4e199e92). Called from the bonded
+ * session's own assistant `message.updated` events, inside that bond. Writes only
+ * when it changed, so a streaming reply costs one state write, not one per token.
+ */
+export function noteRuntimeModel(model) {
+    if (!model)
+        return;
+    const state = readState();
+    if (!state || sameModel(state.runtimeModel, model))
+        return;
+    patchState({ runtimeModel: model });
+}
+/** `provider/model` as OpenCode's config writes it; the model id may itself hold slashes. */
+export function parseConfiguredModel(raw) {
+    if (typeof raw !== 'string')
+        return undefined;
+    const slash = raw.indexOf('/');
+    if (slash <= 0 || slash === raw.length - 1)
+        return undefined;
+    return { providerID: raw.slice(0, slash).trim(), modelID: raw.slice(slash + 1).trim() };
+}
+/**
+ * Before this bond's session has replied, report what OpenCode will run: the last
+ * assistant model already in the session, else the configured default model. The
+ * caller tries it once per pump (see PumpState.runtimeModelSeeded); a later reply
+ * corrects it through noteRuntimeModel.
+ */
+async function seedRuntimeModel(client, sessionId) {
+    let model = (await resolveControlSlashModel(client, sessionId)) ?? undefined;
+    if (!model && typeof client.config?.get === 'function') {
+        try {
+            const cfg = unwrapSdkData(await withTimeout(client.config.get(), OPENCODE_SESSION_API_TIMEOUT_MS, 'runtime-model.config'));
+            model = parseConfiguredModel(cfg?.model);
+        }
+        catch (err) {
+            logPoll(`runtime model: could not read the configured model: ${err}`);
+        }
+    }
+    noteRuntimeModel(model);
 }
 function catalogModelsFromProviders(raw) {
     const data = (raw && typeof raw === 'object' ? raw : {});
@@ -2463,6 +2507,13 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         automationDispatchIds: persistedAutomationIds.ids,
     });
     retryAcceptanceRecoveries(pump);
+    if (!pump.runtimeModelSeeded) {
+        pump.runtimeModelSeeded = true;
+        if (!state.runtimeModel) {
+            await seedRuntimeModel(client, sessionId);
+            state = readState() ?? state;
+        }
+    }
     const acceptanceStage = (name, key, run) => ({
         name,
         run: () => {
@@ -3555,7 +3606,8 @@ export async function executeCanonicalControl(input) {
                 !configured.some((model) => model.provider === parsed.model.providerID && model.id === parsed.model.modelID)) {
                 throw new Error(`This OpenCode process does not have ${key} configured`);
             }
-            patchState({ remoteControlModel: parsed.model });
+            // What the next turn runs, so the Agents page shows it before that turn.
+            patchState({ remoteControlModel: parsed.model, runtimeModel: parsed.model });
             if (typeof client.session?.update === 'function') {
                 try {
                     const result = await withTimeout(client.session.update({

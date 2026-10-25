@@ -108,6 +108,14 @@ interface ConnectionState {
     remoteDispatchCursor?: string | null;
     /** Host-selected model for subsequent remote promptAsync turns. */
     remoteControlModel?: OpenCodeModelStamp | null;
+    /**
+     * The model OpenCode last actually ran in this bond's session, read off its own
+     * assistant message, or its configured default before the first reply (item
+     * 4e199e92). Reported as `agent_stats` so the Agents page shows the model even
+     * outside a DevSpec session; `remoteControlModel` alone is set only by a DevSpec
+     * set_model, so a connection nobody had switched never reported one.
+     */
+    runtimeModel?: OpenCodeModelStamp | null;
     /** Host-selected OpenCode model variant for subsequent remote turns. */
     remoteControlThinking?: string | null;
     /** Canonical controls executed locally; retained so ack retries never re-execute. */
@@ -399,6 +407,14 @@ export declare function resolveOpenCodeAssistantModel(message: {
 };
 /** Story `data` fragment when a model stamp is known. */
 export declare function modelStoryData(model: OpenCodeModelStamp | undefined): Record<string, unknown>;
+/**
+ * Record the model OpenCode just ran (item 4e199e92). Called from the bonded
+ * session's own assistant `message.updated` events, inside that bond. Writes only
+ * when it changed, so a streaming reply costs one state write, not one per token.
+ */
+export declare function noteRuntimeModel(model: OpenCodeModelStamp | undefined): void;
+/** `provider/model` as OpenCode's config writes it; the model id may itself hold slashes. */
+export declare function parseConfiguredModel(raw: unknown): OpenCodeModelStamp | undefined;
 /**
  * True when the latest assistant message still has an in-flight tool
  * (pending / running). Completed tools alone are not progress — the turn
