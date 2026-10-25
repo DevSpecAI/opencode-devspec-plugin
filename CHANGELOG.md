@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.2
+
+### Clean substantive task field partitioning
+Updated `instructions/devspec.md` and `commands/devspec.remote.md` so `create_task` and `update_task` partition task fields cleanly: why the task exists, speaker attribution/quotes, and desired outcome in `intent`; complete product behaviour and architectural or technical mechanism in natural English in `description` (duplicate and reversal screening reads `title`, `intent`, and `description`, never `ai_instructions`); plain-prose checkable conditions in `acceptance_criteria`; and raw file paths, line numbers, code snippets, CSS classes, and edit recipes in `ai_instructions`.
+
 ## 0.12.1
 
 ### Documents are standing guides, references and runbooks
