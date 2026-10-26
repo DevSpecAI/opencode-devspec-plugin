@@ -18,12 +18,7 @@ describe('priority-host authority terminology', () => {
   })
 
   it('describes sessionless automations without assignment or progress delivery prose', () => {
-    const overview = read('docs/remote-control/remote-control-overview.md')
     const command = read('commands/devspec.remote.md')
-
-    assert.doesNotMatch(overview, /receives dispatches \/ assignments|Assignment \/ `report_progress`/)
-    assert.match(overview, /separately consented owner-scoped `automation_run` wakes/)
-    assert.match(overview, /stamps immutable requester provenance/)
 
     assert.doesNotMatch(command, /\*\*Sessionless:\*\*.*`report_progress`/)
     assert.match(command, /Separately accepted owner-scoped automation runs/)

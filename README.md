@@ -1,18 +1,12 @@
 # DevSpec for OpenCode
 
-**The launcher is optional.** Start OpenCode normally and use this plugin's connection commands, or copy a command from DevSpec. This package does not bundle the separate DevSpec Launcher, install or update it, or register a background service or URL handler. Browser-launch convenience is provided by the separately installed app; see your [Agents settings](https://app.devspec.ai/settings/agents) in DevSpec for availability and setup.
-
 **Build on your team’s best thinking.**
 
-DevSpec is where your team, your knowledge and your agents build software together, made for AI-native development from the ground up.
+[DevSpec](https://devspec.ai) is where your team, your knowledge and your agents build software together, made for AI-native development from the ground up.
 
-DevSpec integration for [OpenCode](https://opencode.ai) — connects OpenCode to your DevSpec project over MCP, teaches it DevSpec's conventions (briefs, action items, memory), and ports the same `devspec.*` commands and remote-control support that already ship for Claude Code and Cursor.
+This plugin connects [OpenCode](https://opencode.ai) to your DevSpec project over MCP, loads DevSpec's project instructions (tasks, shared memory, and documents), and provides the `/devspec.remote` and `/devspec.remote-stop` commands for remote control from your phone or browser.
 
-OpenCode has no plugin marketplace yet, so setup is two manual steps: install the package, then paste two blocks into your **user-home** OpenCode config.
-
-The default file is `~/.config/opencode/opencode.jsonc` (Windows: `%USERPROFILE%\.config\opencode\opencode.jsonc`). Put the MCP token there once so every folder has DevSpec. Which project a run belongs to still comes from `git remote get-url origin` in the folder you open.
-
-A project-level `opencode.json` / `opencode.jsonc` in a repo also works — git remote still resolves the project — but it is optional and not the default. Do not copy the MCP JSON into every repo.
+---
 
 ## 1. Install
 
@@ -22,7 +16,7 @@ npm install --save-dev opencode-devspec-plugin
 
 ## 2. Configure `~/.config/opencode/opencode.jsonc`
 
-Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry loading this package:
+Add a `devspec` entry under `mcp`, load `opencode-devspec-plugin` under `plugin`, and point `instructions` at the bundled instructions file in your user-home OpenCode config (`~/.config/opencode/opencode.jsonc` on macOS/Linux, `%USERPROFILE%\.config\opencode\opencode.jsonc` on Windows):
 
 ```jsonc
 {
@@ -41,43 +35,41 @@ Add an `mcp` entry pointing at DevSpec's MCP endpoint, and a `plugin` entry load
 }
 ```
 
-Create your token on DevSpec's [Agents settings page](https://app.devspec.ai/settings/agents): choose **Create your token** and pick **Read & write**. It starts with `dvs_`. Paste it after `Bearer ` in place of `dvs_…`.
+Create your token on DevSpec's [Agents settings page](https://app.devspec.ai/settings/agents): choose **Create your token**, pick **Read & write**, and paste your `dvs_…` token after `Bearer `.
 
-**One token, everywhere.** The token is account-wide — use the *same* one in every tool and on every machine; don't mint one per machine. The project for a run is resolved from the repo's git remote, so a single token works across all your projects. It's retrievable, too: reveal and copy it again any time on the [Agents settings page](https://app.devspec.ai/settings/agents) (no show-once).
+**One token, everywhere.** Your token is account-wide — reuse the same token across every tool and every machine. You can reveal and copy it again any time on the [Agents settings page](https://app.devspec.ai/settings/agents). Which DevSpec project a run uses is resolved automatically from the repository's git remote (`git remote get-url origin`).
 
-You don't add anything else to that entry: while OpenCode loads, the plugin adds `x-devspec-plugin: opencode/<its version>` to the `devspec` server's headers, in memory only, so every DevSpec request OpenCode makes says the DevSpec plugin is installed and which version. Your file is never rewritten, and an update changes the version it reports.
-
-The URL above is DevSpec's production MCP host — the machine-facing API lives on `api.devspec.ai`, separate from the web app at `app.devspec.ai`. On a self-hosted DevSpec instance, use that instance's API host instead. The URL's `model_tools` names the connection plumbing OpenCode's model calls itself in `/devspec.remote` and `/devspec.remote-stop` (register, attach and detach): DevSpec lists only model tools plus those, so keep it on whichever host you use.
-
-> **Node.js 18+** is only needed for remote control and working a batch of items (isolated work branches, connection lifecycle) — plain MCP tool access works without it.
+While OpenCode loads, the plugin attaches `x-devspec-plugin: opencode/<version>` in memory so DevSpec recognises the installed plugin version automatically.
 
 ## 3. Verify
 
-Start OpenCode in a second DevSpec-tracked repo without copying the MCP JSON into that repo, and ask it to list your DevSpec action items — if the user-home config is wired correctly, it will call straight through.
+Start OpenCode in a DevSpec-tracked repository and ask it to list your DevSpec tasks.
 
-## What this package provides
+---
 
-- **MCP wiring guidance** — the config block above; DevSpec's MCP server itself needs no changes.
-- **Conventions file** (`instructions/devspec.md`) — DevSpec's workflow rules (briefs/action items, memory usage, pointer to the served implementation contract), auto-loaded via OpenCode's `instructions` config.
-- **Commit provenance** — `tool.execute` assistance for honestly readable `git commit -m` forms (including worktree `cd <path> &&` and `git -C`). Edits and unknown tools are never claim-gated. See [docs/commit-provenance.md](docs/commit-provenance.md).
-- **Two commands** (`commands/*.md`) — `devspec.remote` and `devspec.remote-stop`, same names as the Claude Code and Cursor plugins. They exist because connecting runs a real setup script; everything else is a sentence you say to the agent, which works in any host with the DevSpec MCP server.
-- **Batches** — tell the agent *"Work these DevSpec items in order: 4f2a, 9c1b, 2e7d"* and it reserves them so nobody else takes one mid-run, then claims and works them in order. DevSpec's web app has a copy button that writes that line.
-- **Shared session plans** — substantial multi-phase work can use the on-demand `manage_plan` path selected by the served implementation contract; routine turns carry no plan boilerplate. Attached remote sessions receive a strict current active-plan snapshot with room-wide read awareness.
-- **Remote control** — attach this OpenCode session to a DevSpec session for phone/web control, delivered via OpenCode's own session-message API rather than a file-based workaround.
+## Commands & usage
 
-## Developing this plugin
+| Command | What it does |
+|---|---|
+| `/devspec.remote` | Connect this OpenCode session to DevSpec's Agents page (`--session <id>` to attach to a room) |
+| `/devspec.remote-stop` | Disconnect this session from remote control |
 
-Working on remote-control / presence / poll code in this repo? From the plugin root run:
+For everything else, ask in plain language:
+
+```text
+Work on DevSpec task 4f2a
+Work these DevSpec tasks in order: 4f2a, 9c1b, 2e7d
+Create a DevSpec task for the login redirect bug
+Search DevSpec memories for authentication decisions
+```
+
+---
+
+## Development
 
 ```bash
 npm test
 ```
-
-That builds then runs the full unit suite (including presence-pump). Canonical detail — when to run it, what it covers, and the optional live smell-test — lives in [docs/remote-control/remote-control-opencode.md](docs/remote-control/remote-control-opencode.md#running-tests-after-a-remote-control-change).
-
-## Status
-
-This package is under active development — see the parent DevSpec brief for the full list of in-progress pieces.
 
 ## License
 

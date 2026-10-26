@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.3
+
+### Current task search tools and customer-facing documentation
+Updated `instructions/devspec.md` and `commands/devspec.remote.md` to reference `search_index`, `get_tasks`, `search_tasks`, `supersede_task`, and `get_task_history` rather than retired action-item tool names, and streamlined `README.md` for customer setup.
+
 ## 0.12.2
 
 ### Clean substantive task field partitioning
