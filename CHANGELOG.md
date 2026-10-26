@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### New DevSpec settings page names
+The README uses DevSpec's new settings page names: the personal settings page where you create or reveal your token is now **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. No runtime text changed.
+
 ## 0.12.3
 
 ### Current task search tools and customer-facing documentation

@@ -35,9 +35,9 @@ Add a `devspec` entry under `mcp`, load `opencode-devspec-plugin` under `plugin`
 }
 ```
 
-Create your token on DevSpec's [Agents settings page](https://app.devspec.ai/settings/agents): choose **Create your token**, pick **Read & write**, and paste your `dvs_…` token after `Bearer `.
+Create your token on DevSpec's [Agent setup page](https://app.devspec.ai/settings/agents): choose **Create your token**, pick **Read & write**, and paste your `dvs_…` token after `Bearer `.
 
-**One token, everywhere.** Your token is account-wide — reuse the same token across every tool and every machine. You can reveal and copy it again any time on the [Agents settings page](https://app.devspec.ai/settings/agents). Which DevSpec project a run uses is resolved automatically from the repository's git remote (`git remote get-url origin`).
+**One token, everywhere.** Your token is account-wide — reuse the same token across every tool and every machine. You can reveal and copy it again any time on the [Agent setup page](https://app.devspec.ai/settings/agents). Which DevSpec project a run uses is resolved automatically from the repository's git remote (`git remote get-url origin`).
 
 While OpenCode loads, the plugin attaches `x-devspec-plugin: opencode/<version>` in memory so DevSpec recognises the installed plugin version automatically.
 
