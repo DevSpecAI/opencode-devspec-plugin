@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.12.4
+
+### Required task dismissal categories
+Updated `instructions/devspec.md` and `commands/devspec.remote.md` for required task dismissal categories (`duplicate`, `replaced`, `outdated`, and `not_wanted`) on `update_task` (`lifecycle: "dismissed"`), including `target_task_id` linking, held-replacement behaviour for unmerged replacements, and required rejection notes on `not_wanted`.
 
 ### New DevSpec settings page names
 The README uses DevSpec's new settings page names: the personal settings page where you create or reveal your token is now **Agent setup**, and the project settings page for agent execution rules is now **Agent rules**. No runtime text changed.
