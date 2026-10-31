@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.5
+
+### Live work-trail streaming during sessionless automation runs
+When OpenCode runs an automation without being attached to a room session, `postWorkTrail` now streams live tool and reasoning progress over `connection_id` so anyone watching the running automation sees real-time progress. Placeholder `Working…` seed text remains scoped to attached room sessions, unattached local prompts stay silent, and pre-claim trail posts before `claim_automation_run` roll back their cached hash so the next update retries cleanly.
+
 ## 0.12.4
 
 ### Required task dismissal categories
