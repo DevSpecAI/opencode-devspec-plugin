@@ -1371,6 +1371,7 @@ export async function checkBusyStall(client, directory, sessionId) {
     // cause. `failOpenTrailTurn` above already cleared the non-unclaiming parts
     // of inject-turn state; this call additionally unclaims.
     clearInjectTurnState({ unclaim: true });
+    patchState({ activeAutomationRunIds: [] });
     await setBusy(directory, false);
 }
 /**
@@ -1405,6 +1406,7 @@ export async function handleSessionError(directory, event) {
     // in flight — unclaim its command ids so they can re-inject instead of
     // being silently swallowed forever by the delivery dedup set.
     clearInjectTurnState({ unclaim: true });
+    patchState({ activeAutomationRunIds: [] });
     await setBusy(directory, false);
 }
 /**
@@ -4017,9 +4019,10 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             logPoll(`postWorkTrail: no auth (${auth.error ?? 'token/url missing'})`);
             return;
         }
-        if (!state?.sessionId || !state.connectionId) {
-            logPoll(`postWorkTrail: no session/connection ` +
-                `(sessionId=${state?.sessionId ?? 'none'} connectionId=${state?.connectionId ?? 'none'})`);
+        const hasActiveAutomationRun = (state?.activeAutomationRunIds?.length ?? 0) > 0;
+        if (!state?.connectionId || (!state.sessionId && !hasActiveAutomationRun)) {
+            logPoll(`postWorkTrail: no session/automation ` +
+                `(sessionId=${state?.sessionId ?? 'none'} activeAutomationRuns=${state?.activeAutomationRunIds?.length ?? 0} connectionId=${state?.connectionId ?? 'none'})`);
             return;
         }
         if (!state.busy && !state.awaitingRemoteReply) {
@@ -4059,10 +4062,10 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             return;
         }
         // Turn-start seed (item 05a88ed5): only substitute the placeholder when
-        // there is genuinely nothing to show yet. Real content always wins, so a
-        // seed call racing behind a message.updated-triggered post never clobbers
-        // it — "one trail row" holds, never an orphan second bubble.
-        const usingSeed = seed && !rawTrail.trim();
+        // attached to a room session and there is genuinely nothing to show yet.
+        // Sessionless automation runs never seed "Working…" into captured_output.
+        const allowSeed = seed && Boolean(state.sessionId);
+        const usingSeed = allowSeed && !rawTrail.trim();
         const trail = usingSeed ? TRAIL_SEED_TEXT : rawTrail;
         const trailHash = hashPostedContent(trail);
         if (!shouldPostTrail({
@@ -4072,7 +4075,7 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             lastPostedAt: state.lastTrailPostedAt ?? null,
             now: Date.now(),
             force,
-            seed,
+            seed: allowSeed,
         })) {
             logPoll(`postWorkTrail: shouldPostTrail=false ` +
                 `(empty=${!trail.trim()} hash_unchanged=${trailHash === (state.lastTrailHash ?? null)} ` +
@@ -4100,9 +4103,13 @@ export async function postWorkTrail(client, directory, sessionId, { force = fals
             }
         }
         catch (err) {
-            // Roll the hash back so the next update retries rather than assuming this
-            // body already landed.
-            patchState({ lastTrailHash: state.lastTrailHash ?? null });
+            // Roll the hash and timestamp back so the next update (e.g. right after
+            // claim_automation_run transitions a sessionless run to running) retries
+            // immediately rather than assuming this body already landed.
+            patchState({
+                lastTrailHash: state.lastTrailHash ?? null,
+                lastTrailPostedAt: state.lastTrailPostedAt ?? null,
+            });
             logPoll(`postWorkTrail: post_session_message(phase=trail) failed: ${err}`);
         }
         finally {
@@ -4236,6 +4243,7 @@ export function settleAgentPostResult(toolName, result, callId) {
     clearPromptTransactions(state.connectionId);
     clearInjectTurnState();
     patchState({
+        activeAutomationRunIds: [],
         busy: false,
         busySince: null,
         stallWarnedAt: null,
@@ -4323,6 +4331,7 @@ export async function handleSessionIdle(directory) {
         return;
     clearPromptTransactions(fresh.connectionId);
     patchState({
+        activeAutomationRunIds: [],
         busy: false,
         busySince: null,
         stallWarnedAt: null,
