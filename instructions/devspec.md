@@ -8,6 +8,8 @@ This project is connected to DevSpec over MCP. DevSpec indexes the codebase and 
 4. **Respect project standards.** Read applicable conventions and decisions in full before relying on or contradicting them.
 5. **Deliver attached-conversation answers explicitly.** In a bonded local terminal turn, call `post_session_message` exactly once before the final response and pass only the complete answer body as `message`. Remote injected turns carry the same instruction. The plugin binds current connection identity and correlation; there is no assistant-text mirror fallback. The `devspec.remote` connect/status handshake itself must not post. Writing @ and a person's name in the answer notifies that person, if they are in the room or on the project.
 
+6. **Rule the checks DevSpec sends you.** DevSpec sends every check on a change — your own changes included — as a check job on your wake channel. Take it with `claim_check_job`, rule every entry with `record_check_rulings` using the definition it carries (read any linked supporting document or uploaded file in full with `get_resource` first), then carry on with what you were doing or act on what it found. If you cannot rule it, hand it back.
+
 ## Session plans — high threshold, on demand
 
 The served implementation contract decides whether session-plan tracking is warranted. Routine reading, search/inspect/answer, and other work with no material shared interruption, coordination, or handoff value should add **no plan** and no plan prompt footprint.

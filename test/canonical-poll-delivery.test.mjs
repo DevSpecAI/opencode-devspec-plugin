@@ -19,9 +19,13 @@ import {
   rememberOpenCodeBond,
   runWithBond,
   runWithBondAsync,
+  claimAgentAnswerPost,
+  handleSessionIdle,
+  settleAgentPostResult,
   settleAutomationRunResult,
   writeState,
 } from '../dist/remote-control.js'
+import { checkJobWakeText } from '../dist/check-jobs.js'
 import {
   captureConnectionCapability,
   clearConnectionCapability,
@@ -60,6 +64,24 @@ function automationWake(over = {}) {
     id,
     run_id: over.run_id ?? id,
     kind: 'automation_run',
+  }
+}
+
+const checkJobId = 'c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1'
+function checkJobWake(over = {}) {
+  const id = over.id ?? checkJobId
+  return {
+    id,
+    kind: 'check_job',
+    check_job_id: id,
+    check_kind: 'conflict',
+    record: { type: 'task', id: 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2', title: 'Fix the login redirect' },
+    entries: 2,
+    high_risk: 1,
+    yours: true,
+    offered_at: '2026-11-04T03:00:00.000Z',
+    delivery_connection_id: connectionId,
+    ...over,
   }
 }
 
@@ -494,6 +516,8 @@ describe('pollAndDeliver canonical transaction integration', () => {
       assert.equal(call.arguments.ingress_version, 1)
       assert.equal(call.arguments.delegated_scope_version, 1)
       assert.equal(call.arguments.active_plan_projection_version, 1)
+      // A poll that leaves it out tells DevSpec this host stopped reading check jobs.
+      assert.equal(call.arguments.check_job_version, 1)
     }
   })
 
@@ -1208,5 +1232,114 @@ describe('the model OpenCode is running reaches the Agents page (item 4e199e92)'
     assert.equal(parseConfiguredModel('no-slash'), undefined)
     assert.equal(parseConfiguredModel('/x'), undefined)
     assert.equal(parseConfiguredModel(undefined), undefined)
+  })
+})
+
+// Check jobs (DevSpec item 55d71b0c; this plugin's item 0793170c). What could break:
+// a check job riding in a command's or an automation run's prompt, being delivered
+// twice when the server lists it again, opening a Working trail no answer closes, or
+// the connection going idle while the agent still rules a job it took (DevSpec then
+// drops it).
+describe('pollAndDeliver check jobs', () => {
+  const unchanged = () => ({ connection_id: connectionId, session_id: devspecSessionId, changed: false, cursor_v2: 'live-v2-next', dispatch_cursor: 'dispatch-next' })
+  const lastPoll = () => calls.filter((call) => call.name === 'poll_connection' && !call.arguments.control_ack).at(-1)
+  const state = () => runWithBond(opencodeSessionId, () => readState())
+
+  it('wakes a check job as its own turn, once, busy until the session settles, with no trail', async () => {
+    pollResults.push(changed({ dispatches: [checkJobWake()] }))
+    await tick(); await settle()
+
+    assert.equal(promptCalls.length, 1)
+    const text = promptCalls[0].body.parts[0].text
+    assert.ok(text.includes(checkJobWakeText(checkJobWake())), text)
+    assert.match(text, new RegExp(`check_job_id=${checkJobId}`))
+    assert.doesNotMatch(text, /claim_automation_run|Required answer delivery/)
+    let current = state()
+    assert.equal(current.busy, true)
+    assert.equal(current.awaitingRemoteReply ?? false, false, 'a check job owns no command answer')
+    assert.deepEqual(current.activeCheckJobIds, [checkJobId])
+    assert.deepEqual(current.deliveredAutomationDispatchIds, [checkJobId])
+    assert.equal(current.remoteDispatchCursor, 'dispatch-next')
+    assert.ok(calls.some((call) => call.name === 'heartbeat_connection' && call.arguments.busy === true))
+    assert.equal(calls.some((call) => call.name === 'post_session_message'), false, 'no Working trail for a check job turn')
+
+    // The server lists every open job on every poll until it is ruled or dropped.
+    pollResults.push(changed({ dispatches: [checkJobWake()] }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1, 'a re-listed job is not delivered again')
+    assert.equal(lastPoll().arguments.busy, true)
+
+    // Telling the person something mid-turn does not end the turn that is ruling.
+    runWithBond(opencodeSessionId, () => claimAgentAnswerPost('call-1'))
+    assert.equal(runWithBond(opencodeSessionId, () => settleAgentPostResult('post_session_message', { message_id: 'm-1' }, 'call-1')), true)
+    assert.equal(state().busy, true)
+
+    await runWithBondAsync(opencodeSessionId, () => handleSessionIdle(process.cwd()))
+    current = state()
+    assert.equal(current.busy, false)
+    assert.deepEqual(current.activeCheckJobIds, [])
+    pollResults.push(unchanged())
+    await tick(); await settle()
+    assert.equal(lastPoll().arguments.busy, false)
+    assert.equal(lastPoll().arguments.check_job_version, 1)
+    assert.equal(promptCalls.length, 1)
+  })
+
+  it('never rides in an automation run prompt: it waits for that turn to settle, then gets its own', async () => {
+    pollResults.push(changed({ dispatches: [automationWake({ id: 'play-before-check', run_id: 'run-before-check' }), checkJobWake()] }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1)
+    assert.match(promptCalls[0].body.parts[0].text, /claim_automation_run/)
+    assert.doesNotMatch(promptCalls[0].body.parts[0].text, /claim_check_job/)
+    let current = state()
+    assert.deepEqual(current.deliveredAutomationDispatchIds, ['play-before-check'])
+    assert.deepEqual(current.deferredAutomationDispatches.map((dispatch) => dispatch.id), [checkJobId])
+
+    assert.equal(runWithBond(opencodeSessionId, () =>
+      settleAutomationRunResult('devspec_record_automation_run', { status: 'succeeded' }, { run_id: 'run-before-check' })), true)
+    pollResults.push(unchanged())
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
+    assert.match(promptCalls[1].body.parts[0].text, /claim_check_job/)
+    assert.doesNotMatch(promptCalls[1].body.parts[0].text, /claim_automation_run/)
+    current = state()
+    assert.deepEqual(current.deliveredAutomationDispatchIds, ['play-before-check', checkJobId])
+    assert.deepEqual(current.deferredAutomationDispatches, [])
+  })
+
+  it('holds a check job arriving during a command turn and delivers it after the turn settles', async () => {
+    pollResults.push(changed({ ingress: ingress([command(message1, 1, provenance1, 'canonical first', true)]) }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1)
+    pollResults.push(changed({ ingress: ingress([]), dispatches: [checkJobWake()] }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1, 'never injected into the running command turn')
+    assert.equal(state().deferredAutomationDispatches?.[0]?.id, checkJobId)
+
+    await runWithBondAsync(opencodeSessionId, () => handleSessionIdle(process.cwd()))
+    pollResults.push(unchanged())
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 2)
+    assert.match(promptCalls[1].body.parts[0].text, /claim_check_job/)
+  })
+
+  it('keeps automation runs arriving as before while any other shape stays inert', async () => {
+    const extraKey = { ...checkJobWake({ id: 'c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3' }), title: 'record text has no place here' }
+    const { yours: _yours, ...missingKey } = checkJobWake({ id: 'c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4' })
+    const elsewhere = checkJobWake({ id: 'c5c5c5c5-c5c5-4c5c-8c5c-c5c5c5c5c5c5', delivery_connection_id: delegateId })
+    pollResults.push(changed({
+      dispatches: [extraKey, missingKey, elsewhere, { id: 'unknown-1', kind: 'review_job' }, automationWake({ id: 'play-still', run_id: 'run-still' })],
+    }))
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1)
+    assert.match(promptCalls[0].body.parts[0].text, /claim_automation_run/)
+    assert.equal(runWithBond(opencodeSessionId, () =>
+      settleAutomationRunResult('devspec_record_automation_run', { status: 'succeeded' }, { run_id: 'run-still' })), true)
+    pollResults.push(unchanged())
+    await tick(); await settle()
+    assert.equal(promptCalls.length, 1, 'no malformed or misaddressed check job is ever delivered')
+    const current = state()
+    assert.deepEqual(current.deliveredAutomationDispatchIds, ['play-still'])
+    assert.deepEqual(current.deferredAutomationDispatches ?? [], [])
   })
 })

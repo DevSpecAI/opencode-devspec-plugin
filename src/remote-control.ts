@@ -54,6 +54,7 @@ import {
   type CanonicalControl,
   type CanonicalIngress,
 } from './remote-ingress.js'
+import { CHECK_JOB_VERSION, isCheckJobWake, renderCheckJobTurn, type CheckJobWake } from './check-jobs.js'
 import {
   HOLD_HTTP_GRACE_MS,
   createCarryBuffer,
@@ -366,6 +367,12 @@ interface ConnectionState {
   deferredAutomationDispatchCursor?: string | null
   /** Accepted automation runs whose recorded outcomes can settle the current prompt. */
   activeAutomationRunIds?: string[]
+  /**
+   * Check jobs (55d71b0c) the current OpenCode turn was woken to rule. The turn
+   * belongs to no command: it posts no work trail, and it stays busy until OpenCode
+   * settles the session, because DevSpec drops a taken job once its taker stops working.
+   */
+  activeCheckJobIds?: string[]
   /**
    * Our own last-known assertion of heartbeat_connection's `busy` flag —
    * the SOLE signal that drives the "OpenCode is working…" indicator on the
@@ -1885,7 +1892,7 @@ export async function checkBusyStall(
   // cause. `failOpenTrailTurn` above already cleared the non-unclaiming parts
   // of inject-turn state; this call additionally unclaims.
   clearInjectTurnState({ unclaim: true })
-  patchState({ activeAutomationRunIds: [] })
+  patchState({ activeAutomationRunIds: [], activeCheckJobIds: [] })
   await setBusy(directory, false)
 }
 
@@ -1919,7 +1926,7 @@ export async function handleSessionError(directory: string, event: unknown): Pro
   // in flight — unclaim its command ids so they can re-inject instead of
   // being silently swallowed forever by the delivery dedup set.
   clearInjectTurnState({ unclaim: true })
-  patchState({ activeAutomationRunIds: [] })
+  patchState({ activeAutomationRunIds: [], activeCheckJobIds: [] })
   await setBusy(directory, false)
 }
 
@@ -3097,6 +3104,21 @@ export function logConnectionEndedStory(input: {
  * What the pump should do after one poll. `delayMs: 0` is the normal answer — the
  * server HELD the request, so the wait already happened and we go straight back in.
  */
+/**
+ * The ingress features every `poll_connection` call negotiates, the main hold and
+ * the context-wipe and control acks alike: a poll that leaves one out tells DevSpec
+ * this host stopped reading it. `check_job_version` says this plugin reads check
+ * jobs beside automation runs in `dispatches[]`; DevSpec offers them only while it is sent.
+ */
+export function pollNegotiationArgs() {
+  return {
+    ingress_version: REMOTE_INGRESS_VERSION,
+    delegated_scope_version: DELEGATED_SCOPE_VERSION,
+    active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
+    check_job_version: CHECK_JOB_VERSION,
+  }
+}
+
 export interface PollOutcome {
   delayMs: number
   /** The connection is gone server-side: stop pumping and do NOT restart. */
@@ -3323,9 +3345,7 @@ export async function pollAndDeliver(
         ...(pump.needsSeed ? { catch_up: true } : {}),
         ...(pump.catchUpCursor ? { catch_up_cursor: pump.catchUpCursor } : {}),
         ...(pump.dispatchCursor ? { dispatch_cursor: pump.dispatchCursor } : {}),
-        ingress_version: REMOTE_INGRESS_VERSION,
-        delegated_scope_version: DELEGATED_SCOPE_VERSION,
-        active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
+        ...pollNegotiationArgs(),
         ...(remoteControlAgentStats(state) ? { agent_stats: remoteControlAgentStats(state) } : {}),
       },
       timeoutMs: hold.waitMs + HOLD_HTTP_GRACE_MS,
@@ -3393,9 +3413,7 @@ export async function pollAndDeliver(
           wait_ms: 0,
           context_wipe_ack: true,
           busy: false,
-          ingress_version: REMOTE_INGRESS_VERSION,
-          delegated_scope_version: DELEGATED_SCOPE_VERSION,
-          active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
+          ...pollNegotiationArgs(),
         },
         timeoutMs: MCP_SHORT_CALL_TIMEOUT_MS,
       })
@@ -3490,6 +3508,7 @@ export async function pollAndDeliver(
       answerPostProcessId: null,
       answerPostedThisTurn: false,
       activeAutomationRunIds: [],
+      activeCheckJobIds: [],
       activeTrailMessageId: null,
       pendingQuestion: null,
       pendingPermissions: [],
@@ -3572,21 +3591,32 @@ export async function pollAndDeliver(
     }
   }
 
-  // Explicit automation dispatch is a separate owner-scoped workflow. Extract and
-  // schedule it before canonical parsing so an unsupported conversation envelope
-  // cannot block a valid automation. Unknown work-shaped dispatches remain inert.
+  // Explicit automation dispatch is a separate owner-scoped workflow, and a check job
+  // (55d71b0c) is a check DevSpec asks this agent to rule. Both arrive in dispatches[]
+  // and share this lane, its deferral and its delivered-id dedupe. Extract and schedule
+  // them before canonical parsing so an unsupported conversation envelope cannot block
+  // either. Unknown work-shaped dispatches remain inert. One kind per prompt,
+  // automation runs first: a check job never rides in an automation run's prompt,
+  // whose recorded outcome ends the turn, so it waits for the next one.
   const offeredDispatches: any[] = Array.isArray(res?.dispatches) ? res.dispatches : []
   const persistedAutomationDispatches = state.deferredAutomationDispatches ?? []
+  const laneConnectionId = state.connectionId
+  const isLaneDispatch = (dispatch: unknown): dispatch is Record<string, unknown> =>
+    isAutomationRunWake(dispatch) || isCheckJobWake(dispatch, laneConnectionId)
   const automationDispatchesById = new Map<string, any>()
   for (const dispatch of [...persistedAutomationDispatches, ...offeredDispatches]) {
-    if (isAutomationRunWake(dispatch)) {
+    if (isLaneDispatch(dispatch)) {
       automationDispatchesById.set(String(dispatch.id), dispatch)
     }
   }
-  const freshDispatches = [...automationDispatchesById.values()].filter((dispatch) =>
-    isAutomationRunWake(dispatch) &&
+  const pendingDispatches = [...automationDispatchesById.values()].filter((dispatch) =>
+    isLaneDispatch(dispatch) &&
     !pump.deliveredAutomationDispatchIds.has(String(dispatch.id)),
   )
+  const pendingAutomations = pendingDispatches.filter((dispatch) => isAutomationRunWake(dispatch))
+  const freshDispatches = pendingAutomations.length > 0 ? pendingAutomations : pendingDispatches
+  const heldBackDispatches = pendingDispatches.filter((dispatch) => !freshDispatches.includes(dispatch))
+  const checkJobBatch = freshDispatches.length > 0 && pendingAutomations.length === 0
   const automationDispatchCursor = state.deferredAutomationDispatchCursor ??
     (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor ? res.dispatch_cursor : null)
   const commitAutomationCursor = (): boolean => {
@@ -3604,59 +3634,71 @@ export async function pollAndDeliver(
     )
     if (automationBlocked) {
       patchState({
-        deferredAutomationDispatches: structuredClone(freshDispatches),
+        deferredAutomationDispatches: structuredClone(pendingDispatches),
         deferredAutomationDispatchCursor: automationDispatchCursor,
       })
-      logPoll(`deferring ${freshDispatches.length} automation dispatch(es) until the active OpenCode turn settles`)
+      logPoll(`deferring ${pendingDispatches.length} dispatch(es) until the active OpenCode turn settles`)
       return { delayMs: 1000, stop: false }
     }
+    const lane = checkJobBatch ? 'check_job' : 'automation'
     const automationDispatchIds = freshDispatches.map((dispatch) => dispatch.id as string)
     const automationRunIds = freshDispatches
       .map((dispatch) => dispatch.run_id)
       .filter((runId): runId is string => typeof runId === 'string' && runId.length > 0)
-    const automationKey = `automation:${automationDispatchIds.join(',')}`
+    const automationKey = `${lane}:${automationDispatchIds.join(',')}`
     const automationAcceptanceStages = (): AcceptanceBookkeepingStage[] => [
-      acceptanceStage('automation_active_runs', automationKey, () => {
+      ...(checkJobBatch ? [] : [acceptanceStage('automation_active_runs', automationKey, () => {
         if (!patchState({ activeAutomationRunIds: automationRunIds })) {
           throw new Error('active automation run ids were not persisted')
         }
-      }),
-      acceptanceStage('automation_memory_ids', automationKey, () => {
+      })]),
+      acceptanceStage(`${lane}_memory_ids`, automationKey, () => {
         for (const id of automationDispatchIds) pump.deliveredAutomationDispatchIds.add(id)
       }),
-      acceptanceStage('automation_persisted_ids', automationKey, () => {
+      acceptanceStage(`${lane}_persisted_ids`, automationKey, () => {
         if (!patchState({
           deliveredAutomationDispatchIds: [...pump.deliveredAutomationDispatchIds].slice(-50),
-          deferredAutomationDispatches: [],
+          deferredAutomationDispatches: structuredClone(heldBackDispatches),
           deferredAutomationDispatchCursor: null,
         })) {
-          throw new Error('delivered automation ids were not persisted')
+          throw new Error('delivered dispatch ids were not persisted')
         }
       }),
-      acceptanceStage('automation_dispatch_cursor', automationKey, () => {
-        if (!commitAutomationCursor()) throw new Error('automation dispatch cursor was not persisted')
+      acceptanceStage(`${lane}_dispatch_cursor`, automationKey, () => {
+        if (!commitAutomationCursor()) throw new Error('dispatch cursor was not persisted')
       }),
     ]
     if (pump.promptTransactions.get(automationKey) === 'accepted') {
-      logPoll(`suppressing in-process reoffer of host-accepted automation ${automationKey}`)
+      logPoll(`suppressing in-process reoffer of host-accepted dispatch ${automationKey}`)
     } else if (!pump.acceptingAutomation) {
       patchState({
-        deferredAutomationDispatches: structuredClone(freshDispatches),
+        deferredAutomationDispatches: structuredClone(pendingDispatches),
         deferredAutomationDispatchCursor: automationDispatchCursor,
       })
       pump.acceptingAutomation = { key: automationKey, automationDispatchIds }
       pump.promptTransactions.set(automationKey, 'pending')
-      const automationCommands = freshDispatches.map((dispatch) => ({
-        id: `dispatch:${dispatch.id}`,
-        created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
-        addressed_to: res.addressed_to,
-        authority: { kind: 'owner', capabilities: ['full'] },
-        content: automationRunCommandText(dispatch),
-        dispatch_model: dispatch.dispatch_model,
-      }))
-      const text = renderInjectedTurn({ commands: automationCommands, context: null })
-      const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model)
-      const model = modelExtract.model ?? state.remoteControlModel ?? undefined
+      let text: string
+      let model: { providerID: string; modelID: string } | undefined
+      if (checkJobBatch) {
+        text = renderCheckJobTurn(freshDispatches as CheckJobWake[])
+        model = state.remoteControlModel ?? undefined
+        // Before the prompt, so nothing in the turn opens a trail for it (postWorkTrail).
+        patchState({ activeCheckJobIds: automationDispatchIds })
+      } else {
+        const automationCommands = freshDispatches.map((dispatch) => ({
+          id: `dispatch:${dispatch.id}`,
+          created_at: typeof dispatch.created_at === 'string' ? dispatch.created_at : new Date().toISOString(),
+          addressed_to: res.addressed_to,
+          authority: { kind: 'owner', capabilities: ['full'] },
+          content: automationRunCommandText(dispatch),
+          dispatch_model: dispatch.dispatch_model,
+        }))
+        text = renderInjectedTurn({ commands: automationCommands, context: null })
+        const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model)
+        model = modelExtract.model ?? state.remoteControlModel ?? undefined
+      }
+      // A check job's turn is busy from the moment it is handed over until OpenCode
+      // settles the session (handleSessionIdle), exactly like an automation run's.
       await setBusy(directory, true)
       const injectStateKey = sessionId
       void runWithBondAsync(injectStateKey, () => deliverInjectedTurn({
@@ -3679,9 +3721,10 @@ export async function pollAndDeliver(
         onRejected: () => {
           pump.promptTransactions.delete(automationKey)
           if (pump.acceptingAutomation?.key === automationKey) pump.acceptingAutomation = null
+          if (checkJobBatch) patchState({ activeCheckJobIds: [] })
         },
         shouldCleanupRejectedTurn: () => pump.promptTransactions.size === 0,
-      })).catch((err) => logPoll(`automation prompt delivery failed: ${err}`))
+      })).catch((err) => logPoll(`${lane} prompt delivery failed: ${err}`))
     }
   }
 
@@ -4520,9 +4563,7 @@ async function acknowledgeCanonicalControl(input: {
       agent_name: AGENT_NAME,
       wait_ms: 0,
       busy: input.state.busy ?? false,
-      ingress_version: REMOTE_INGRESS_VERSION,
-      delegated_scope_version: DELEGATED_SCOPE_VERSION,
-      active_plan_projection_version: ACTIVE_PLAN_PROJECTION_VERSION,
+      ...pollNegotiationArgs(),
       control_ack: input.controlId,
       ...(input.modelCatalog ? { model_catalog: input.modelCatalog } : {}),
       ...(remoteControlAgentStats(input.state) ? { agent_stats: remoteControlAgentStats(input.state) } : {}),
@@ -4974,6 +5015,12 @@ export async function postWorkTrail(
       logPoll(`postWorkTrail: not busy/awaiting (busy=${state.busy} awaiting=${state.awaitingRemoteReply})`)
       return
     }
+    // A turn woken to rule check jobs belongs to no command: a trail would sit in the
+    // room as a Working bubble no answer ever closes (item 0793170c).
+    if ((state.activeCheckJobIds?.length ?? 0) > 0 && !hasActiveAutomationRun && !state.awaitingRemoteReply) {
+      logPoll(`postWorkTrail: check job turn (${state.activeCheckJobIds?.length}) — no trail`)
+      return
+    }
 
     const key = trailGuardKey(sessionId)
     const guard = trailGuards.get(key) ?? { inFlight: false, pending: false }
@@ -5213,14 +5260,20 @@ export function settleAgentPostResult(toolName: string, result: unknown, callId:
 
   clearPromptTransactions(state.connectionId)
   clearInjectTurnState()
+  // A check job's turn is still ruling after it tells the person something, so it
+  // stays busy until OpenCode settles the session (handleSessionIdle): DevSpec drops
+  // a job it took the moment its taker stops working.
+  const checkJobTurn = (state.activeCheckJobIds?.length ?? 0) > 0
   patchState({
     activeAutomationRunIds: [],
-    busy: false,
-    busySince: null,
-    stallWarnedAt: null,
-    stallProgressAssistantId: null,
-    stallActiveToolSlides: null,
-    stallReasoningFingerprint: null,
+    ...(checkJobTurn ? {} : {
+      busy: false,
+      busySince: null,
+      stallWarnedAt: null,
+      stallProgressAssistantId: null,
+      stallActiveToolSlides: null,
+      stallReasoningFingerprint: null,
+    }),
     permissionAskedPending: false,
     permissionAskedAt: null,
     pendingPermissions: [],
@@ -5309,6 +5362,7 @@ export async function handleSessionIdle(directory: string): Promise<void> {
   clearPromptTransactions(fresh.connectionId)
   patchState({
     activeAutomationRunIds: [],
+    activeCheckJobIds: [],
     busy: false,
     busySince: null,
     stallWarnedAt: null,

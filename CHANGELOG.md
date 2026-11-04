@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.0
+
+### Rule DevSpec's checks as check jobs
+Every poll (the main hold and the context-wipe and control acknowledgements) now sends `check_job_version: 1`, so DevSpec can send this agent the checks on a change, its own changes included, as check jobs beside automation runs. A check job is accepted only in its exact shape, addressed to this connection; automation runs arrive exactly as before, and any other dispatch stays inert. Each job is delivered once by its id, as its own OpenCode turn after any running turn settles, and never inside a command or an automation run. That turn opens with one line naming the record: take the job with `claim_check_job`, rule every entry with `record_check_rulings`, then carry on.
+
+The connection reports busy from the moment a job is handed over until OpenCode settles the session, even if the agent posts something along the way, because DevSpec drops a job it took once its taker stops working. A check job's turn posts no work trail into the room. `commands/devspec.remote.md` and `instructions/devspec.md` describe ruling in a line or two.
+
 ## 0.12.5
 
 ### Live work-trail streaming during sessionless automation runs
