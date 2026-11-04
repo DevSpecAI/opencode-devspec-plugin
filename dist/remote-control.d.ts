@@ -173,6 +173,12 @@ interface ConnectionState {
     /** Accepted automation runs whose recorded outcomes can settle the current prompt. */
     activeAutomationRunIds?: string[];
     /**
+     * Check jobs (55d71b0c) the current OpenCode turn was woken to rule. The turn
+     * belongs to no command: it posts no work trail, and it stays busy until OpenCode
+     * settles the session, because DevSpec drops a taken job once its taker stops working.
+     */
+    activeCheckJobIds?: string[];
+    /**
      * Our own last-known assertion of heartbeat_connection's `busy` flag —
      * the SOLE signal that drives the "OpenCode is working…" indicator on the
      * agent's icon in the DevSpec session UI (confirmed against the tool's
@@ -764,6 +770,18 @@ export declare function logConnectionEndedStory(input: {
  * What the pump should do after one poll. `delayMs: 0` is the normal answer — the
  * server HELD the request, so the wait already happened and we go straight back in.
  */
+/**
+ * The ingress features every `poll_connection` call negotiates, the main hold and
+ * the context-wipe and control acks alike: a poll that leaves one out tells DevSpec
+ * this host stopped reading it. `check_job_version` says this plugin reads check
+ * jobs beside automation runs in `dispatches[]`; DevSpec offers them only while it is sent.
+ */
+export declare function pollNegotiationArgs(): {
+    ingress_version: 1;
+    delegated_scope_version: 1;
+    active_plan_projection_version: 1;
+    check_job_version: 1;
+};
 export interface PollOutcome {
     delayMs: number;
     /** The connection is gone server-side: stop pumping and do NOT restart. */
