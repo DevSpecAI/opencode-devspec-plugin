@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.1
+
+### What a change that waits for its checks means
+When your agent revises a decision, convention or requirement, DevSpec may now accept the change and hold it until its checks are ruled. `commands/devspec.remote.md` now tells the agent what that result means: accepted but not in effect yet, taking effect by itself once checked or waiting for the OK of the person it names, with DevSpec's own note on the result saying where it stands.
+
 ## 0.13.0
 
 ### Rule DevSpec's checks as check jobs
