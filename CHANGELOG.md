@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.0
+
+Part of the coordinated DevSpec plugin release with check-job delivery version 2 and labelled notices.
+
+### More checks come to the agent
+Every poll now sends `check_job_version: 2`, and check jobs are taken in DevSpec's version-2 shape. Besides tasks, decisions, documents and pending versions, a check can now be about a settled discussion point, a Goal, or the whole backlog: when a discussion point settles or a Goal changes, the agent can check which open tasks it leaves out of date, and the Tasks page's out-of-date scan of the whole backlog can come to the agent too. The wake line says which it is. Check jobs no longer carry a high-risk count, and a job still shaped like version 1 stays inert.
+
+### Ruling checks stays out of the room
+`commands/devspec.remote.md`, `instructions/devspec.md` and the check-job turn's own prompt now say never to post in the room about ruling a check job (`check_job.room` in the served contract): rulings show on the record and in Review. They also say that when a write's result carries `tell_person`, it changed someone else's record, and the agent tells you what it changed.
+
+DevSpec's new notice labels (needs a person, or for the record) don't apply to OpenCode yet: this plugin doesn't receive DevSpec notices, so it doesn't ask for them.
+
 ## 0.13.1
 
 ### What a change that waits for its checks means
