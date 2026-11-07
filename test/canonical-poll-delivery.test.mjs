@@ -77,7 +77,6 @@ function checkJobWake(over = {}) {
     check_kind: 'conflict',
     record: { type: 'task', id: 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2', title: 'Fix the login redirect' },
     entries: 2,
-    high_risk: 1,
     yours: true,
     offered_at: '2026-11-04T03:00:00.000Z',
     delivery_connection_id: connectionId,
@@ -517,7 +516,7 @@ describe('pollAndDeliver canonical transaction integration', () => {
       assert.equal(call.arguments.delegated_scope_version, 1)
       assert.equal(call.arguments.active_plan_projection_version, 1)
       // A poll that leaves it out tells DevSpec this host stopped reading check jobs.
-      assert.equal(call.arguments.check_job_version, 1)
+      assert.equal(call.arguments.check_job_version, 2)
     }
   })
 
@@ -1281,7 +1280,7 @@ describe('pollAndDeliver check jobs', () => {
     pollResults.push(unchanged())
     await tick(); await settle()
     assert.equal(lastPoll().arguments.busy, false)
-    assert.equal(lastPoll().arguments.check_job_version, 1)
+    assert.equal(lastPoll().arguments.check_job_version, 2)
     assert.equal(promptCalls.length, 1)
   })
 
