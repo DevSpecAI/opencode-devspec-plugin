@@ -52,7 +52,8 @@ export declare function checkJobWakeText(job: CheckJobWake): string;
 /**
  * The prompt a batch of check jobs wakes OpenCode with: one wake line per job and
  * the job's own metadata, so the agent has the check_job_id to claim. It is not a
- * command or an automation run, and it asks for no reply.
+ * command or an automation run, and it asks for no reply: ruling a check job is
+ * never posted about in the room (`check_job.room`, DevSpec item a868f41f).
  */
 export declare function renderCheckJobTurn(jobs: readonly CheckJobWake[]): string;
 export {};

@@ -106,6 +106,9 @@ describe('check job wake shape', () => {
     assert.match(turn, new RegExp(`check_job_id=${jobId}`))
     assert.match(turn, /no answer post/)
     assert.doesNotMatch(turn, /high_risk|high risk/)
+    // Ruling a check job is never posted about (DevSpec item a868f41f): the turn
+    // points at the served rule rather than restating it.
+    assert.match(turn, /Never post in the room about ruling a check job \(check_job\.room in devspec:\/\/product\/remote-ingress-contract\)/)
   })
 
   it('says what the records version 2 adds are, so the agent knows what it is ruling', () => {

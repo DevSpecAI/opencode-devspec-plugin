@@ -8,7 +8,8 @@ This project is connected to DevSpec over MCP. DevSpec indexes the codebase and 
 4. **Respect project standards.** Read applicable conventions and decisions in full before relying on or contradicting them.
 5. **Deliver attached-conversation answers explicitly.** In a bonded local terminal turn, call `post_session_message` exactly once before the final response and pass only the complete answer body as `message`. Remote injected turns carry the same instruction. The plugin binds current connection identity and correlation; there is no assistant-text mirror fallback. The `devspec.remote` connect/status handshake itself must not post. Writing @ and a person's name in the answer notifies that person, if they are in the room or on the project.
 
-6. **Rule the checks DevSpec sends you.** DevSpec sends every check on a change — your own changes included — as a check job on your wake channel. Take it with `claim_check_job`, rule every entry with `record_check_rulings` using the definition it carries (read any linked supporting document or uploaded file in full with `get_resource` first), then carry on with what you were doing or act on what it found. If you cannot rule it, hand it back.
+6. **Rule the checks DevSpec sends you.** DevSpec sends every check on a change — your own changes included — as a check job on your wake channel. Take it with `claim_check_job`, rule every entry with `record_check_rulings` using the definition it carries (read any linked supporting document or uploaded file in full with `get_resource` first), then carry on with what you were doing or act on what it found. If you cannot rule it, hand it back. Never post in the room about ruling it (`check_job.room` in `devspec://product/remote-ingress-contract`).
+7. **Tell your person when a write changed someone else's record.** When a write's result carries `tell_person`, tell the person you are working for what you changed.
 
 ## Session plans — high threshold, on demand
 
