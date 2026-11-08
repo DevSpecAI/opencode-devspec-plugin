@@ -74,7 +74,9 @@ Each delivered turn contains the room context first, then the command(s) address
 
 DevSpec sends every check on a change — your own changes included — as a check job on your wake channel. Take it with `claim_check_job`, rule every entry with `record_check_rulings` using the definition it carries (read any linked supporting document or uploaded file in full with `get_resource` first), then carry on with what you were doing or act on what it found. If you cannot rule it, hand it back.
 
-The plugin delivers a check job as its own turn once any running turn settles, never inside a command or an automation run. It is not a command, so it needs no answer post of its own.
+The plugin delivers a check job as its own turn once any running turn settles, never inside a command or an automation run. It is not a command, so it needs no answer post of its own, and you never post in the room about ruling it (`check_job.room` in `devspec://product/remote-ingress-contract`).
+
+When a write's result carries `tell_person`, it changed someone else's record: tell your person what you changed, whatever started the turn.
 
 ## Security (non-negotiable)
 

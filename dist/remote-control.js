@@ -2386,7 +2386,8 @@ export function logConnectionEndedStory(input) {
  * The ingress features every `poll_connection` call negotiates, the main hold and
  * the context-wipe and control acks alike: a poll that leaves one out tells DevSpec
  * this host stopped reading it. `check_job_version` says this plugin reads check
- * jobs beside automation runs in `dispatches[]`; DevSpec offers them only while it is sent.
+ * jobs beside automation runs in `dispatches[]`, in the version-2 envelope
+ * (check-jobs.ts); DevSpec offers them only while it is sent.
  */
 export function pollNegotiationArgs() {
     return {

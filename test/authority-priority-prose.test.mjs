@@ -24,4 +24,21 @@ describe('priority-host authority terminology', () => {
     assert.match(command, /Separately accepted owner-scoped automation runs/)
     assert.match(command, /server's canonical authority stamp/)
   })
+
+  // DevSpec item a868f41f: ruling a check job is never talked about in the room, and
+  // a write that changed someone else's record is. The text points at the served
+  // rules rather than restating them.
+  it('points at check_job.room, tells the person about tell_person writes, and never asks for a post about ruling checks', () => {
+    for (const file of ['commands/devspec.remote.md', 'instructions/devspec.md']) {
+      const content = read(file)
+      assert.match(content, /check_job\.room/, file)
+      assert.match(content, /tell_person/, file)
+      assert.doesNotMatch(content, /post what happened/i, file)
+      const aboutChecks = content.split(/(?<=[.!?])\s+/).filter((text) => /check job|check_job/i.test(text) && !/\bnever\b/i.test(text))
+      for (const sentence of aboutChecks) {
+        assert.doesNotMatch(sentence, /\b(?:post|tell|report)\b[^.]{0,60}\b(?:rul(?:ed|ing)|verdicts?)\b/i,
+          `${file} asks for a post about ruling a check job: ${sentence.slice(0, 160)}`)
+      }
+    }
+  })
 })
