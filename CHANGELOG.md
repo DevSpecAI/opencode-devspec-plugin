@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1
+
+### Post-action room silence on settled findings and notices
+`commands/devspec.remote.md` and `instructions/devspec.md` now point at `semantics.notice_audience` and `semantics.notice_reply` in `devspec://product/remote-ingress-contract`: findings covered by explicit conversation intent are settled quietly in place without posting a room acknowledgment, and a room notice reply (`post_session_message` with `system_notice_ids`) is posted only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`).
+
 ## 0.14.0
 
 Part of the coordinated DevSpec plugin release with check-job delivery version 2 and labelled notices.

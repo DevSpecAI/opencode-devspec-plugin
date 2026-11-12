@@ -10,6 +10,7 @@ This project is connected to DevSpec over MCP. DevSpec indexes the codebase and 
 
 6. **Rule the checks DevSpec sends you.** DevSpec sends every check on a change — your own changes included — as a check job on your wake channel. Take it with `claim_check_job`, rule every entry with `record_check_rulings` using the definition it carries (read any linked supporting document or uploaded file in full with `get_resource` first), then carry on with what you were doing or act on what it found. If you cannot rule it, hand it back. Never post in the room about ruling it (`check_job.room` in `devspec://product/remote-ingress-contract`).
 7. **Tell your person when a write changed someone else's record.** When a write's result carries `tell_person`, tell the person you are working for what you changed.
+8. **Stay silent after settling covered findings.** Follow `semantics.notice_audience` and `semantics.notice_reply` in `devspec://product/remote-ingress-contract`: settle findings covered by explicit conversation intent quietly in place without posting a room acknowledgment, and post a room notice reply (`post_session_message` with `system_notice_ids`, never as a command's answer) only when an unresolved choice, hold, rejection, or block still needs a person after acting (or when a write carries `tell_person`).
 
 ## Session plans — high threshold, on demand
 
