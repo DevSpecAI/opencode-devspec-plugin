@@ -32,6 +32,9 @@ describe('priority-host authority terminology', () => {
     for (const file of ['commands/devspec.remote.md', 'instructions/devspec.md']) {
       const content = read(file)
       assert.match(content, /check_job\.room/, file)
+      assert.match(content, /semantics\.notice_audience/, file)
+      assert.match(content, /semantics\.notice_reply/, file)
+      assert.match(content, /unresolved choice, hold, rejection, or block/, file)
       assert.match(content, /tell_person/, file)
       assert.doesNotMatch(content, /post what happened/i, file)
       const aboutChecks = content.split(/(?<=[.!?])\s+/).filter((text) => /check job|check_job/i.test(text) && !/\bnever\b/i.test(text))
