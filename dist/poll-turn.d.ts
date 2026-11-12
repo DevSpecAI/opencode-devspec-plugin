@@ -484,4 +484,6 @@ export declare function renderInjectedTurn(input: {
     attachmentReferences?: AttachmentReference[];
     /** Strictly parsed active-plan projection serialized as inert read-awareness. */
     activeSessionPlans?: string | null;
+    /** Strictly parsed project-incidents projection serialized as inert read-awareness. */
+    projectIncidents?: string | null;
 }): string;

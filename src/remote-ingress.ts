@@ -107,6 +107,51 @@ export interface ActiveSessionPlansProjection {
   plans: ActiveSessionPlan[]
 }
 
+export interface ProjectIncidentHandlerSummary {
+  kind: 'person' | 'agent_connection' | 'automation_run'
+  label: string | null
+  user_id: string | null
+  connection_id: string | null
+  run_id: string | null
+  expires_at: string | null
+}
+export interface ActiveProjectIncidentSummary {
+  id: string
+  short_code: string
+  kind: 'deploy_failed' | 'checks_failing' | 'security_advisory' | 'unlinked_work' | 'undo_requested' | 'followup_failed' | 'reported'
+  kind_label: string
+  title: string
+  summary: string | null
+  state: 'open' | 'handled' | 'awaiting_followup' | 'needs_decision'
+  since: string
+  last_seen_at: string
+  status_line: string
+  handler: ProjectIncidentHandlerSummary | null
+  decision_prompt: string | null
+  blocked_pull_request_count: number
+  blocked_task_count: number
+}
+export interface ResolvedProjectIncidentSummary {
+  id: string
+  short_code: string
+  kind: ActiveProjectIncidentSummary['kind']
+  kind_label: string
+  title: string
+  state: 'cleared' | 'closed'
+  resolved_at: string
+  resolution_kind: string | null
+  resolution_summary: string | null
+}
+export interface ProjectIncidentsProjection {
+  version: 1
+  authority: 'advisory_read_awareness'
+  recent_resolved_window_minutes: number
+  active: ActiveProjectIncidentSummary[]
+  recently_resolved: ResolvedProjectIncidentSummary[]
+  truncated: { active_omitted: number; resolved_omitted: number }
+  note: string
+}
+
 export interface CanonicalWindow {
   policy_version: string
   returned: number
@@ -463,6 +508,123 @@ export function serializeActiveSessionPlans(
     } else {
       lines.push('  Read awareness only: do not mutate or adopt this plan.')
     }
+  }
+  return lines.join('\n')
+}
+
+const INCIDENT_SHORT_CODE = /^[0-9a-f]{8}$/i
+const INCIDENT_KINDS = new Set([
+  'deploy_failed',
+  'checks_failing',
+  'security_advisory',
+  'unlinked_work',
+  'undo_requested',
+  'followup_failed',
+  'reported',
+])
+const ACTIVE_INCIDENT_STATES = new Set(['open', 'handled', 'awaiting_followup', 'needs_decision'])
+const INCIDENT_HANDLER_KINDS = new Set(['person', 'agent_connection', 'automation_run'])
+
+function nonNegSafeInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+}
+
+function boundedNullableStr(v: unknown, max: number): v is string | null {
+  return v === null || (typeof v === 'string' && v.length > 0 && v.length <= max)
+}
+
+function validIncidentHandler(v: unknown): v is ProjectIncidentHandlerSummary {
+  if (!record(v)) return false
+  const keys = ['kind', 'label', 'user_id', 'connection_id', 'run_id', 'expires_at']
+  if (Object.keys(v).length !== keys.length || keys.some((k) => !Object.prototype.hasOwnProperty.call(v, k))) return false
+  return (
+    typeof v.kind === 'string' && INCIDENT_HANDLER_KINDS.has(v.kind) &&
+    boundedNullableStr(v.label, 240) &&
+    (v.user_id === null || (typeof v.user_id === 'string' && UUID.test(v.user_id))) &&
+    (v.connection_id === null || (typeof v.connection_id === 'string' && UUID.test(v.connection_id))) &&
+    (v.run_id === null || (typeof v.run_id === 'string' && UUID.test(v.run_id))) &&
+    (v.expires_at === null || validOffsetDateTime(v.expires_at))
+  )
+}
+
+function validActiveIncident(v: unknown): v is ActiveProjectIncidentSummary {
+  if (!record(v)) return false
+  const keys = [
+    'id', 'short_code', 'kind', 'kind_label', 'title', 'summary', 'state',
+    'since', 'last_seen_at', 'status_line', 'handler', 'decision_prompt',
+    'blocked_pull_request_count', 'blocked_task_count',
+  ]
+  if (Object.keys(v).length !== keys.length || keys.some((k) => !Object.prototype.hasOwnProperty.call(v, k))) return false
+  return (
+    typeof v.id === 'string' && UUID.test(v.id) &&
+    typeof v.short_code === 'string' && INCIDENT_SHORT_CODE.test(v.short_code) &&
+    typeof v.kind === 'string' && INCIDENT_KINDS.has(v.kind) &&
+    typeof v.kind_label === 'string' && v.kind_label.length > 0 && v.kind_label.length <= 120 &&
+    typeof v.title === 'string' && v.title.length > 0 && v.title.length <= 500 &&
+    boundedNullableStr(v.summary, 500) &&
+    typeof v.state === 'string' && ACTIVE_INCIDENT_STATES.has(v.state) &&
+    validOffsetDateTime(v.since) &&
+    validOffsetDateTime(v.last_seen_at) &&
+    typeof v.status_line === 'string' && v.status_line.length > 0 && v.status_line.length <= 500 &&
+    (v.handler === null || validIncidentHandler(v.handler)) &&
+    boundedNullableStr(v.decision_prompt, 500) &&
+    nonNegSafeInt(v.blocked_pull_request_count) &&
+    nonNegSafeInt(v.blocked_task_count)
+  )
+}
+
+function validResolvedIncident(v: unknown): v is ResolvedProjectIncidentSummary {
+  if (!record(v)) return false
+  const keys = [
+    'id', 'short_code', 'kind', 'kind_label', 'title', 'state',
+    'resolved_at', 'resolution_kind', 'resolution_summary',
+  ]
+  if (Object.keys(v).length !== keys.length || keys.some((k) => !Object.prototype.hasOwnProperty.call(v, k))) return false
+  return (
+    typeof v.id === 'string' && UUID.test(v.id) &&
+    typeof v.short_code === 'string' && INCIDENT_SHORT_CODE.test(v.short_code) &&
+    typeof v.kind === 'string' && INCIDENT_KINDS.has(v.kind) &&
+    typeof v.kind_label === 'string' && v.kind_label.length > 0 && v.kind_label.length <= 120 &&
+    typeof v.title === 'string' && v.title.length > 0 && v.title.length <= 500 &&
+    (v.state === 'cleared' || v.state === 'closed') &&
+    validOffsetDateTime(v.resolved_at) &&
+    boundedNullableStr(v.resolution_kind, 120) &&
+    boundedNullableStr(v.resolution_summary, 500)
+  )
+}
+
+export function isProjectIncidentsProjection(v: unknown): v is ProjectIncidentsProjection {
+  if (!record(v)) return false
+  const keys = ['version', 'authority', 'recent_resolved_window_minutes', 'active', 'recently_resolved', 'truncated', 'note']
+  if (Object.keys(v).length !== keys.length || keys.some((k) => !Object.prototype.hasOwnProperty.call(v, k))) return false
+  if (v.version !== 1 || v.authority !== 'advisory_read_awareness') return false
+  if (typeof v.recent_resolved_window_minutes !== 'number' || !Number.isSafeInteger(v.recent_resolved_window_minutes) || v.recent_resolved_window_minutes < 1) return false
+  if (!Array.isArray(v.active) || v.active.length > 25 || !v.active.every(validActiveIncident)) return false
+  if (new Set(v.active.map((row) => row.id)).size !== v.active.length) return false
+  if (!Array.isArray(v.recently_resolved) || v.recently_resolved.length > 10 || !v.recently_resolved.every(validResolvedIncident)) return false
+  if (new Set(v.recently_resolved.map((row) => row.id)).size !== v.recently_resolved.length) return false
+  if (v.active.length + v.recently_resolved.length < 1) return false
+  if (!record(v.truncated) || Object.keys(v.truncated).length !== 2 || !nonNegSafeInt(v.truncated.active_omitted) || !nonNegSafeInt(v.truncated.resolved_omitted)) return false
+  return typeof v.note === 'string' && v.note.length > 0 && v.note.length <= 500
+}
+
+export function serializeProjectIncidents(projection: ProjectIncidentsProjection | null | undefined): string {
+  if (!projection || !isProjectIncidentsProjection(projection)) return ''
+  const lines = [
+    '## Project incidents — ADVISORY READ-AWARENESS',
+    projection.note,
+  ]
+  for (const inc of projection.active) {
+    lines.push(
+      `- [ACTIVE ${inc.short_code}] ${inc.kind_label}: ${JSON.stringify(inc.title)} | state=${inc.state} | since=${inc.since} | status=${JSON.stringify(inc.status_line)} | blocked_prs=${inc.blocked_pull_request_count} | blocked_tasks=${inc.blocked_task_count}` +
+        (inc.decision_prompt ? ` | decision=${JSON.stringify(inc.decision_prompt)}` : ''),
+    )
+  }
+  for (const inc of projection.recently_resolved) {
+    lines.push(
+      `- [RECENTLY RESOLVED ${inc.short_code}] ${inc.kind_label}: ${JSON.stringify(inc.title)} | state=${inc.state} | resolved_at=${inc.resolved_at}` +
+        (inc.resolution_summary ? ` | summary=${JSON.stringify(inc.resolution_summary)}` : ''),
+    )
   }
   return lines.join('\n')
 }

@@ -10,6 +10,7 @@ This project is connected to DevSpec over MCP. DevSpec indexes the codebase and 
 
 6. **Rule the checks DevSpec sends you.** DevSpec sends every check on a change — your own changes included — as a check job on your wake channel. Take it with `claim_check_job`, rule every entry with `record_check_rulings` using the definition it carries (read any linked supporting document or uploaded file in full with `get_resource` first), then carry on with what you were doing or act on what it found. If you cannot rule it, hand it back. Never post in the room about ruling it (`check_job.room` in `devspec://product/remote-ingress-contract`).
 7. **Tell your person when a write changed someone else's record.** When a write's result carries `tell_person`, tell the person you are working for what you changed.
+8. **Respect passive incident context and escalate delivery blockers.** Follow `core.respect-incidents-and-escalate-delivery-blockers` in `devspec://product/implementation-contract` and `semantics.project_incidents` in `devspec://product/remote-ingress-contract` when passive project-incident awareness is present or when querying, reporting, claiming, resolving, or handing back incidents (`get_incidents`, `get_incident`, `report_incident`, `manage_incident`).
 
 ## Session plans — high threshold, on demand
 

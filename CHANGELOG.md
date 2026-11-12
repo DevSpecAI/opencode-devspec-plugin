@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1
+
+### Passive project-incident awareness and incident tool pointers
+When a `poll_connection` response carries `project_incidents`, the in-process remote-control pump validates and caches the bounded active and recently-resolved incident snapshot passively (never waking an idle session on its own) and includes an advisory `PROJECT INCIDENTS` block on ordinary injected command and automation turns. `instructions/devspec.md` and `commands/devspec.remote.md` point to `semantics.project_incidents` (`devspec://product/remote-ingress-contract`) and `core.respect-incidents-and-escalate-delivery-blockers` (`devspec://product/implementation-contract`) alongside `get_incidents`, `get_incident`, `report_incident`, and `manage_incident`.
+
 ## 0.14.0
 
 Part of the coordinated DevSpec plugin release with check-job delivery version 2 and labelled notices.

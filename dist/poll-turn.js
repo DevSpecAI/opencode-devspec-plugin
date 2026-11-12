@@ -597,6 +597,8 @@ export function renderInjectedTurn(input) {
     }
     if (input.activeSessionPlans)
         parts.push(input.activeSessionPlans);
+    if (input.projectIncidents)
+        parts.push(input.projectIncidents);
     if (window) {
         const renderPoint = (point) => point ? `sequence=${point.sequence},created_at=${point.created_at},message_id=${point.message_id}` : 'null';
         parts.push(`_Canonical ingress window: policy_version=${window.policy_version}, returned=${window.returned}, ` +

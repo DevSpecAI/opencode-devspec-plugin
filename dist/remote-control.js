@@ -32,7 +32,7 @@ import { AGENT_NAME } from './agent-identity.js';
 import { McpTimeoutError, mcpToolsCall } from './devspec-client.js';
 import { resolveDevspecAuth } from './resolve-devspec-auth.js';
 import { captureConnectionCapabilityMeta, clearConnectionCapability, connectionCapabilityForTransport, hasConnectionCapability, moveConnectionCapability, negotiateConnectionCapability, } from './manage-plan-tool.js';
-import { ACTIVE_PLAN_PROJECTION_VERSION, DELEGATED_SCOPE_VERSION, freezeCanonicalTurn, parseCanonicalIngress, REMOTE_INGRESS_VERSION, resolveHandshakeInject, selectCanonicalCommandsForPrompt, serializeActiveSessionPlans, } from './remote-ingress.js';
+import { ACTIVE_PLAN_PROJECTION_VERSION, DELEGATED_SCOPE_VERSION, freezeCanonicalTurn, isProjectIncidentsProjection, parseCanonicalIngress, REMOTE_INGRESS_VERSION, resolveHandshakeInject, selectCanonicalCommandsForPrompt, serializeActiveSessionPlans, serializeProjectIncidents, } from './remote-ingress.js';
 import { CHECK_JOB_VERSION, isCheckJobWake, renderCheckJobTurn } from './check-jobs.js';
 import { HOLD_HTTP_GRACE_MS, createCarryBuffer, buildAttachmentParts, emptyTurnBackoffMs, errorBackoffMs, holdFor, pollTerminalReason, RECOVERABLE_TERMINAL_MAX, renderInjectedTurn, resolveServerAttachment, adoptRequiresNullCursorRepoll, } from './poll-turn.js';
 import { shouldDeferInjectDuringConnect, } from './remote-format.js';
@@ -2271,6 +2271,7 @@ function pumpStateFor(connectionId, persisted) {
             catchUpCursor: persisted.catchUpCursor,
             dispatchCursor: persisted.dispatchCursor,
             carry: createCarryBuffer(),
+            projectIncidents: null,
             // First poll of a process is a SEED: ask for the catch-up window and treat
             // already-answered commands in it as history rather than as new work.
             needsSeed: true,
@@ -2775,6 +2776,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
         pump.catchUpCursor = null;
         pump.dispatchCursor = null;
         pump.carry.reset();
+        pump.projectIncidents = null;
         pump.needsSeed = true;
         if (adoptRequiresNullCursorRepoll()) {
             logPoll(`adopt → re-poll with cursor:null + catch_up (discarding pre-adopt package; ` +
@@ -2782,50 +2784,59 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             return { delayMs: 0, stop: false };
         }
     }
-    else if (res?.changed !== true) {
-        const persistedDeferred = state.deferredCanonicalTransaction;
-        const deferredCommands = state.deferredCanonicalCommands ?? [];
-        if (persistedDeferred && deferredCommands.length > 0) {
-            if (state.connectHandshakePending &&
-                !state.awaitingRemoteReply &&
-                !shouldDeferInjectDuringConnect({
+    else {
+        if (res && typeof res === 'object' && Object.prototype.hasOwnProperty.call(res, 'project_incidents')) {
+            pump.projectIncidents = res.project_incidents === null
+                ? null
+                : isProjectIncidentsProjection(res.project_incidents)
+                    ? res.project_incidents
+                    : null;
+        }
+        if (res?.changed !== true) {
+            const persistedDeferred = state.deferredCanonicalTransaction;
+            const deferredCommands = state.deferredCanonicalCommands ?? [];
+            if (persistedDeferred && deferredCommands.length > 0) {
+                if (state.connectHandshakePending &&
+                    !state.awaitingRemoteReply &&
+                    !shouldDeferInjectDuringConnect({
+                        connectHandshakePending: state.connectHandshakePending,
+                        connectHandshakeStartedAt: state.connectHandshakeStartedAt,
+                        awaitingRemoteReply: state.awaitingRemoteReply,
+                        busy: state.busy,
+                    })) {
+                    patchState({ connectHandshakePending: false, connectHandshakeStartedAt: null });
+                }
+                const deferInject = shouldDeferCanonicalPrompt({
+                    busy: state.busy,
                     connectHandshakePending: state.connectHandshakePending,
                     connectHandshakeStartedAt: state.connectHandshakeStartedAt,
                     awaitingRemoteReply: state.awaitingRemoteReply,
-                    busy: state.busy,
-                })) {
-                patchState({ connectHandshakePending: false, connectHandshakeStartedAt: null });
+                    pendingQuestionRequestId: state.pendingQuestion?.requestId,
+                });
+                if (deferInject || pump.acceptingTurn || pump.acceptingAutomation) {
+                    // Do not accept echoed idle cursors while a command transaction is held.
+                    // poll_connection may show the command only once.
+                    return { delayMs: 1000, stop: false };
+                }
+                deferredFollowUpTransaction = freezeCanonicalTurn(structuredClone(persistedDeferred));
             }
-            const deferInject = shouldDeferCanonicalPrompt({
-                busy: state.busy,
-                connectHandshakePending: state.connectHandshakePending,
-                connectHandshakeStartedAt: state.connectHandshakeStartedAt,
-                awaitingRemoteReply: state.awaitingRemoteReply,
-                pendingQuestionRequestId: state.pendingQuestion?.requestId,
-            });
-            if (deferInject || pump.acceptingTurn || pump.acceptingAutomation) {
-                // Do not accept echoed idle cursors while a command transaction is held.
-                // poll_connection may show the command only once.
-                return { delayMs: 1000, stop: false };
+            else if ((state.deferredAutomationDispatches?.length ?? 0) === 0) {
+                // Idle responses echo all independent cursors. They contain no turn to accept,
+                // so applying them cannot skip work.
+                if (typeof res?.cursor_v2 === 'string' && res.cursor_v2)
+                    pump.cursorV2 = res.cursor_v2;
+                if (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor)
+                    pump.dispatchCursor = res.dispatch_cursor;
+                pump.catchUpCursor = null;
+                pump.needsSeed = false;
+                patchState({
+                    remoteIngressCursorV2: pump.cursorV2,
+                    remoteIngressCatchUpCursor: null,
+                    remoteDispatchCursor: pump.dispatchCursor,
+                });
+                pump.consecutiveEmpty = 0;
+                return { delayMs: 0, stop: false };
             }
-            deferredFollowUpTransaction = freezeCanonicalTurn(structuredClone(persistedDeferred));
-        }
-        else if ((state.deferredAutomationDispatches?.length ?? 0) === 0) {
-            // Idle responses echo all independent cursors. They contain no turn to accept,
-            // so applying them cannot skip work.
-            if (typeof res?.cursor_v2 === 'string' && res.cursor_v2)
-                pump.cursorV2 = res.cursor_v2;
-            if (typeof res?.dispatch_cursor === 'string' && res.dispatch_cursor)
-                pump.dispatchCursor = res.dispatch_cursor;
-            pump.catchUpCursor = null;
-            pump.needsSeed = false;
-            patchState({
-                remoteIngressCursorV2: pump.cursorV2,
-                remoteIngressCatchUpCursor: null,
-                remoteDispatchCursor: pump.dispatchCursor,
-            });
-            pump.consecutiveEmpty = 0;
-            return { delayMs: 0, stop: false };
         }
     }
     // Explicit automation dispatch is a separate owner-scoped workflow, and a check job
@@ -2931,7 +2942,11 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
                     content: automationRunCommandText(dispatch),
                     dispatch_model: dispatch.dispatch_model,
                 }));
-                text = renderInjectedTurn({ commands: automationCommands, context: null });
+                text = renderInjectedTurn({
+                    commands: automationCommands,
+                    context: null,
+                    projectIncidents: serializeProjectIncidents(pump.projectIncidents),
+                });
                 const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model);
                 model = modelExtract.model ?? state.remoteControlModel ?? undefined;
             }
@@ -3350,6 +3365,7 @@ export async function pollAndDeliver(client, directory, sessionId, opts = {}) {
             connectionId: ingress.connection.connection_id,
             ownerUserId: commands[0]?.authority.connection_owner_user_id ?? null,
         }),
+        projectIncidents: serializeProjectIncidents(pump.projectIncidents),
     });
     logPoll(`injecting ${commands.length} command(s) with context: ` +
         `${context?.owner_ambient.length ?? 0} owner-ambient, ${context?.room_context.length ?? 0} room-context, ` +

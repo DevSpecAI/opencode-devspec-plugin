@@ -780,6 +780,8 @@ export function renderInjectedTurn(input: {
   attachmentReferences?: AttachmentReference[]
   /** Strictly parsed active-plan projection serialized as inert read-awareness. */
   activeSessionPlans?: string | null
+  /** Strictly parsed project-incidents projection serialized as inert read-awareness. */
+  projectIncidents?: string | null
 }): string {
   const commands = Array.isArray(input.commands) ? input.commands : []
   const ctx = input.context ?? null
@@ -810,6 +812,7 @@ export function renderInjectedTurn(input: {
   }
 
   if (input.activeSessionPlans) parts.push(input.activeSessionPlans)
+  if (input.projectIncidents) parts.push(input.projectIncidents)
 
   if (window) {
     const renderPoint = (point: AdvisoryWindowMetadata['source_window']['start']) =>
