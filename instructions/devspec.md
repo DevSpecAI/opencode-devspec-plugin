@@ -35,4 +35,4 @@ There is no command for working an item, creating one, or recording finished wor
 
 ## Git & worktrees
 
-Follow the repository and commit rules returned by `devspec://product/implementation-contract` and the project's current workflow settings. Do not infer push, merge, completion, or verification authority from this local file.
+Follow the repository and commit rules returned by `devspec://product/implementation-contract` (`commit_provenance_contract`, including mechanical unlinked-work accountability with no automatic task creation) and the project's current workflow settings. Do not infer push, merge, completion, or verification authority from this local file.

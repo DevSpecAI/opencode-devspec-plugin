@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.2
+
+### Commit-provenance contract pointer for unlinked-work accountability
+`instructions/devspec.md` explicitly points repository and commit linkage guidance at `commit_provenance_contract` in `devspec://product/implementation-contract` (mechanical unlinked-work accountability with no automatic task creation).
+
 ## 0.14.1
 
 ### Passive project-incident awareness and incident tool pointers
