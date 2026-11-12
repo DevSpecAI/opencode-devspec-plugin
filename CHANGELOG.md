@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.2
+
+### Commit-provenance contract pointer for unlinked-work accountability
+`instructions/devspec.md` explicitly points repository and commit linkage guidance at `commit_provenance_contract` in `devspec://product/implementation-contract` (mechanical unlinked-work accountability with no automatic task creation).
+
+### Passive project-incident awareness and incident tool pointers
+When a `poll_connection` response carries `project_incidents`, the in-process remote-control pump validates and caches the bounded active and recently-resolved incident snapshot passively (never waking an idle session on its own) and includes an advisory `PROJECT INCIDENTS` block on ordinary injected command and automation turns. `instructions/devspec.md` and `commands/devspec.remote.md` point to `semantics.project_incidents` (`devspec://product/remote-ingress-contract`) and `core.respect-incidents-and-escalate-delivery-blockers` (`devspec://product/implementation-contract`) alongside `get_incidents`, `get_incident`, `report_incident`, and `manage_incident`.
+
 ## 0.14.1
 
 ### Post-action room silence on settled findings and notices

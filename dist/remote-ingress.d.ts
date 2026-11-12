@@ -124,6 +124,53 @@ export interface ActiveSessionPlansProjection {
     };
     plans: ActiveSessionPlan[];
 }
+export interface ProjectIncidentHandlerSummary {
+    kind: 'person' | 'agent_connection' | 'automation_run';
+    label: string | null;
+    user_id: string | null;
+    connection_id: string | null;
+    run_id: string | null;
+    expires_at: string | null;
+}
+export interface ActiveProjectIncidentSummary {
+    id: string;
+    short_code: string;
+    kind: 'deploy_failed' | 'checks_failing' | 'security_advisory' | 'unlinked_work' | 'undo_requested' | 'followup_failed' | 'reported';
+    kind_label: string;
+    title: string;
+    summary: string | null;
+    state: 'open' | 'handled' | 'awaiting_followup' | 'needs_decision';
+    since: string;
+    last_seen_at: string;
+    status_line: string;
+    handler: ProjectIncidentHandlerSummary | null;
+    decision_prompt: string | null;
+    blocked_pull_request_count: number;
+    blocked_task_count: number;
+}
+export interface ResolvedProjectIncidentSummary {
+    id: string;
+    short_code: string;
+    kind: ActiveProjectIncidentSummary['kind'];
+    kind_label: string;
+    title: string;
+    state: 'cleared' | 'closed';
+    resolved_at: string;
+    resolution_kind: string | null;
+    resolution_summary: string | null;
+}
+export interface ProjectIncidentsProjection {
+    version: 1;
+    authority: 'advisory_read_awareness';
+    recent_resolved_window_minutes: number;
+    active: ActiveProjectIncidentSummary[];
+    recently_resolved: ResolvedProjectIncidentSummary[];
+    truncated: {
+        active_omitted: number;
+        resolved_omitted: number;
+    };
+    note: string;
+}
 export interface CanonicalWindow {
     policy_version: string;
     returned: number;
@@ -193,6 +240,8 @@ export declare function serializeActiveSessionPlans(projection: ActiveSessionPla
     connectionId: string;
     ownerUserId?: string | null;
 }): string;
+export declare function isProjectIncidentsProjection(v: unknown): v is ProjectIncidentsProjection;
+export declare function serializeProjectIncidents(projection: ProjectIncidentsProjection | null | undefined): string;
 export declare function selectCanonicalCommandsForPrompt(parsed: CanonicalIngressResult, deliveredMessageIds: ReadonlySet<string>): {
     commands: CanonicalCommand[];
     rejectedUnavailable: CanonicalCommand[];

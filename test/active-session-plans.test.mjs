@@ -4,8 +4,10 @@ import path from 'node:path'
 import { describe, it } from 'node:test'
 import {
   ACTIVE_SESSION_PLAN_AUTHORITY_NOTE,
+  isProjectIncidentsProjection,
   parseCanonicalIngress,
   serializeActiveSessionPlans,
+  serializeProjectIncidents,
 } from '../dist/remote-ingress.js'
 import { renderInjectedTurn } from '../dist/poll-turn.js'
 
@@ -144,5 +146,79 @@ describe('active session plan projection v1', () => {
       text.length < INSTRUCTION_BLOAT_CEILING_CHARS,
       `instructions bloated: ${text.length} chars (ceiling ${INSTRUCTION_BLOAT_CEILING_CHARS})`,
     )
+    assert.match(text, /core\.respect-incidents-and-escalate-delivery-blockers/)
+    assert.match(text, /semantics\.project_incidents/)
+  })
+
+  it('validates and renders passive project incident projections only when present', () => {
+    assert.equal(serializeProjectIncidents(null), '')
+    assert.equal(serializeProjectIncidents(undefined), '')
+
+    const validIncidents = {
+      version: 1,
+      authority: 'advisory_read_awareness',
+      recent_resolved_window_minutes: 60,
+      active: [
+        {
+          id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          short_code: 'aaaaaaaa',
+          kind: 'checks_failing',
+          kind_label: 'Checks failing',
+          title: 'Typecheck broken on staging',
+          summary: 'tsc failing in packages/core',
+          state: 'handled',
+          since: '2026-11-12T01:00:00.000Z',
+          last_seen_at: '2026-11-12T01:05:00.000Z',
+          status_line: 'Handled by OpenCode · Otter',
+          handler: {
+            kind: 'agent_connection',
+            label: 'OpenCode · Otter',
+            user_id: null,
+            connection_id: ids.connection,
+            run_id: null,
+            expires_at: null,
+          },
+          decision_prompt: null,
+          blocked_pull_request_count: 2,
+          blocked_task_count: 1,
+        },
+      ],
+      recently_resolved: [
+        {
+          id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          short_code: 'bbbbbbbb',
+          kind: 'deploy_failed',
+          kind_label: 'Deployment failed',
+          title: 'Vercel preview build timeout',
+          state: 'cleared',
+          resolved_at: '2026-11-12T00:30:00.000Z',
+          resolution_kind: 'signal_cleared',
+          resolution_summary: 'Preview deployment green again',
+        },
+      ],
+      truncated: { active_omitted: 0, resolved_omitted: 0 },
+      note: 'Passive project-incident awareness; never a wake trigger.',
+    }
+
+    assert.equal(isProjectIncidentsProjection(validIncidents), true)
+    assert.equal(
+      isProjectIncidentsProjection({ ...validIncidents, active: [], recently_resolved: [] }),
+      false,
+      'empty projection must fail closed so zero-incident projects add zero footprint',
+    )
+
+    const serialized = serializeProjectIncidents(validIncidents)
+    assert.match(serialized, /## Project incidents — ADVISORY READ-AWARENESS/)
+    assert.match(serialized, /\[ACTIVE aaaaaaaa\] Checks failing: "Typecheck broken on staging"/)
+    assert.match(serialized, /Handled by OpenCode · Otter/)
+    assert.match(serialized, /blocked_prs=2 \| blocked_tasks=1/)
+    assert.match(serialized, /bbbbbbbb.*Deployment failed.*"Vercel preview build timeout"/)
+
+    const rendered = renderInjectedTurn({
+      commands: [{ content: 'Check PR status.' }],
+      projectIncidents: serialized,
+    })
+    assert.match(rendered, /## Project incidents — ADVISORY READ-AWARENESS/)
+    assert.match(rendered, /Check PR status\./)
   })
 })

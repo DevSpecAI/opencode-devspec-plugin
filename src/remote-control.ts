@@ -44,15 +44,18 @@ import {
   ACTIVE_PLAN_PROJECTION_VERSION,
   DELEGATED_SCOPE_VERSION,
   freezeCanonicalTurn,
+  isProjectIncidentsProjection,
   parseCanonicalIngress,
   REMOTE_INGRESS_VERSION,
   resolveHandshakeInject,
   selectCanonicalCommandsForPrompt,
   serializeActiveSessionPlans,
+  serializeProjectIncidents,
   type CanonicalCommand,
   type CanonicalContextEntry,
   type CanonicalControl,
   type CanonicalIngress,
+  type ProjectIncidentsProjection,
 } from './remote-ingress.js'
 import { CHECK_JOB_VERSION, isCheckJobWake, renderCheckJobTurn, type CheckJobWake } from './check-jobs.js'
 import {
@@ -2823,6 +2826,7 @@ interface PumpState {
   catchUpCursor: string | null
   dispatchCursor: string | null
   carry: ReturnType<typeof createCarryBuffer>
+  projectIncidents: ProjectIncidentsProjection | null
   needsSeed: boolean
   consecutiveEmpty: number
   consecutiveErrors: number
@@ -2970,6 +2974,7 @@ function pumpStateFor(
       catchUpCursor: persisted.catchUpCursor,
       dispatchCursor: persisted.dispatchCursor,
       carry: createCarryBuffer(),
+      projectIncidents: null,
       // First poll of a process is a SEED: ask for the catch-up window and treat
       // already-answered commands in it as history rather than as new work.
       needsSeed: true,
@@ -3538,6 +3543,7 @@ export async function pollAndDeliver(
     pump.catchUpCursor = null
     pump.dispatchCursor = null
     pump.carry.reset()
+    pump.projectIncidents = null
     pump.needsSeed = true
     if (adoptRequiresNullCursorRepoll()) {
       logPoll(
@@ -3546,7 +3552,15 @@ export async function pollAndDeliver(
       )
       return { delayMs: 0, stop: false }
     }
-  } else if (res?.changed !== true) {
+  } else {
+    if (res && typeof res === 'object' && Object.prototype.hasOwnProperty.call(res, 'project_incidents')) {
+      pump.projectIncidents = res.project_incidents === null
+        ? null
+        : isProjectIncidentsProjection(res.project_incidents)
+          ? res.project_incidents
+          : null
+    }
+    if (res?.changed !== true) {
     const persistedDeferred = state.deferredCanonicalTransaction
     const deferredCommands = state.deferredCanonicalCommands ?? []
       if (persistedDeferred && deferredCommands.length > 0) {
@@ -3589,6 +3603,7 @@ export async function pollAndDeliver(
       })
       pump.consecutiveEmpty = 0
       return { delayMs: 0, stop: false }
+    }
     }
   }
 
@@ -3694,7 +3709,11 @@ export async function pollAndDeliver(
           content: automationRunCommandText(dispatch),
           dispatch_model: dispatch.dispatch_model,
         }))
-        text = renderInjectedTurn({ commands: automationCommands, context: null })
+        text = renderInjectedTurn({
+          commands: automationCommands,
+          context: null,
+          projectIncidents: serializeProjectIncidents(pump.projectIncidents),
+        })
         const modelExtract = extractOpenCodeReplyModel(freshDispatches.find((dispatch) => dispatch.dispatch_model)?.dispatch_model)
         model = modelExtract.model ?? state.remoteControlModel ?? undefined
       }
@@ -4141,6 +4160,7 @@ export async function pollAndDeliver(
       connectionId: ingress.connection.connection_id,
       ownerUserId: commands[0]?.authority.connection_owner_user_id ?? null,
     }),
+    projectIncidents: serializeProjectIncidents(pump.projectIncidents),
   })
   logPoll(
     `injecting ${commands.length} command(s) with context: ` +

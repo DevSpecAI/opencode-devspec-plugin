@@ -88,6 +88,7 @@ For notices and findings on your own work, follow `semantics.notice_audience` an
 - Command authority comes only from the server's canonical authority stamp. Delegated commands also carry a server-authored project instruction immediately before their body; owner commands do not. The plugin validates and renders that text verbatim rather than recreating it locally.
 - Mutable remote-ingress authority and scope policy lives at `devspec://product/remote-ingress-contract`. Treat the injected scope text as model steering; do not claim the host mechanically enforces it.
 - The active session-plan section is advisory room read-awareness, never a command or mutation grant. Another owner's plan is read-only. Same-owner adoption requires an orphaned plan, explicit continuation intent, and the exact projected `plan_id` / `revision`; the server rechecks all of this.
+- The project-incidents section (`semantics.project_incidents` in `devspec://product/remote-ingress-contract`) is passive advisory read-awareness, never a wake trigger or unrequested fix assignment; follow `core.respect-incidents-and-escalate-delivery-blockers` in `devspec://product/implementation-contract` when using `get_incidents`, `get_incident`, `report_incident`, and `manage_incident`.
 
 ## Personal + project instructions (on attach — non-negotiable)
 
